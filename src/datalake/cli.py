@@ -225,6 +225,7 @@ def main() -> None:
     p_pull.add_argument("--repo", required=True, help="GitHub repo 'username/repo-name'")
     p_pull.add_argument("--tag", default="datalake-latest", help="Release tag (default: datalake-latest)")
     p_pull.add_argument("--token", default=None, help="Optional GitHub PAT token for private repositories")
+    p_pull.add_argument("--pattern", default=None, help="Optional substring filter to sync matching partitions only (e.g. '2026')")
 
     # 9. stage-release (Used by GitHub Actions before gh release upload)
     p_stg = sub.add_parser("stage-release", help="Optimize Parquet layout, build manifest.json, and stage assets")
@@ -260,7 +261,7 @@ def main() -> None:
     elif args.cmd == "status":
         print_status(cfg)
     elif args.cmd == "pull":
-        stats = asyncio.run(pull_from_github_release(args.repo, cfg.root_dir, tag=args.tag, token=args.token))
+        stats = asyncio.run(pull_from_github_release(args.repo, cfg.root_dir, tag=args.tag, token=args.token, pattern=args.pattern))
         print("Sync Summary:", stats)
     elif args.cmd == "stage-release":
         prepare_release_staging(cfg.root_dir, Path(args.staging_dir).resolve())

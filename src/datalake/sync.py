@@ -85,11 +85,13 @@ async def pull_from_github_release(
     tag: str = "datalake-latest",
     token: str | None = None,
     concurrency: int = 4,
+    pattern: str | None = None,
 ) -> dict[str, int]:
     """
     Smart delta sync from `https://github.com/{repo}/releases/download/{tag}/manifest.json`.
     Only downloads `.parquet` files whose SHA-256 differs from local disk!
     Supports both public repos (zero auth) and private repos (via `GITHUB_TOKEN`).
+    Optionally filters downloads by substring `pattern` (e.g. '2026' or 'equities').
     """
     target_root = Path(data_dir).resolve()
     target_root.mkdir(parents=True, exist_ok=True)
@@ -116,6 +118,10 @@ async def pull_from_github_release(
         skipped = 0
 
         for rel_path, meta in files_map.items():
+            if pattern:
+                import re
+                if not re.search(pattern, rel_path, re.IGNORECASE) and not re.search(pattern, meta.get("asset_name", ""), re.IGNORECASE):
+                    continue
             local_file = target_root / rel_path
             if local_file.exists() and local_file.stat().st_size == meta["size_bytes"]:
                 if compute_sha256(local_file) == meta["sha256"]:
@@ -137,27 +143,53 @@ async def pull_from_github_release(
             local_path = target_root / rel_path
             local_path.parent.mkdir(parents=True, exist_ok=True)
             tmp_path = local_path.with_name(f"{local_path.name}.dl_tmp")
-            async with sem:
-                r = await http.get(asset_url, headers=headers)
-                r.raise_for_status()
-                tmp_path.write_bytes(r.content)
-                if compute_sha256(tmp_path) != meta["sha256"]:
+            
+            for dl_attempt in range(4):
+                try:
+                    async with sem:
+                        if http.client is not None:
+                            async with http.client.stream("GET", asset_url, headers=headers) as r:
+                                r.raise_for_status()
+                                h = hashlib.sha256()
+                                sz = 0
+                                with tmp_path.open("wb") as f:
+                                    async for chunk in r.aiter_bytes(chunk_size=512 * 1024):
+                                        f.write(chunk)
+                                        h.update(chunk)
+                                        sz += len(chunk)
+                                computed_sha = h.hexdigest()
+                        else:
+                            r = await http.get(asset_url, headers=headers)
+                            r.raise_for_status()
+                            tmp_path.write_bytes(r.content)
+                            computed_sha = compute_sha256(tmp_path)
+                            sz = len(r.content)
+
+                        if computed_sha != meta["sha256"]:
+                            tmp_path.unlink(missing_ok=True)
+                            raise RuntimeError(f"SHA-256 mismatch on downloaded asset {meta['asset_name']}")
+                        
+                        # Windows-safe atomic replacement with retry
+                        for attempt in range(5):
+                            try:
+                                os.replace(tmp_path, local_path)
+                                break
+                            except PermissionError:
+                                if attempt == 4:
+                                    raise
+                                gc.collect()
+                                time.sleep(0.1 * (attempt + 1))
+                        
+                        downloaded += 1
+                        logger.info("[Lake Pull] Synced %s (%d KB)", rel_path, sz // 1024)
+                        return
+                except Exception as exc:
                     tmp_path.unlink(missing_ok=True)
-                    raise RuntimeError(f"SHA-256 mismatch on downloaded asset {meta['asset_name']}")
-                
-                # Windows-safe atomic replacement with retry
-                for attempt in range(5):
-                    try:
-                        os.replace(tmp_path, local_path)
-                        break
-                    except PermissionError:
-                        if attempt == 4:
-                            raise
-                        gc.collect()
-                        time.sleep(0.1 * (attempt + 1))
-                
-                downloaded += 1
-                logger.info("[Lake Pull] Synced %s (%d KB)", rel_path, len(r.content) // 1024)
+                    if dl_attempt == 3:
+                        logger.error("[Lake Pull] Failed to download %s after 4 attempts: %s", rel_path, exc)
+                        raise
+                    logger.warning("[Lake Pull] Retry %d for %s due to: %s", dl_attempt + 1, rel_path, exc)
+                    await asyncio.sleep(1.0 * (2 ** dl_attempt))
 
         if to_download:
             await asyncio.gather(*[_dl(rp, m) for rp, m in to_download])

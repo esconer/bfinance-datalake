@@ -91,8 +91,9 @@ class ResilientHTTPClient:
 
     def __init__(self) -> None:
         if HAS_HTTPX:
-            limits = httpx.Limits(max_keepalive_connections=10, max_connections=16)
-            self.client = httpx.AsyncClient(limits=limits, follow_redirects=True, timeout=45.0)
+            limits = httpx.Limits(max_keepalive_connections=20, max_connections=32)
+            timeout = httpx.Timeout(connect=15.0, read=180.0, write=30.0, pool=30.0)
+            self.client = httpx.AsyncClient(limits=limits, follow_redirects=True, timeout=timeout)
         else:
             self.client = None
         self.curl_session = (
@@ -132,10 +133,11 @@ class ResilientHTTPClient:
             if not self._bse_primed:
                 await self._prime_host("bse")
 
+        is_exchange = any(k in url for k in ("nseindia.com", "bseindia.com", "niftyindices.com"))
         last_exc: Exception | None = None
         for attempt in range(retries):
             try:
-                if self.curl_session is not None:
+                if self.curl_session is not None and is_exchange:
                     c_resp = await self.curl_session.get(
                         url, headers=req_headers, params=params, allow_redirects=True
                     )
@@ -145,7 +147,21 @@ class ResilientHTTPClient:
                         headers=dict(c_resp.headers),
                     )
                 elif self.client is not None:
-                    resp = await self.client.get(url, headers=req_headers, params=params)
+                    h_resp = await self.client.get(url, headers=req_headers, params=params)
+                    resp = SimpleHTTPResponse(
+                        status_code=h_resp.status_code,
+                        content=h_resp.content,
+                        headers=dict(h_resp.headers),
+                    )
+                elif self.curl_session is not None:
+                    c_resp = await self.curl_session.get(
+                        url, headers=req_headers, params=params, allow_redirects=True
+                    )
+                    resp = SimpleHTTPResponse(
+                        status_code=c_resp.status_code,
+                        content=c_resp.content,
+                        headers=dict(c_resp.headers),
+                    )
                 else:
                     raise RuntimeError("curl_cffi or httpx required for live network calls")
 
