@@ -114,16 +114,15 @@ jobs:
           uv run datalake doctor
           uv run datalake status
 
-      - name: Package, Verify & Publish Updated Data Lake to GitHub Release (`datalake-latest`)
+      - name: Stage, Verify & Publish Updated Data Lake to GitHub Release (`datalake-latest`)
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if [ -d data ] && [ -f data/state.db ]; then
-            tar --zstd -cf /tmp/datalake_store.tar.zst data/
+            uv run datalake stage-release --staging-dir /tmp/release_assets
+            tar --zstd -cf /tmp/release_assets/datalake_store.tar.zst data/
             # Verify archive integrity before uploading so a broken tar never overwrites the release
-            tar --zstd -tf /tmp/datalake_store.tar.zst >/dev/null
-            gh release upload datalake-latest /tmp/datalake_store.tar.zst --clobber
-            find data/ -name "*.parquet" -size -1900M -exec gh release upload datalake-latest {} --clobber \;
-            gh release upload datalake-latest data/state.db --clobber
+            tar --zstd -tf /tmp/release_assets/datalake_store.tar.zst >/dev/null
+            gh release upload datalake-latest /tmp/release_assets/* --clobber
           fi

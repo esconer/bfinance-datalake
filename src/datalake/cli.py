@@ -17,6 +17,7 @@ from datalake.scrapers.indices import IndicesScraper
 from datalake.scrapers.universe_actions import UniverseAndActionsScraper
 from datalake.scrapers.xbrl import XBRLScraper
 from datalake.state import StateStore
+from datalake.sync import prepare_release_staging, pull_from_github_release
 
 logging.basicConfig(
     level=logging.INFO,
@@ -219,6 +220,16 @@ def main() -> None:
     # 7. status
     sub.add_parser("status", help="Show watermark & row counts across all datasets")
 
+    # 8. pull (Delta sync from GitHub Release to local PC)
+    p_pull = sub.add_parser("pull", help="Fast SHA-256 delta sync from GitHub Release to local disk")
+    p_pull.add_argument("--repo", required=True, help="GitHub repo 'username/repo-name'")
+    p_pull.add_argument("--tag", default="datalake-latest", help="Release tag (default: datalake-latest)")
+    p_pull.add_argument("--token", default=None, help="Optional GitHub PAT token for private repositories")
+
+    # 9. stage-release (Used by GitHub Actions before gh release upload)
+    p_stg = sub.add_parser("stage-release", help="Optimize Parquet layout, build manifest.json, and stage assets")
+    p_stg.add_argument("--staging-dir", default="/tmp/release_assets", help="Output folder for flat release assets")
+
     args = parser.parse_args()
     cfg = LakeConfig(root_dir=Path(args.data_dir).resolve())
 
@@ -248,6 +259,11 @@ def main() -> None:
         print_status(cfg)
     elif args.cmd == "status":
         print_status(cfg)
+    elif args.cmd == "pull":
+        stats = asyncio.run(pull_from_github_release(args.repo, cfg.root_dir, tag=args.tag, token=args.token))
+        print("Sync Summary:", stats)
+    elif args.cmd == "stage-release":
+        prepare_release_staging(cfg.root_dir, Path(args.staging_dir).resolve())
 
 
 if __name__ == "__main__":

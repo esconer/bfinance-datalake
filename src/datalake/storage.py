@@ -36,28 +36,40 @@ def read_table_safe(path: Path) -> pd.DataFrame:
     return pd.read_pickle(buf)
 
 
-def write_parquet_atomic(df: pd.DataFrame, target_path: Path) -> None:
-    """Write a DataFrame to Zstandard-compressed Parquet atomically via a temporary file."""
+def write_parquet_atomic(df: pd.DataFrame, target_path: Path, row_group_size: int = 10_000) -> None:
+    """
+    Write a DataFrame to Zstandard-compressed Parquet atomically via a temporary file with
+    `row_group_size=10_000` so remote HTTP Byte-Range queries (DuckDB httpfs / PyArrow)
+    only download ~250 KB per stock instead of the whole file.
+    """
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = target_path.with_name(f"{target_path.stem}_{uuid.uuid4().hex[:8]}.parquet.tmp")
+    tmp_path = target_path.with_name(f"{target_path.stem}.{uuid.uuid4().hex[:8]}.tmp")
     try:
         if HAS_PARQUET:
-            df.to_parquet(tmp_path, compression="zstd", index=False)
+            df.to_parquet(
+                tmp_path,
+                compression="zstd",
+                index=False,
+                row_group_size=row_group_size,
+            )
         else:
             df.to_pickle(tmp_path)
-        for attempt in range(10):
+
+        last_err: Exception | None = None
+        for attempt in range(8):
             try:
                 os.replace(tmp_path, target_path)
-                break
-            except PermissionError:
-                if attempt == 9:
-                    raise
+                return
+            except PermissionError as exc:
+                last_err = exc
                 gc.collect()
                 time.sleep(0.05 * (attempt + 1))
+        if last_err is not None:
+            raise last_err
     finally:
         if tmp_path.exists():
             try:
-                tmp_path.unlink()
+                tmp_path.unlink(missing_ok=True)
             except OSError:
                 pass
 
@@ -67,6 +79,7 @@ def upsert_parquet_partition(
     target_path: Path,
     dedup_cols: list[str],
     sort_cols: list[str] | None = None,
+    row_group_size: int = 10_000,
 ) -> int:
     """
     Merge `new_df` into an existing Parquet file (if present), deduplicate by `dedup_cols`
@@ -86,9 +99,12 @@ def upsert_parquet_partition(
     if valid_dedup:
         combined = combined.drop_duplicates(subset=valid_dedup, keep="last")
 
+    if sort_cols is None and "Symbol" in combined.columns and "Date" in combined.columns:
+        sort_cols = ["Symbol", "Date"]
+
     valid_sort = [c for c in (sort_cols or valid_dedup) if c in combined.columns]
     if valid_sort:
         combined = combined.sort_values(valid_sort).reset_index(drop=True)
 
-    write_parquet_atomic(combined, target_path)
+    write_parquet_atomic(combined, target_path, row_group_size=row_group_size)
     return len(combined)

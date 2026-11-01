@@ -130,7 +130,7 @@ class EquityEODScraper:
                             merged_batch,
                             target,
                             dedup_cols=["Date", "Exchange", "InstrumentId", "Series"],
-                            sort_cols=["Date", "Symbol"],
+                            sort_cols=["Symbol", "Date"],
                         )
                         for key, r_cnt, raw_b, s_url in ok_records:
                             self.state.record(dataset_name, key, "OK", row_count=r_cnt, raw_bytes=raw_b, source_url=s_url)
@@ -258,7 +258,7 @@ class EquityEODScraper:
                         grp,
                         target,
                         dedup_cols=["Date", "Exchange", "InstrumentId", "Series"],
-                        sort_cols=["Date", "Symbol"],
+                        sort_cols=["Symbol", "Date"],
                     )
                 for key, df_out, s_url in res:
                     if df_out is not None and not df_out.empty:
@@ -320,7 +320,7 @@ class EquityEODScraper:
             out = repair_ohlc(out)
             target = self.cfg.root_dir / "equities" / f"nse_cm_{year}.parquet"
             upsert_parquet_partition(
-                out, target, dedup_cols=["Date", "Exchange", "InstrumentId", "Series"], sort_cols=["Date", "Symbol"]
+                out, target, dedup_cols=["Date", "Exchange", "InstrumentId", "Series"], sort_cols=["Symbol", "Date"]
             )
             self.state.record("nse_historical_or_symbol", key, "OK", len(out), resp.content, url)
             await asyncio.sleep(0.35)

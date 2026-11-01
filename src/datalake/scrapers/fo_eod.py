@@ -88,7 +88,7 @@ class DerivativesEODScraper:
                                 grp,
                                 target,
                                 dedup_cols=["Date", "Exchange", "InstrumentType", "Symbol", "ExpiryDate", "StrikePrice", "OptionType"],
-                                sort_cols=["Date", "Symbol", "ExpiryDate", "StrikePrice", "OptionType"],
+                                sort_cols=["Symbol", "Date", "ExpiryDate", "StrikePrice", "OptionType"],
                             )
                         # Commit 'OK' watermarks only AFTER Parquet files are safely written!
                         for key, r_cnt, raw_b, s_url in ok_records:
