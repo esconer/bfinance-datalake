@@ -51,9 +51,17 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Enable Cloudflare WARP (Masks Azure IP for NSE/BSE APIs)
-        uses: stenic/warp-github-action@v1.3.0
+      - name: Enable Cloudflare WARP (Official Cloudflare apt Package)
         continue-on-error: true
+        run: |
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          sudo apt-get update -y
+          sudo apt-get install -y cloudflare-warp
+          warp-cli --accept-tos registration new || warp-cli --accept-tos register || true
+          warp-cli --accept-tos connect || true
+          sleep 4
+          curl -fsSL https://www.cloudflare.com/cdn-cgi/trace | grep "warp=" || true
 
       - name: Install uv & Python 3.12
         uses: astral-sh/setup-uv@v4
@@ -122,7 +130,6 @@ jobs:
           if [ -d data ] && [ -f data/state.db ]; then
             uv run datalake stage-release --staging-dir /tmp/release_assets
             tar --zstd -cf /tmp/release_assets/datalake_store.tar.zst data/
-            # Verify archive integrity before uploading so a broken tar never overwrites the release
             tar --zstd -tf /tmp/release_assets/datalake_store.tar.zst >/dev/null
             gh release upload datalake-latest /tmp/release_assets/* --clobber
           fi
