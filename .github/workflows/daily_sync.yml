@@ -1,0 +1,129 @@
+name: Cloud Data Lake (Backfill, Daily Sync & Self-Healing Doctor)
+
+on:
+  schedule:
+    # 1. 7:15 PM IST (13:45 UTC) Mon-Fri: Daily EOD NSE & BSE Bhavcopy, Delivery, F&O, Indices, Deals
+    - cron: "45 13 * * 1-5"
+    # 2. 10:00 PM IST (16:30 UTC) Mon-Fri: AMFI Mutual Fund NAVAll.txt & late EOD catch-up
+    - cron: "30 16 * * 1-5"
+
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Mode to run in the cloud"
+        required: true
+        default: "daily"
+        type: choice
+        options:
+          - daily
+          - backfill
+          - seed-cloud-pre2016
+          - xbrl-all-market
+          - doctor-only
+      start_date:
+        description: "Backfill start date (YYYY-MM-DD)"
+        required: false
+        default: "2016-01-01"
+      end_date:
+        description: "Backfill end date (YYYY-MM-DD, leave blank for today)"
+        required: false
+        default: ""
+      include_fo:
+        description: "Include F&O Option Chains & Futures"
+        required: false
+        default: false
+        type: boolean
+      include_amfi_history:
+        description: "Include AMFI Historical NAVs (2006+)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  run-datalake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Enable Cloudflare WARP (Masks Azure IP for NSE/BSE APIs)
+        uses: stenic/warp-github-action@v1.3.0
+        continue-on-error: true
+
+      - name: Install uv & Python 3.12
+        uses: astral-sh/setup-uv@v4
+        with:
+          python-version: "3.12"
+
+      - name: Install Dependencies
+        run: uv sync
+
+      - name: Restore Existing Data Lake from GitHub Release (`datalake-latest`)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data
+          if gh release view datalake-latest >/dev/null 2>&1; then
+            echo "Downloading existing datalake-latest archive..."
+            gh release download datalake-latest -p "datalake_store.tar.zst" -D /tmp/ --clobber || true
+            if [ -f /tmp/datalake_store.tar.zst ]; then
+              tar --zstd -xf /tmp/datalake_store.tar.zst -C ./
+              rm -f /tmp/datalake_store.tar.zst
+            fi
+          else
+            echo "Creating initial datalake-latest release..."
+            gh release create datalake-latest --title "Automated Indian Financial Data Lake (Latest)" --notes "Rolling Zstd-Parquet Data Lake & SQLite Watermark Store"
+          fi
+
+      - name: Pre-Flight Self-Healing Doctor Check
+        run: uv run datalake doctor
+
+      - name: Execute Scraper in Cloud
+        run: |
+          MODE="${{ github.event.inputs.mode || 'daily' }}"
+          if [ "$MODE" = "backfill" ]; then
+            ARGS="--start ${{ github.event.inputs.start_date || '2016-01-01' }}"
+            if [ -n "${{ github.event.inputs.end_date }}" ]; then
+              ARGS="$ARGS --end ${{ github.event.inputs.end_date }}"
+            fi
+            if [ "${{ github.event.inputs.include_fo }}" = "true" ]; then
+              ARGS="$ARGS --include-fo"
+            fi
+            if [ "${{ github.event.inputs.include_amfi_history }}" = "true" ]; then
+              ARGS="$ARGS --amfi-history"
+            fi
+            uv run datalake backfill $ARGS
+          elif [ "$MODE" = "seed-cloud-pre2016" ]; then
+            uv run datalake seed-cloud --start-year 2000 --end-year 2015
+          elif [ "$MODE" = "xbrl-all-market" ]; then
+            uv run datalake xbrl --all-market --limit 500
+          elif [ "$MODE" = "doctor-only" ]; then
+            uv run datalake doctor
+          else
+            uv run datalake daily --lookback-days 10
+          fi
+
+      - name: Post-Run Self-Healing Doctor & Status Verification
+        if: always()
+        run: |
+          uv run datalake doctor
+          uv run datalake status
+
+      - name: Package, Verify & Publish Updated Data Lake to GitHub Release (`datalake-latest`)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -d data ] && [ -f data/state.db ]; then
+            tar --zstd -cf /tmp/datalake_store.tar.zst data/
+            # Verify archive integrity before uploading so a broken tar never overwrites the release
+            tar --zstd -tf /tmp/datalake_store.tar.zst >/dev/null
+            gh release upload datalake-latest /tmp/datalake_store.tar.zst --clobber
+            find data/ -name "*.parquet" -size -1900M -exec gh release upload datalake-latest {} --clobber \;
+            gh release upload datalake-latest data/state.db --clobber
+          fi

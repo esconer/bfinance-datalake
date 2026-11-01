@@ -1,0 +1,86 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Scratch & development notes
+.scratch/
+scratch/
+*.scratch
+
+# Data Lake Storage, Parquet Partitions, Watermark DB & Temp files
+data/
+smoke_data/
+*.parquet
+*.parquet.tmp
+*.tmp
+*.part
+*.db
+*.db-shm
+*.db-wal
+*.db.corrupt
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# Unit test / coverage / lint caches
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / Editor configurations
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS specific files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Secrets & Environment variables
+.env
+.env.*
+*.pem
+*.key
