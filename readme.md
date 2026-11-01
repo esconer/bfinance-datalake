@@ -1,4 +1,11 @@
- Command Reference
+# bfinance-datalake
+
+Automated historical backfill & daily EOD scraper for Indian Equities, F&O, Indices, XBRL Fundamentals, Shareholding, Deals, and Mutual Funds.
+
+## Documentation
+- [Upstox Historical Candle CDN Integration](docs/upstox_data_integration.md) - Details on public CDN endpoints, schemas, corporate action adjustments, and multi-decade coverage boundaries.
+
+## Command Reference
 
 ```bash
 # 1. Install dependencies
