@@ -21,6 +21,7 @@ Every feed in this repository has been rigorously verified via empirical live ne
 | [**Deals, Insider Trading & Market Activity**](deals_insider_and_market_activity.md) | NSE & BSE Bulk & Block Deals, Cash Market Provisional FII / DII Daily Flows (₹ Crores), SEBI PIT Insider Trading Disclosures (Reg 7(2)) | NSE Archives, NSE Corporates API | HTTPS CSV (UTF-8 BOM), JSON | **`2004-01-01` (Deals) / `2016-01-01` (PIT)** | Daily EOD (~18:00 IST) / Real-time Disclosures |
 | [**Unified Query Engine**](unified_query_engine.md) | `UnifiedLakeEngine`: Universal crosswalk resolution (`RELIANCE` == `500325` == `INE002A01018`), PyArrow row-group pushdown, DuckDB zero-copy SQL interface | In-Memory Parquet Engine, DuckDB | Python API, DuckDB SQL | **Full Lake Coverage** | Sub-millisecond In-Memory Queries |
 | [**Smart Cloud Delta Sync & Releases**](cloud_sync_and_releases.md) | 3-stage architecture: GitHub Actions daily delta builds, SHA-256 `manifest.json` indexing, and ~1.5s local incremental pull via `datalake pull` | GitHub Actions, GitHub Releases | HTTPS JSON Manifest + Parquet Asset Downloads | **`1995` to Present** | Daily at 7:15 PM & 10:00 PM IST |
+| [**Zero-Disk Remote Querying**](zero_disk_remote_querying.md) | `RemoteLakeClient`: Direct HTTPS queries over GitHub Releases via DuckDB `httpfs` byte-range requests with 0 MB downloaded to disk | DuckDB `httpfs`, GitHub Releases | Remote Parquet Byte-Range Queries | **Full Lake Coverage** | ~300–550 ms Zero-Disk Remote Queries |
 
 ---
 
@@ -61,3 +62,13 @@ To download multi-decade historical archives and real-time feeds reliably withou
    - Dual UTF-8 and Windows-1252 (`cp1252`) decoding to handle typographical symbols and accents in AMFI flat files and legacy BSE records.
 5. **Atomic Storage & File Lock Protection**:
    - Unique temporary file generation (`.{uuid}.tmp`) with exponential retry loops and explicit garbage collection (`gc.collect()`) to prevent Windows OS `PermissionError` file-locking deadlocks during Parquet partition upserts.
+
+
+---
+
+## 4. License & Statutory Notice
+
+`bfinance-datalake` is licensed under the **GNU Affero General Public License v3.0 or later** (`AGPL-3.0-or-later`).  
+See [`LICENSE`](../LICENSE) and [`NOTICE`](../NOTICE) for full terms.
+
+Pursuant to Section 7(b) of the GNU AGPLv3, all redistributions must preserve the 4-point **Legal Disclaimer, Data Ownership & Provenance, and SEBI Compliance Notice** intact.

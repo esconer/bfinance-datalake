@@ -1,0 +1,53 @@
+bfinance & bfinance-datalake
+Copyright (C) 2026 esconer (https://github.com/esconer/bfinance-datalake)
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version.
+
+Pursuant to Section 7(b) of the GNU Affero General Public License v3.0, all
+copies, forks, or redistributions of this software must retain the following
+Legal Disclaimer, Data Provenance, and SEBI Compliance Notices intact:
+
+========================================================================
+LEGAL DISCLAIMER, DATA PROVENANCE & SEBI NOTICE
+========================================================================
+
+1. NO AFFILIATION WITH EXCHANGES OR REGULATORS
+`bfinance` and `bfinance-datalake` are independent, open-source software
+tools designed for educational, academic, and quantitative research
+purposes. This project is NOT affiliated with, endorsed by, sponsored by,
+or vetted by the National Stock Exchange of India Ltd. (NSE), BSE Ltd.
+(formerly Bombay Stock Exchange), NSE Indices Ltd., the Association of
+Mutual Funds in India (AMFI), or the Securities and Exchange Board of
+India (SEBI).
+
+2. DATA OWNERSHIP & PERMITTED USE
+All financial data, end-of-day (EOD) bhavcopies, XBRL filings, indices,
+corporate actions, and mutual fund NAVs retrieved or cached by this
+software are sourced from publicly accessible statutory filings and
+archives and remain the intellectual property of their respective
+exchanges, issuers, and regulatory bodies.
+- Any pre-built Parquet caches or release artifacts in this repository
+  are provided strictly as a technical mirror for personal, educational,
+  and non-commercial research use.
+- Users are solely responsible for complying with the Terms of Use of
+  upstream data providers (NSE, BSE, AMFI) and must not redistribute
+  raw exchange data commercially without obtaining appropriate licenses
+  from the respective exchanges.
+
+3. NOT INVESTMENT ADVICE (SEBI COMPLIANCE)
+Nothing contained in this software, its outputs, screeners, ratios, or
+documentation constitutes financial, investment, legal, or tax advice,
+nor does it constitute a recommendation under the SEBI (Research
+Analysts) Regulations, 2014 or SEBI (Investment Advisers) Regulations,
+2013.
+
+4. NO WARRANTY & LIMITATION OF LIABILITY
+Market data may be delayed, incomplete, unadjusted, or subject to
+upstream formatting changes or errors. In no event shall the authors,
+maintainers, or contributors be liable for any financial losses, trading
+losses, damages, or claims arising from the use of this software or the
+data retrieved by it. Always verify critical figures against official
+exchange filings before making any financial decisions.
