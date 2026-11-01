@@ -124,6 +124,7 @@ class ResilientHTTPClient:
         retries: int = 3,
         prime_nse: bool = False,
         prime_bse: bool = False,
+        timeout: float = 60.0,
     ):
         req_headers = headers or ARCHIVE_HEADERS
         if prime_nse or "www.nseindia.com" in url:
@@ -139,7 +140,7 @@ class ResilientHTTPClient:
             try:
                 if self.curl_session is not None and is_exchange:
                     c_resp = await self.curl_session.get(
-                        url, headers=req_headers, params=params, allow_redirects=True
+                        url, headers=req_headers, params=params, allow_redirects=True, timeout=timeout
                     )
                     resp = SimpleHTTPResponse(
                         status_code=c_resp.status_code,
@@ -147,7 +148,7 @@ class ResilientHTTPClient:
                         headers=dict(c_resp.headers),
                     )
                 elif self.client is not None:
-                    h_resp = await self.client.get(url, headers=req_headers, params=params)
+                    h_resp = await self.client.get(url, headers=req_headers, params=params, timeout=timeout)
                     resp = SimpleHTTPResponse(
                         status_code=h_resp.status_code,
                         content=h_resp.content,
@@ -155,7 +156,7 @@ class ResilientHTTPClient:
                     )
                 elif self.curl_session is not None:
                     c_resp = await self.curl_session.get(
-                        url, headers=req_headers, params=params, allow_redirects=True
+                        url, headers=req_headers, params=params, allow_redirects=True, timeout=timeout
                     )
                     resp = SimpleHTTPResponse(
                         status_code=c_resp.status_code,
@@ -201,6 +202,7 @@ class ResilientHTTPClient:
         headers: dict[str, str] | None = None,
         retries: int = 3,
         prime_nifty: bool = False,
+        timeout: float = 60.0,
     ):
         req_headers = headers or NIFTY_INDICES_HEADERS
         if prime_nifty or "niftyindices.com" in url:
@@ -212,7 +214,7 @@ class ResilientHTTPClient:
             try:
                 if self.curl_session is not None:
                     c_resp = await self.curl_session.post(
-                        url, json=json_body, headers=req_headers, allow_redirects=False, timeout=60.0
+                        url, json=json_body, headers=req_headers, allow_redirects=False, timeout=timeout
                     )
                     resp = SimpleHTTPResponse(
                         status_code=c_resp.status_code,
@@ -220,7 +222,7 @@ class ResilientHTTPClient:
                         headers=dict(c_resp.headers),
                     )
                 elif self.client is not None:
-                    resp = await self.client.post(url, json=json_body, headers=req_headers, timeout=60.0)
+                    resp = await self.client.post(url, json=json_body, headers=req_headers, timeout=timeout)
                 else:
                     raise RuntimeError("curl_cffi or httpx required for POST calls")
 

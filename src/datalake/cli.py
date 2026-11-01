@@ -24,6 +24,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("datalake.cli")
 
 
@@ -150,7 +151,7 @@ async def run_pre2016_nse(cfg: LakeConfig, symbols: list[str], start_year: int, 
             await eq.backfill_nse_symbol_via_historical_or(sym, start_year=start_year, end_year=end_year)
 
 
-async def run_seed_cloud(cfg: LakeConfig, start_year: int, end_year: int, limit: int | None) -> None:
+async def run_seed_cloud(cfg: LakeConfig, start_year: int = 2008, end_year: int = 2015, limit: int | None = None) -> None:
     cfg.ensure_dirs()
     state = StateStore(cfg.state_db_path)
     async with ResilientHTTPClient() as http:
@@ -188,7 +189,7 @@ def main() -> None:
     p_bf.add_argument("--start", default="2016-01-01", help="Start date YYYY-MM-DD")
     p_bf.add_argument("--end", default=None, help="End date YYYY-MM-DD (default: today IST)")
     p_bf.add_argument("--include-fo", action="store_true", help="Also backfill daily NSE/BSE F&O Option Chains & Futures")
-    p_bf.add_argument("--amfi-history", action="store_true", help="Also backfill 90-day AMFI NAV windows since 2006")
+    p_bf.add_argument("--amfi-history", action="store_true", help="Also backfill 30-day AMFI NAV windows since 2006")
 
     # 2. daily
     p_dy = sub.add_parser("daily", help="Incremental daily update from last watermark to today IST")
@@ -209,8 +210,8 @@ def main() -> None:
     p_p16.add_argument("--end-year", type=int, default=2015)
 
     # 5. seed-cloud
-    p_sc = sub.add_parser("seed-cloud", help="Cloud-native 2000-2015 NSE backfill via Upstox public V2 CDN")
-    p_sc.add_argument("--start-year", type=int, default=2000)
+    p_sc = sub.add_parser("seed-cloud", help="Cloud-native 2008-2015 NSE backfill via Upstox public V2 CDN")
+    p_sc.add_argument("--start-year", type=int, default=2008)
     p_sc.add_argument("--end-year", type=int, default=2015)
     p_sc.add_argument("--limit", type=int, default=None)
 

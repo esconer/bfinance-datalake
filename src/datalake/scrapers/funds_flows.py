@@ -49,7 +49,7 @@ class FundsAndFlowsScraper:
 
         for url in AMFI_DAILY_MIRRORS:
             try:
-                resp = await self.http.get(url, headers=ARCHIVE_HEADERS)
+                resp = await self.http.get(url, headers=ARCHIVE_HEADERS, timeout=90.0)
                 if resp.status_code == 200 and ";" in resp.text:
                     parsed = self._parse_amfi_text(resp.text)
                     if len(parsed) >= 100:
@@ -72,7 +72,7 @@ class FundsAndFlowsScraper:
         for year, grp in df.groupby(df["Date"].dt.year):
             target = self.cfg.root_dir / "mutual_funds" / f"amfi_nav_{int(year)}.parquet"
             upsert_parquet_partition(
-                grp, target, dedup_cols=["Date", "SchemeCode"], sort_cols=["Date", "SchemeCode"]
+                grp, target, dedup_cols=["Date", "SchemeCode"], sort_cols=["SchemeCode", "Date"]
             )
         max_dt = df["Date"].max().date().isoformat()
         self.state.record("amfi_nav_daily", max_dt, "OK", len(df), raw_content, used_url)
@@ -88,7 +88,7 @@ class FundsAndFlowsScraper:
         for code in scheme_codes:
             url = f"https://api.mfapi.in/mf/{code}"
             try:
-                resp = await self.http.get(url, headers={"Accept": "application/json"})
+                resp = await self.http.get(url, headers={"Accept": "application/json"}, timeout=60.0)
                 if resp.status_code != 200:
                     continue
                 payload = resp.json()
@@ -124,15 +124,16 @@ class FundsAndFlowsScraper:
         for year, grp in combined.groupby(combined["Date"].dt.year):
             target = self.cfg.root_dir / "mutual_funds" / f"amfi_nav_{int(year)}.parquet"
             upsert_parquet_partition(
-                grp, target, dedup_cols=["Date", "SchemeCode"], sort_cols=["Date", "SchemeCode"]
+                grp, target, dedup_cols=["Date", "SchemeCode"], sort_cols=["SchemeCode", "Date"]
             )
         return combined
 
     async def backfill_amfi_history(self, start_date: date = date(2006, 4, 1), end_date: date | None = None) -> None:
+        """Walks AMFI historical NAVs in 30-day windows with a 120s timeout so large windows never time out."""
         end = end_date or today_ist()
         cur = start_date
         while cur <= end:
-            win_end = min(end, cur + timedelta(days=89))
+            win_end = min(end, cur + timedelta(days=29))
             key = f"{cur.isoformat()}_{win_end.isoformat()}"
             if self.state.is_completed("amfi_nav_window", key):
                 cur = win_end + timedelta(days=1)
@@ -140,18 +141,20 @@ class FundsAndFlowsScraper:
 
             params = {"frmdt": cur.strftime("%d-%b-%Y"), "todt": win_end.strftime("%d-%b-%Y")}
             try:
-                resp = await self.http.get(self.AMFI_HIST_URL, headers=ARCHIVE_HEADERS, params=params)
+                resp = await self.http.get(
+                    self.AMFI_HIST_URL, headers=ARCHIVE_HEADERS, params=params, timeout=120.0
+                )
                 resp.raise_for_status()
                 df = self._parse_amfi_text(resp.text)
                 if not df.empty:
                     for year, grp in df.groupby(df["Date"].dt.year):
                         target = self.cfg.root_dir / "mutual_funds" / f"amfi_nav_{int(year)}.parquet"
                         upsert_parquet_partition(
-                            grp, target, dedup_cols=["Date", "SchemeCode"], sort_cols=["Date", "SchemeCode"]
+                            grp, target, dedup_cols=["Date", "SchemeCode"], sort_cols=["SchemeCode", "Date"]
                         )
                     self.state.record("amfi_nav_window", key, "OK", len(df), resp.content)
                     logger.info("[AMFI History %s] Saved %d rows", key, len(df))
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.5)
             except Exception as exc:
                 logger.warning("[AMFI History %s] Failed: %s", key, exc)
             cur = win_end + timedelta(days=1)

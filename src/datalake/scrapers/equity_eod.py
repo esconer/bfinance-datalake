@@ -184,89 +184,120 @@ class EquityEODScraper:
         return repair_ohlc(leg_df), raw_leg, url_leg
 
     async def seed_pre2016_via_upstox_cdn(
-        self, start_year: int = 2000, end_year: int = 2015, max_symbols: int | None = None
+        self, start_year: int = 2008, end_year: int = 2015, max_symbols: int | None = None
     ) -> None:
+        """
+        100% Cloud/GitHub-Actions-compatible backfill for 2008–2015 NSE Equities.
+        Chunks requests into 4-year windows (to respect Upstox V2's max range limit)
+        and filters to EQ-series stocks that were actually listed on or before the window.
+        """
         master_path = self.cfg.root_dir / "universe" / "nse_equity_master.parquet"
         if not master_path.exists():
             logger.warning("Run sync_security_masters() first so ISINs are available.")
             return
 
-        mdf = read_table_safe(master_path)
+        mdf = read_table_safe(master_path).copy()
+        mdf.columns = [c.strip() for c in mdf.columns]
         isin_col = next((c for c in mdf.columns if "ISIN" in c.upper()), None)
+        list_col = next((c for c in mdf.columns if "LISTING" in c.upper()), None)
         if not isin_col:
             return
+
+        # Filter to EQ series only (Upstox uses NSE_BE| for BE series and rejects NSE_EQ| with 400)
+        if "SERIES" in mdf.columns:
+            mdf = mdf[mdf["SERIES"].astype(str).str.strip().str.upper() == "EQ"].copy()
+
+        # Filter out IPOs that listed after end_year
+        if list_col:
+            mdf["_list_dt"] = pd.to_datetime(mdf[list_col], format="mixed", dayfirst=True, errors="coerce")
+            mdf = mdf[mdf["_list_dt"].isna() | (mdf["_list_dt"].dt.year <= end_year)].copy()
 
         records = mdf[["SYMBOL", "SERIES", isin_col]].dropna().to_dict("records")
         if max_symbols:
             records = records[:max_symbols]
 
+        # Upstox daily candles start in 2008; chunk into 4-year windows so range is always <= 4 years
+        eff_start = max(2008, start_year)
+        windows: list[tuple[int, int]] = []
+        y = eff_start
+        while y <= end_year:
+            w_end = min(end_year, y + 3)
+            windows.append((y, w_end))
+            y = w_end + 1
+
         sem = asyncio.Semaphore(self.cfg.archive_concurrency)
 
-        async def _fetch_isin(rec: dict):
-            sym = str(rec["SYMBOL"]).strip()
-            ser = str(rec.get("SERIES", "EQ")).strip()
-            isin = str(rec[isin_col]).strip()
-            key = f"upstox_nse:{sym}:{start_year}_{end_year}"
-            if self.state.is_completed("upstox_cloud_seed", key):
-                return key, None, None
-            url = (
-                f"https://api.upstox.com/v2/historical-candle/NSE_EQ%7C{isin}"
-                f"/day/{end_year}-12-31/{start_year}-01-01"
-            )
-            async with sem:
-                try:
-                    resp = await self.http.get(url, headers={"Accept": "application/json"})
-                    await asyncio.sleep(0.15)
-                    if resp.status_code != 200:
-                        return key, None, url
-                    candles = resp.json().get("data", {}).get("candles", [])
-                    if not candles:
-                        self.state.record("upstox_cloud_seed", key, "HOLIDAY", source_url=url)
-                        return key, None, url
-                    cdf = pd.DataFrame(
-                        candles, columns=["Date", "Open", "High", "Low", "Close", "Volume", "OI"]
-                    )
-                    out = pd.DataFrame({
-                        "Date": pd.to_datetime(cdf["Date"]).dt.tz_localize(None).dt.normalize(),
-                        "Exchange": "NSE",
-                        "InstrumentId": sym,
-                        "Symbol": sym,
-                        "Series": ser,
-                        "ISIN": isin,
-                        "Open": pd.to_numeric(cdf["Open"], errors="coerce"),
-                        "High": pd.to_numeric(cdf["High"], errors="coerce"),
-                        "Low": pd.to_numeric(cdf["Low"], errors="coerce"),
-                        "Close": pd.to_numeric(cdf["Close"], errors="coerce"),
-                        "Last": pd.to_numeric(cdf["Close"], errors="coerce"),
-                        "PrevClose": pd.NA,
-                        "Volume": pd.to_numeric(cdf["Volume"], errors="coerce"),
-                        "TurnoverValue": pd.NA,
-                        "Trades": pd.NA,
-                        "DeliverableQty": pd.NA,
-                        "DeliveryPct": pd.NA,
-                    })
-                    return key, repair_ohlc(out), url
-                except Exception as exc:
-                    logger.warning("[Upstox Cloud Seed %s] %s", sym, exc)
-                    return key, None, url
+        for w_start, w_end in windows:
+            logger.info("[Upstox Cloud Seed %d..%d] Fetching %d pre-%d listed EQ stocks...", w_start, w_end, len(records), w_end + 1)
 
-        for chunk_start in range(0, len(records), 50):
-            batch_recs = records[chunk_start : chunk_start + 50]
-            res = await asyncio.gather(*[_fetch_isin(r) for r in batch_recs])
-            frames = [r[1] for r in res if r[1] is not None and not r[1].empty]
-            if frames:
-                combined = pd.concat(frames, ignore_index=True)
-                for yr, grp in combined.groupby(combined["Date"].dt.year):
-                    target = self.cfg.root_dir / "equities" / f"nse_cm_{int(yr)}.parquet"
-                    upsert_parquet_partition(
-                        grp,
-                        target,
-                        dedup_cols=["Date", "Exchange", "InstrumentId", "Series"],
-                        sort_cols=["Symbol", "Date"],
-                    )
-                for key, df_out, s_url in res:
-                    if df_out is not None and not df_out.empty:
-                        self.state.record("upstox_cloud_seed", key, "OK", row_count=len(df_out), source_url=s_url)
+            async def _fetch_isin(rec: dict, ws: int = w_start, we: int = w_end):
+                sym = str(rec["SYMBOL"]).strip()
+                ser = str(rec.get("SERIES", "EQ")).strip()
+                isin = str(rec[isin_col]).strip()
+                key = f"upstox_nse:{sym}:{ws}_{we}"
+                if self.state.is_completed("upstox_cloud_seed", key):
+                    return key, None, None
+                url = (
+                    f"https://api.upstox.com/v2/historical-candle/NSE_EQ%7C{isin}"
+                    f"/day/{we}-12-31/{ws}-01-01"
+                )
+                async with sem:
+                    try:
+                        resp = await self.http.get(url, headers={"Accept": "application/json"})
+                        await asyncio.sleep(0.15)
+                        if resp.status_code != 200:
+                            if resp.status_code in (400, 404):
+                                self.state.record("upstox_cloud_seed", key, "HOLIDAY", source_url=url)
+                            return key, None, url
+                        candles = resp.json().get("data", {}).get("candles", [])
+                        if not candles:
+                            self.state.record("upstox_cloud_seed", key, "HOLIDAY", source_url=url)
+                            return key, None, url
+                        cdf = pd.DataFrame(
+                            candles, columns=["Date", "Open", "High", "Low", "Close", "Volume", "OI"]
+                        )
+                        out = pd.DataFrame({
+                            "Date": pd.to_datetime(cdf["Date"]).dt.tz_localize(None).dt.normalize(),
+                            "Exchange": "NSE",
+                            "InstrumentId": sym,
+                            "Symbol": sym,
+                            "Series": ser,
+                            "ISIN": isin,
+                            "Open": pd.to_numeric(cdf["Open"], errors="coerce"),
+                            "High": pd.to_numeric(cdf["High"], errors="coerce"),
+                            "Low": pd.to_numeric(cdf["Low"], errors="coerce"),
+                            "Close": pd.to_numeric(cdf["Close"], errors="coerce"),
+                            "Last": pd.to_numeric(cdf["Close"], errors="coerce"),
+                            "PrevClose": pd.NA,
+                            "Volume": pd.to_numeric(cdf["Volume"], errors="coerce"),
+                            "TurnoverValue": pd.NA,
+                            "Trades": pd.NA,
+                            "DeliverableQty": pd.NA,
+                            "DeliveryPct": pd.NA,
+                        })
+                        return key, repair_ohlc(out), url
+                    except Exception as exc:
+                        logger.debug("[Upstox Cloud Seed %s] %s", sym, exc)
+                        return key, None, url
+
+            for chunk_start in range(0, len(records), 50):
+                batch_recs = records[chunk_start : chunk_start + 50]
+                res = await asyncio.gather(*[_fetch_isin(r) for r in batch_recs])
+                frames = [r[1] for r in res if r[1] is not None and not r[1].empty]
+                if frames:
+                    combined = pd.concat(frames, ignore_index=True)
+                    for yr, grp in combined.groupby(combined["Date"].dt.year):
+                        target = self.cfg.root_dir / "equities" / f"nse_cm_{int(yr)}.parquet"
+                        upsert_parquet_partition(
+                            grp,
+                            target,
+                            dedup_cols=["Date", "Exchange", "InstrumentId", "Series"],
+                            sort_cols=["Symbol", "Date"],
+                        )
+                    for key, df_out, s_url in res:
+                        if df_out is not None and not df_out.empty:
+                            self.state.record("upstox_cloud_seed", key, "OK", row_count=len(df_out), source_url=s_url)
+                    logger.info("[Upstox Cloud Seed %d..%d] Committed batch (%d symbols)", w_start, w_end, len(frames))
 
     async def backfill_nse_symbol_via_historical_or(
         self, symbol: str, start_year: int = 1995, end_year: int = 2015

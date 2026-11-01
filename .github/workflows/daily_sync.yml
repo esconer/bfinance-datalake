@@ -42,6 +42,13 @@ on:
 permissions:
   contents: write
 
+
+# Ensures runs always execute one-after-another in a queue and never overwrite each other!
+concurrency:
+    group: datalake-release-lock
+    cancel-in-progress: false
+
+
 jobs:
   run-datalake:
     runs-on: ubuntu-latest
@@ -107,7 +114,7 @@ jobs:
             fi
             uv run datalake backfill $ARGS
           elif [ "$MODE" = "seed-cloud-pre2016" ]; then
-            uv run datalake seed-cloud --start-year 2000 --end-year 2015
+            uv run datalake seed-cloud --start-year 2008 --end-year 2015
           elif [ "$MODE" = "xbrl-all-market" ]; then
             uv run datalake xbrl --all-market --limit 500
           elif [ "$MODE" = "doctor-only" ]; then
