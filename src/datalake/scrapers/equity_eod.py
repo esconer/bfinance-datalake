@@ -155,15 +155,23 @@ class EquityEODScraper:
 
         if day >= self.NSE_FULL_BHAV_CUTOVER:
             full_df, raw_full, url_full = await self._fetch_nse_sec_bhavdata_full(day)
-            if full_df is None:
-                return None, None, url_full
-            leg_df, _, _ = await self._fetch_nse_legacy_cm(day)
-            if leg_df is not None and "ISIN" in leg_df.columns:
-                isin_map = leg_df[["Symbol", "Series", "ISIN"]].drop_duplicates(subset=["Symbol", "Series"])
-                full_df = full_df.drop(columns=["ISIN"], errors="ignore").merge(
-                    isin_map, on=["Symbol", "Series"], how="left"
-                )
-            return repair_ohlc(full_df), raw_full, url_full
+            leg_df, raw_leg, url_leg = await self._fetch_nse_legacy_cm(day)
+            if full_df is not None:
+                if leg_df is not None and "ISIN" in leg_df.columns:
+                    isin_map = leg_df[["Symbol", "Series", "ISIN"]].drop_duplicates(subset=["Symbol", "Series"])
+                    full_df = full_df.drop(columns=["ISIN"], errors="ignore").merge(
+                        isin_map, on=["Symbol", "Series"], how="left"
+                    )
+                return repair_ohlc(full_df), raw_full, url_full
+            # Fallback when sec_bhavdata_full is missing/HTML on a trading day (e.g., 2022-08-08)
+            if leg_df is not None:
+                mto_df = await self._fetch_nse_mto_delivery(day)
+                if mto_df is not None:
+                    leg_df = leg_df.drop(columns=["DeliverableQty", "DeliveryPct"], errors="ignore").merge(
+                        mto_df, on=["Symbol", "Series"], how="left"
+                    )
+                return repair_ohlc(leg_df), raw_leg, url_leg
+            return None, None, url_full
 
         leg_df, raw_leg, url_leg = await self._fetch_nse_legacy_cm(day)
         if leg_df is None:
@@ -178,10 +186,6 @@ class EquityEODScraper:
     async def seed_pre2016_via_upstox_cdn(
         self, start_year: int = 2000, end_year: int = 2015, max_symbols: int | None = None
     ) -> None:
-        """
-        100% Cloud/GitHub-Actions-compatible backfill for 2000–2015 NSE Equities.
-        Uses Upstox's public, unauthenticated V2 Historical Candle CDN keyed by ISIN.
-        """
         master_path = self.cfg.root_dir / "universe" / "nse_equity_master.parquet"
         if not master_path.exists():
             logger.warning("Run sync_security_masters() first so ISINs are available.")
@@ -267,7 +271,6 @@ class EquityEODScraper:
     async def backfill_nse_symbol_via_historical_or(
         self, symbol: str, start_year: int = 1995, end_year: int = 2015
     ) -> None:
-        """Bypasses the pre-2016 `nsearchives` 403 block using `/api/historicalOR/generateSecurityWiseHistoricalData`."""
         sym = symbol.strip().upper()
         for year in range(start_year, end_year + 1):
             key = f"{sym}:{year}"
@@ -279,9 +282,9 @@ class EquityEODScraper:
                 "&type=priceVolumeDeliverable&series=ALL&csv=true"
             )
             resp = await self.http.get(url, headers=NSE_API_HEADERS, prime_nse=True)
-            if resp.status_code != 200 or not resp.text.strip():
+            if resp.status_code != 200 or not resp.text.strip() or resp.text.lstrip().startswith("<"):
                 continue
-            df = pd.read_csv(io.StringIO(resp.text))
+            df = pd.read_csv(io.StringIO(resp.text), on_bad_lines="skip")
             df.columns = [c.strip() for c in df.columns]
             if df.empty or "Date" not in df.columns:
                 self.state.record("nse_historical_or_symbol", key, "HOLIDAY", source_url=url)
@@ -330,9 +333,16 @@ class EquityEODScraper:
         resp = await self.http.get(url, headers=ARCHIVE_HEADERS)
         if resp.status_code in (404, 403):
             return None, None, url
-        resp.raise_for_status()
+        # Guard against HTML error pages served with HTTP 200 (e.g. 2022-08-08)
+        head_txt = resp.text[:250].lstrip()
+        if head_txt.startswith("<") or "SYMBOL" not in head_txt.upper():
+            return None, None, url
 
-        df = pd.read_csv(io.StringIO(resp.text))
+        try:
+            df = pd.read_csv(io.StringIO(resp.text), on_bad_lines="skip")
+        except Exception:
+            return None, None, url
+
         df.columns = [c.strip() for c in df.columns]
         for col in ("SYMBOL", "SERIES", "DATE1", "DELIV_QTY", "DELIV_PER"):
             if col in df.columns:
@@ -345,6 +355,7 @@ class EquityEODScraper:
             file_date = datetime.strptime(df["DATE1"].iloc[0], "%d-%b-%Y").date()
         except ValueError:
             return None, None, url
+
         if file_date != day:
             return None, None, url
 
@@ -376,22 +387,20 @@ class EquityEODScraper:
     async def _fetch_nse_udiff(self, day: date) -> tuple[pd.DataFrame | None, bytes | None, str]:
         url = f"https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_{day:%Y%m%d}_F_0000.csv.zip"
         resp = await self.http.get(url, headers=ARCHIVE_HEADERS)
-        if resp.status_code in (404, 403):
+        if resp.status_code in (404, 403) or not resp.content.startswith(b"PK"):
             return None, None, url
-        resp.raise_for_status()
         with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-            df = pd.read_csv(zf.open(zf.namelist()[0]))
+            df = pd.read_csv(zf.open(zf.namelist()[0]), on_bad_lines="skip")
         return self._normalize_udiff(df, day, "NSE"), resp.content, url
 
     async def _fetch_nse_legacy_cm(self, day: date) -> tuple[pd.DataFrame | None, bytes | None, str]:
         mon = day.strftime("%b").upper()
         url = f"https://nsearchives.nseindia.com/content/historical/EQUITIES/{day:%Y}/{mon}/cm{day:%d}{mon}{day:%Y}bhav.csv.zip"
         resp = await self.http.get(url, headers=ARCHIVE_HEADERS)
-        if resp.status_code in (404, 403):
+        if resp.status_code in (404, 403) or not resp.content.startswith(b"PK"):
             return None, None, url
-        resp.raise_for_status()
         with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-            df = pd.read_csv(zf.open(zf.namelist()[0]))
+            df = pd.read_csv(zf.open(zf.namelist()[0]), on_bad_lines="skip")
         df.columns = [c.strip() for c in df.columns]
         out = pd.DataFrame({
             "Date": pd.Timestamp(day),
@@ -449,8 +458,10 @@ class EquityEODScraper:
             resp = await self.http.get(url, headers=ARCHIVE_HEADERS)
             if resp.status_code in (404, 403):
                 return None, None, url
-            resp.raise_for_status()
-            df = pd.read_csv(io.StringIO(resp.text))
+            head_txt = resp.text[:250].lstrip()
+            if head_txt.startswith("<") or "TradDt" not in head_txt:
+                return None, None, url
+            df = pd.read_csv(io.StringIO(resp.text), on_bad_lines="skip")
             out = filter_bse_equity_only(self._normalize_udiff(df, day, "BSE"))
             raw_content = resp.content
         else:
@@ -460,9 +471,9 @@ class EquityEODScraper:
                 self.http.get(url, headers=ARCHIVE_HEADERS),
                 self.http.get(isin_url, headers=ARCHIVE_HEADERS),
             )
-            if resp.status_code in (404, 403):
+            # On Indian market holidays, BSE returns HTTP 200 with an HTML page instead of a PK zip!
+            if resp.status_code in (404, 403) or not resp.content.startswith(b"PK"):
                 return None, None, url
-            resp.raise_for_status()
             raw_content = resp.content
 
             with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
@@ -493,7 +504,7 @@ class EquityEODScraper:
                 "DeliveryPct": pd.NA,
             })
 
-            if isin_resp.status_code == 200:
+            if isin_resp.status_code == 200 and isin_resp.content.startswith(b"PK"):
                 try:
                     with zipfile.ZipFile(io.BytesIO(isin_resp.content)) as izf:
                         idf = pd.read_csv(izf.open(izf.namelist()[0]), on_bad_lines="skip")
@@ -519,12 +530,12 @@ class EquityEODScraper:
     async def _fetch_bse_delivery(self, day: date) -> pd.DataFrame | None:
         url = f"https://www.bseindia.com/BSEDATA/gross/{day:%Y}/SCBSEALL{day:%d%m}.zip"
         resp = await self.http.get(url, headers=ARCHIVE_HEADERS)
-        if resp.status_code in (404, 403):
+        if resp.status_code in (404, 403) or not resp.content.startswith(b"PK"):
             return None
         try:
             with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
                 raw_txt = zf.open(zf.namelist()[0]).read().decode("utf-8", errors="replace")
-            df = pd.read_csv(io.StringIO(raw_txt), sep="|")
+            df = pd.read_csv(io.StringIO(raw_txt), sep="|", on_bad_lines="skip")
             df.columns = [c.strip().upper() for c in df.columns]
             scrip_col = next((c for c in df.columns if "SCRIP" in c), None)
             qty_col = next((c for c in df.columns if "DELIVERY" in c and "QTY" in c), None)

@@ -24,6 +24,20 @@ def _has_parquet_engine() -> bool:
 HAS_PARQUET = _has_parquet_engine()
 
 
+def sanitize_for_parquet(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure object columns never mix numbers and strings when PyArrow serializes to Parquet."""
+    out = df.copy()
+    for col in out.columns:
+        if out[col].dtype == object:
+            non_null = out[col].dropna()
+            if non_null.empty:
+                continue
+            sample_types = {type(v) for v in non_null.iloc[:500]}
+            if len(sample_types) > 1 or (str not in sample_types):
+                out[col] = out[col].where(out[col].isna(), out[col].astype(str))
+    return out
+
+
 def read_table_safe(path: Path) -> pd.DataFrame:
     """
     Read a Parquet partition via an in-memory BytesIO buffer so PyArrow never holds
@@ -43,17 +57,18 @@ def write_parquet_atomic(df: pd.DataFrame, target_path: Path, row_group_size: in
     only download ~250 KB per stock instead of the whole file.
     """
     target_path.parent.mkdir(parents=True, exist_ok=True)
+    clean_df = sanitize_for_parquet(df)
     tmp_path = target_path.with_name(f"{target_path.stem}.{uuid.uuid4().hex[:8]}.tmp")
     try:
         if HAS_PARQUET:
-            df.to_parquet(
+            clean_df.to_parquet(
                 tmp_path,
                 compression="zstd",
                 index=False,
                 row_group_size=row_group_size,
             )
         else:
-            df.to_pickle(tmp_path)
+            clean_df.to_pickle(tmp_path)
 
         last_err: Exception | None = None
         for attempt in range(8):

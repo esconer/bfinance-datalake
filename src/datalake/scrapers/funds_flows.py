@@ -232,7 +232,9 @@ class FundsAndFlowsScraper:
                         await asyncio.sleep(self.cfg.polite_delay_sec)
                         if resp.status_code in (404, 403):
                             return d, None, None, url, None
-                        resp.raise_for_status()
+                        head_txt = resp.text[:250].lstrip()
+                        if head_txt.startswith("<") or "Client Type" not in head_txt:
+                            return d, None, None, url, None
                         lines = [ln for ln in resp.text.splitlines() if ln.strip()]
                         header_idx = next((i for i, ln in enumerate(lines) if "Client Type" in ln), 0)
                         df = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])))

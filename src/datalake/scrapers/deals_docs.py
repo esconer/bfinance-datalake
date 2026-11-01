@@ -21,6 +21,59 @@ BSE_DOC_SUBCATEGORIES = (
 )
 
 
+def _normalize_deals_frame(df: pd.DataFrame, deal_type: str, exchange: str = "NSE") -> pd.DataFrame:
+    """Clean and normalize Bulk & Block deals from either static CSV or historicalOR CSV."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    out.columns = [c.strip() for c in out.columns]
+    col_map = {
+        "BD_DT_DATE": "Date",
+        "BD_SYMBOL": "Symbol",
+        "BD_SCRIP_NAME": "Security Name",
+        "BD_CLIENT_NAME": "Client Name",
+        "BD_BUY_SELL": "Buy/Sell",
+        "BD_QTY_TRD": "Quantity Traded",
+        "BD_TP_WATP": "Trade Price / Wght. Avg. Price",
+        "BD_REMARKS": "Remarks",
+    }
+    out = out.rename(columns={k: v for k, v in col_map.items() if k in out.columns})
+    if "Date" not in out.columns:
+        return pd.DataFrame()
+
+    out = out[~out["Date"].astype(str).str.strip().str.upper().str.contains("NO RECORDS")].copy()
+    if "Symbol" in out.columns:
+        out = out[out["Symbol"].notna() & (out["Symbol"].astype(str).str.strip() != "")].copy()
+    if out.empty:
+        return pd.DataFrame()
+
+    out["Date"] = pd.to_datetime(out["Date"].astype(str).str.strip(), format="mixed", dayfirst=True, errors="coerce")
+    out = out.dropna(subset=["Date"])
+    if out.empty:
+        return pd.DataFrame()
+
+    for num_col in ("Quantity Traded", "Trade Price / Wght. Avg. Price"):
+        if num_col in out.columns:
+            out[num_col] = pd.to_numeric(
+                out[num_col].astype(str).str.replace(",", "").str.strip(), errors="coerce"
+            )
+
+    for str_col in ("Symbol", "Security Name", "Client Name", "Buy/Sell", "Remarks"):
+        if str_col in out.columns:
+            out[str_col] = out[str_col].fillna("").astype(str).str.strip()
+
+    out["DealType"] = deal_type
+    out["Exchange"] = exchange
+    keep = [
+        c for c in (
+            "Date", "Exchange", "DealType", "Symbol", "Security Name",
+            "Client Name", "Buy/Sell", "Quantity Traded", "Trade Price / Wght. Avg. Price", "Remarks",
+        )
+        if c in out.columns
+    ]
+    return out[keep].reset_index(drop=True)
+
+
 class DealsAndDocumentsScraper:
     """
     Scrapes:
@@ -42,29 +95,18 @@ class DealsAndDocumentsScraper:
             ("BLOCK", "https://nsearchives.nseindia.com/content/equities/block.csv"),
         ):
             resp = await self.http.get(url, headers=ARCHIVE_HEADERS)
-            if resp.status_code != 200:
+            if resp.status_code != 200 or resp.text.lstrip().startswith("<"):
                 continue
-            df = pd.read_csv(io.StringIO(resp.text))
-            df.columns = [c.strip() for c in df.columns]
-            if df.empty or "Date" not in df.columns:
-                continue
-            df = df[~df["Date"].astype(str).str.strip().str.upper().str.contains("NO RECORDS")].copy()
-            if "Symbol" in df.columns:
-                df = df[df["Symbol"].notna() & (df["Symbol"].astype(str).str.strip() != "")].copy()
+            raw_df = pd.read_csv(io.StringIO(resp.text), on_bad_lines="skip")
+            df = _normalize_deals_frame(raw_df, deal_type=deal_type, exchange="NSE")
             if df.empty:
                 continue
-            df["Date"] = pd.to_datetime(df["Date"], format="%d-%b-%Y", errors="coerce")
-            df = df.dropna(subset=["Date"])
-            if df.empty:
-                continue
-            df["DealType"] = deal_type
-            df["Exchange"] = "NSE"
             target = self.cfg.root_dir / "deals" / "bulk_block_deals.parquet"
             upsert_parquet_partition(
                 df,
                 target,
                 dedup_cols=["Date", "Exchange", "DealType", "Symbol", "Client Name", "Buy/Sell", "Quantity Traded"],
-                sort_cols=["Date", "Symbol"],
+                sort_cols=["Symbol", "Date"],
             )
             self.state.record(f"nse_{deal_type.lower()}_deals", today_ist().isoformat(), "OK", len(df), resp.content, url)
 
@@ -83,24 +125,21 @@ class DealsAndDocumentsScraper:
                 )
                 try:
                     resp = await self.http.get(url, headers=NSE_API_HEADERS, prime_nse=True)
-                    if resp.status_code != 200 or not resp.text.strip():
+                    if resp.status_code != 200 or not resp.text.strip() or resp.text.lstrip().startswith("<"):
                         continue
-                    df = pd.read_csv(io.StringIO(resp.text))
-                    df.columns = [c.strip() for c in df.columns]
-                    if df.empty or "Date" not in df.columns:
+                    raw_df = pd.read_csv(io.StringIO(resp.text), on_bad_lines="skip")
+                    df = _normalize_deals_frame(raw_df, deal_type=label, exchange="NSE")
+                    if df.empty:
                         self.state.record("nse_historical_or_deals", key, "HOLIDAY", source_url=url)
                         continue
-                    df["Date"] = pd.to_datetime(df["Date"].astype(str).str.strip(), format="mixed", dayfirst=True, errors="coerce")
-                    df = df.dropna(subset=["Date"])
-                    df["DealType"] = label
-                    df["Exchange"] = "NSE"
                     upsert_parquet_partition(
                         df,
                         target,
                         dedup_cols=["Date", "Exchange", "DealType", "Symbol", "Client Name", "Buy/Sell", "Quantity Traded"],
-                        sort_cols=["Date", "Symbol"],
+                        sort_cols=["Symbol", "Date"],
                     )
                     self.state.record("nse_historical_or_deals", key, "OK", len(df), resp.content, url)
+                    logger.info("[Historical Deals %s] Saved %d deals", key, len(df))
                 except Exception as exc:
                     logger.warning("[Historical Deals %s] Failed: %s", key, exc)
 
@@ -121,7 +160,7 @@ class DealsAndDocumentsScraper:
             )
             try:
                 resp = await self.http.get(url, headers=NSE_API_HEADERS, prime_nse=True)
-                if resp.status_code == 200:
+                if resp.status_code == 200 and resp.text.strip().startswith("{"):
                     data = resp.json().get("data", [])
                     if data:
                         df = pd.DataFrame(data)
@@ -190,14 +229,14 @@ class DealsAndDocumentsScraper:
                     folder = "AttachHis" if item.get("OLD") == 1 else "AttachLive"
                     pdf_url = f"https://www.bseindia.com/xml-data/corpfiling/{folder}/{att}" if att else None
                     all_rows.append({
-                        "NewsId": item.get("NEWSID"),
+                        "NewsId": str(item.get("NEWSID", "")),
                         "ScripCode": str(item.get("SCRIP_CD", "")),
-                        "CompanyName": item.get("SLONGNAME"),
+                        "CompanyName": str(item.get("SLONGNAME", "")),
                         "DocumentType": doc_label,
                         "Category": cat,
                         "SubCategory": subcat,
-                        "Headline": item.get("NEWSSUB"),
-                        "FilingTimestamp": item.get("NEWS_DT"),
+                        "Headline": str(item.get("NEWSSUB", "")),
+                        "FilingTimestamp": str(item.get("NEWS_DT", "")),
                         "PDFUrl": pdf_url,
                     })
                 if len(table) < 50:

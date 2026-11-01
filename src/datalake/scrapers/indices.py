@@ -225,8 +225,10 @@ class IndicesScraper:
                         await asyncio.sleep(self.cfg.polite_delay_sec)
                         if resp.status_code in (404, 403):
                             return d, None, None, url, None
-                        resp.raise_for_status()
-                        df = pd.read_csv(io.StringIO(resp.text))
+                        head_txt = resp.text[:250].lstrip()
+                        if head_txt.startswith("<") or "Index Name" not in head_txt:
+                            return d, None, None, url, None
+                        df = pd.read_csv(io.StringIO(resp.text), on_bad_lines="skip")
                         df.columns = [c.strip() for c in df.columns]
                         out = pd.DataFrame({
                             "Date": pd.Timestamp(d),

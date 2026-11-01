@@ -13,7 +13,7 @@ from datalake.adjuster import OHLCVAdjuster
 from datalake.config import LakeConfig
 from datalake.doctor import LakeDoctor
 from datalake.http_client import SimpleHTTPResponse
-from datalake.scrapers.deals_docs import DealsAndDocumentsScraper
+from datalake.scrapers.deals_docs import DealsAndDocumentsScraper, _normalize_deals_frame
 from datalake.scrapers.equity_eod import EquityEODScraper, filter_bse_equity_only, repair_ohlc
 from datalake.scrapers.fo_eod import DerivativesEODScraper
 from datalake.scrapers.funds_flows import FundsAndFlowsScraper
@@ -21,7 +21,7 @@ from datalake.scrapers.indices import IndicesScraper
 from datalake.scrapers.universe_actions import UniverseAndActionsScraper, parse_action_purpose
 from datalake.scrapers.xbrl import XBRLScraper
 from datalake.state import StateStore
-from datalake.storage import read_table_safe, write_parquet_atomic
+from datalake.storage import read_table_safe, sanitize_for_parquet, write_parquet_atomic
 from datalake.symbols import SymbolRenameResolver
 
 
@@ -183,9 +183,46 @@ def test_doctor_self_healing_and_adjuster():
         assert adj.loc[1, "Adj Close"] == 490.0
 
 
+def test_sanitize_for_parquet_mixed_types():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        df = pd.DataFrame({
+            "MixedCol": [100, "200", 300, None],
+            "StrCol": ["A", "B", "C", "D"],
+            "IntCol": [1, 2, 3, 4],
+        })
+        target = Path(tmpdir) / "test_mixed.parquet"
+        write_parquet_atomic(df, target)
+        read_df = read_table_safe(target)
+        assert read_df["MixedCol"].iloc[0] == "100"
+        assert read_df["MixedCol"].iloc[1] == "200"
+        assert pd.isna(read_df["MixedCol"].iloc[3])
+
+
+def test_normalize_deals_frame():
+    raw_hist = pd.DataFrame({
+        "BD_DT_DATE": ["05-JAN-2022", "NO RECORDS FOUND"],
+        "BD_SYMBOL": ["RELIANCE", ""],
+        "BD_SCRIP_NAME": ["Reliance Industries", ""],
+        "BD_CLIENT_NAME": ["ACE INVESTMENTS", ""],
+        "BD_BUY_SELL": ["BUY", ""],
+        "BD_QTY_TRD": ["1,500,000", "0"],
+        "BD_TP_WATP": ["2,450.50", "0"],
+        "BD_REMARKS": ["DEAL 1", ""],
+    })
+    res = _normalize_deals_frame(raw_hist, deal_type="BULK", exchange="NSE")
+    assert len(res) == 1
+    assert res.iloc[0]["Symbol"] == "RELIANCE"
+    assert res.iloc[0]["Quantity Traded"] == 1500000.0
+    assert res.iloc[0]["Trade Price / Wght. Avg. Price"] == 2450.50
+    assert res.iloc[0]["DealType"] == "BULK"
+    assert res.iloc[0]["Exchange"] == "NSE"
+
+
 if __name__ == "__main__":
     test_corporate_action_regex_parser()
     test_repair_ohlc_and_bse_debt_filter()
     test_xbrl_parsers()
     test_doctor_self_healing_and_adjuster()
+    test_sanitize_for_parquet_mixed_types()
+    test_normalize_deals_frame()
     print("ALL OFFLINE UNIT & INTEGRATION TESTS PASSED!")

@@ -90,7 +90,6 @@ class DerivativesEODScraper:
                                 dedup_cols=["Date", "Exchange", "InstrumentType", "Symbol", "ExpiryDate", "StrikePrice", "OptionType"],
                                 sort_cols=["Symbol", "Date", "ExpiryDate", "StrikePrice", "OptionType"],
                             )
-                        # Commit 'OK' watermarks only AFTER Parquet files are safely written!
                         for key, r_cnt, raw_b, s_url in ok_records:
                             self.state.record(dataset, key, "OK", r_cnt, raw_b, s_url)
 
@@ -98,19 +97,17 @@ class DerivativesEODScraper:
         if day >= self.FO_UDIFF_CUTOVER:
             url = f"https://nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_{day:%Y%m%d}_F_0000.csv.zip"
             resp = await self.http.get(url, headers=ARCHIVE_HEADERS)
-            if resp.status_code in (404, 403):
+            if resp.status_code in (404, 403) or not resp.content.startswith(b"PK"):
                 return None, None, url
-            resp.raise_for_status()
             with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-                df = pd.read_csv(zf.open(zf.namelist()[0]))
+                df = pd.read_csv(zf.open(zf.namelist()[0]), on_bad_lines="skip")
             return self._normalize_fo_udiff(df, day, "NSE"), resp.content, url
 
         mon = day.strftime("%b").upper()
         url = f"https://nsearchives.nseindia.com/content/historical/DERIVATIVES/{day:%Y}/{mon}/fo{day:%d}{mon}{day:%Y}bhav.csv.zip"
         resp = await self.http.get(url, headers=ARCHIVE_HEADERS)
-        if resp.status_code in (404, 403):
+        if resp.status_code in (404, 403) or not resp.content.startswith(b"PK"):
             return None, None, url
-        resp.raise_for_status()
         with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
             raw_csv = zf.open(zf.namelist()[0]).read().decode("utf-8", errors="replace")
 
@@ -157,8 +154,10 @@ class DerivativesEODScraper:
         resp = await self.http.get(url, headers=ARCHIVE_HEADERS)
         if resp.status_code in (404, 403):
             return None, None, url
-        resp.raise_for_status()
-        df = pd.read_csv(io.StringIO(resp.text))
+        head_txt = resp.text[:250].lstrip()
+        if head_txt.startswith("<") or "TradDt" not in head_txt:
+            return None, None, url
+        df = pd.read_csv(io.StringIO(resp.text), on_bad_lines="skip")
         return self._normalize_fo_udiff(df, day, "BSE"), resp.content, url
 
     @staticmethod
