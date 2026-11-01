@@ -5,6 +5,7 @@ import io
 import logging
 import re
 from datetime import date, timedelta
+
 import pandas as pd
 
 from datalake.config import LakeConfig, today_ist
@@ -243,6 +244,13 @@ class FundsAndFlowsScraper:
                         df = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])))
                         df.columns = [c.strip() for c in df.columns]
                         df = df[df["Client Type"].astype(str).str.strip().isin(["Client", "DII", "FII", "Pro"])].copy()
+                        df["Client Type"] = df["Client Type"].astype(str).str.strip()
+                        for col in df.columns:
+                            if col not in ("Client Type", "Date"):
+                                df[col] = pd.to_numeric(
+                                    df[col].astype(str).str.replace(",", "").str.strip().replace("-", pd.NA),
+                                    errors="coerce",
+                                )
                         df["Date"] = pd.Timestamp(d)
                         return d, df, resp.content, url, None
                     except Exception as exc:
