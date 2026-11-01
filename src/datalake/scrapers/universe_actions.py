@@ -92,6 +92,34 @@ def parse_action_purpose(text: str) -> dict:
     return out
 
 
+ACTION_NUMERIC_COLS: tuple[str, ...] = (
+    "DividendPerShareRs",
+    "BonusNew",
+    "BonusHeld",
+    "SplitFromFV",
+    "SplitToFV",
+    "ShareMultiplier",
+)
+
+
+def _normalize_action_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure all parsed corporate action numeric columns have strict float64 dtype."""
+    out = df.copy()
+    for col in ACTION_NUMERIC_COLS:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").astype("float64")
+        else:
+            out[col] = pd.Series(
+                1.0 if col == "ShareMultiplier" else float("nan"),
+                index=out.index,
+                dtype="float64",
+            )
+    out["ShareMultiplier"] = out["ShareMultiplier"].fillna(1.0).astype("float64")
+    if "ActionType" in out.columns:
+        out["ActionType"] = out["ActionType"].fillna("OTHER").astype(str)
+    return out
+
+
 class UniverseAndActionsScraper:
     """Syncs NSE/BSE Security Masters, Symbol Rename History, PIT Nifty Constituents, and 30Y Corporate Actions."""
 
@@ -188,7 +216,9 @@ class UniverseAndActionsScraper:
                 if isinstance(rows, list) and rows:
                     df = pd.DataFrame(rows)
                     df["ExDate"] = pd.to_datetime(df.get("exdate"), format="%Y%m%d", errors="coerce")
-                    parsed_cols = pd.DataFrame([parse_action_purpose(p) for p in df.get("Purpose", [])])
+                    parsed_cols = _normalize_action_frame(
+                        pd.DataFrame([parse_action_purpose(p) for p in df.get("Purpose", [])])
+                    )
                     df = pd.concat([df.reset_index(drop=True), parsed_cols], axis=1)
                     frames.append(df)
                     self.state.record(dataset, key, "OK", len(df), resp.content, url)
@@ -198,7 +228,7 @@ class UniverseAndActionsScraper:
 
         if frames:
             upsert_parquet_partition(
-                pd.concat(frames, ignore_index=True),
+                _normalize_action_frame(pd.concat(frames, ignore_index=True)),
                 target,
                 dedup_cols=["scrip_code", "exdate", "Purpose"],
                 sort_cols=["ExDate", "scrip_code"],
@@ -233,7 +263,9 @@ class UniverseAndActionsScraper:
                         continue
                     df = pd.DataFrame(rows)
                     df["ExDate"] = pd.to_datetime(df.get("exDate"), format="%d-%b-%Y", errors="coerce")
-                    parsed_cols = pd.DataFrame([parse_action_purpose(p) for p in df.get("subject", [])])
+                    parsed_cols = _normalize_action_frame(
+                        pd.DataFrame([parse_action_purpose(p) for p in df.get("subject", [])])
+                    )
                     df = pd.concat([df.reset_index(drop=True), parsed_cols], axis=1)
                     frames.append(df)
                     self.state.record(dataset, key, "OK", len(df), resp.content, url)
@@ -242,7 +274,7 @@ class UniverseAndActionsScraper:
 
             if frames:
                 upsert_parquet_partition(
-                    pd.concat(frames, ignore_index=True),
+                    _normalize_action_frame(pd.concat(frames, ignore_index=True)),
                     target,
                     dedup_cols=["symbol", "series", "exDate", "subject"],
                     sort_cols=["ExDate", "symbol"],

@@ -7,7 +7,7 @@ import pandas as pd
 
 from datalake.config import IST, LakeConfig
 from datalake.state import StateStore
-from datalake.storage import read_table_safe, write_parquet_atomic
+from datalake.storage import NUMERIC_FLOAT_COLS, read_table_safe, write_parquet_atomic
 
 logger = logging.getLogger("datalake.doctor")
 
@@ -79,6 +79,15 @@ class LakeDoctor:
                 pq_path.unlink(missing_ok=True)
                 stats["corrupt_parquets_removed"] += 1
                 continue
+
+            if not df.empty:
+                needs_schema_heal = any(
+                    col in df.columns and not pd.api.types.is_float_dtype(df[col])
+                    for col in NUMERIC_FLOAT_COLS
+                ) or df.columns.duplicated().any()
+                if needs_schema_heal:
+                    logger.info("[Doctor] Normalizing numeric/action schema in %s", pq_path.name)
+                    write_parquet_atomic(df, pq_path)
 
             if df.empty or "Date" not in df.columns:
                 continue

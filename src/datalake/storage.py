@@ -25,12 +25,56 @@ def _has_parquet_engine() -> bool:
 HAS_PARQUET = _has_parquet_engine()
 
 
+NUMERIC_FLOAT_COLS: frozenset[str] = frozenset({
+    "DividendPerShareRs",
+    "BonusNew",
+    "BonusHeld",
+    "SplitFromFV",
+    "SplitToFV",
+    "ShareMultiplier",
+})
+
+
+def _clean_object_value(v: object) -> str | None:
+    if v is None or v is pd.NA:
+        return None
+    if isinstance(v, float) and (v != v):
+        return None
+    if isinstance(v, (bytes, bytearray)):
+        return v.decode("utf-8", errors="replace")
+    try:
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+    return str(v)
+
+
+def _coerce_numeric_series(s: pd.Series, default_val: float | None = None) -> pd.Series:
+    if pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s):
+        s = s.map(
+            lambda v: v.decode("utf-8", errors="replace")
+            if isinstance(v, (bytes, bytearray))
+            else (None if (v is None or v is pd.NA or (isinstance(v, float) and v != v)) else v)
+        )
+    res = pd.to_numeric(s, errors="coerce").astype("float64")
+    if default_val is not None:
+        res = res.fillna(default_val).astype("float64")
+    return res
+
+
 def sanitize_for_parquet(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure object columns never mix numbers and strings when PyArrow serializes to Parquet."""
+    """Ensure numeric action columns are float64 and object columns never mix bytes/numbers/strings when PyArrow serializes to Parquet."""
     out = df.copy()
+    if out.columns.duplicated().any():
+        out = out.loc[:, ~out.columns.duplicated()].copy()
+
     for col in out.columns:
-        if pd.api.types.is_object_dtype(out[col]):
-            out[col] = out[col].map(lambda v: pd.NA if pd.isna(v) else str(v))
+        if col in NUMERIC_FLOAT_COLS:
+            default_v = 1.0 if col == "ShareMultiplier" else None
+            out[col] = _coerce_numeric_series(out[col], default_val=default_v)
+        elif pd.api.types.is_object_dtype(out[col]):
+            out[col] = out[col].map(_clean_object_value)
     return out
 
 
@@ -100,11 +144,12 @@ def upsert_parquet_partition(
         return 0
 
     if target_path.exists():
-        existing_df = read_table_safe(target_path)
-        combined = pd.concat([existing_df, new_df], ignore_index=True)
-        del existing_df
+        existing_df = sanitize_for_parquet(read_table_safe(target_path))
+        clean_new = sanitize_for_parquet(new_df)
+        combined = pd.concat([existing_df, clean_new], ignore_index=True)
+        del existing_df, clean_new
     else:
-        combined = new_df.copy()
+        combined = sanitize_for_parquet(new_df)
 
     valid_dedup = [c for c in dedup_cols if c in combined.columns]
     if valid_dedup:

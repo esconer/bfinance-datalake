@@ -184,11 +184,15 @@ def test_doctor_self_healing_and_adjuster():
 
 
 def test_sanitize_for_parquet_mixed_types():
+    from datalake.storage import upsert_parquet_partition
+
     with tempfile.TemporaryDirectory() as tmpdir:
         df = pd.DataFrame({
-            "MixedCol": [100, "200", 300, None],
-            "StrCol": ["A", "B", "C", "D"],
-            "IntCol": [1, 2, 3, 4],
+            "MixedCol": [100, "200", 300, None, b"400", float("nan")],
+            "StrCol": ["A", "B", "C", "D", "E", "F"],
+            "IntCol": [1, 2, 3, 4, 5, 6],
+            "SplitFromFV": [b"10.0", "5.0", 2.0, None, float("nan"), pd.NA],
+            "SplitToFV": [None, None, 1.0, None, None, None],
         })
         target = Path(tmpdir) / "test_mixed.parquet"
         write_parquet_atomic(df, target)
@@ -196,6 +200,42 @@ def test_sanitize_for_parquet_mixed_types():
         assert read_df["MixedCol"].iloc[0] == "100"
         assert read_df["MixedCol"].iloc[1] == "200"
         assert pd.isna(read_df["MixedCol"].iloc[3])
+        assert read_df["MixedCol"].iloc[4] == "400"
+        assert pd.isna(read_df["MixedCol"].iloc[5])
+        assert pd.api.types.is_float_dtype(read_df["SplitFromFV"])
+        assert read_df["SplitFromFV"].iloc[0] == 10.0
+        assert read_df["SplitFromFV"].iloc[2] == 2.0
+        assert pd.isna(read_df["SplitFromFV"].iloc[3])
+
+        # Verify upserting an all-None object batch followed by a float batch never raises ArrowTypeError
+        act_target = Path(tmpdir) / "nse_corporate_actions.parquet"
+        df_sme = pd.DataFrame({
+            "symbol": ["SME1", "SME2"],
+            "series": ["SM", "SM"],
+            "exDate": ["01-Jan-2026", "02-Jan-2026"],
+            "subject": ["Dividend Rs 2", "AGM"],
+            "ExDate": [pd.Timestamp("2026-01-01"), pd.Timestamp("2026-01-02")],
+            "SplitFromFV": [None, None],
+            "SplitToFV": [None, None],
+            "ShareMultiplier": [1.0, 1.0],
+        })
+        upsert_parquet_partition(df_sme, act_target, dedup_cols=["symbol", "series", "exDate", "subject"])
+
+        df_eq = pd.DataFrame({
+            "symbol": ["EQ1", "EQ2"],
+            "series": ["EQ", "EQ"],
+            "exDate": ["03-Jan-2026", "04-Jan-2026"],
+            "subject": ["Split 10 to 2", "Bonus 1:1"],
+            "ExDate": [pd.Timestamp("2026-01-03"), pd.Timestamp("2026-01-04")],
+            "SplitFromFV": [10.0, float("nan")],
+            "SplitToFV": [2.0, float("nan")],
+            "ShareMultiplier": [5.0, 2.0],
+        })
+        total = upsert_parquet_partition(df_eq, act_target, dedup_cols=["symbol", "series", "exDate", "subject"])
+        assert total == 4
+        merged_act = read_table_safe(act_target)
+        assert pd.api.types.is_float_dtype(merged_act["SplitFromFV"])
+        assert pd.api.types.is_float_dtype(merged_act["SplitToFV"])
 
 
 def test_normalize_deals_frame():
