@@ -6,6 +6,7 @@ import os
 import time
 import uuid
 from pathlib import Path
+
 import pandas as pd
 
 
@@ -28,13 +29,8 @@ def sanitize_for_parquet(df: pd.DataFrame) -> pd.DataFrame:
     """Ensure object columns never mix numbers and strings when PyArrow serializes to Parquet."""
     out = df.copy()
     for col in out.columns:
-        if out[col].dtype == object:
-            non_null = out[col].dropna()
-            if non_null.empty:
-                continue
-            sample_types = {type(v) for v in non_null.iloc[:500]}
-            if len(sample_types) > 1 or (str not in sample_types):
-                out[col] = out[col].where(out[col].isna(), out[col].astype(str))
+        if pd.api.types.is_object_dtype(out[col]):
+            out[col] = out[col].map(lambda v: pd.NA if pd.isna(v) else str(v))
     return out
 
 
