@@ -27,6 +27,9 @@ class SecurityIdentity:
     isin: str | None
     company_name: str | None
     aliases: tuple[str, ...]
+    face_value: float | None = None
+    industry: str | None = None
+    listing_date: str | None = None
 
 
 class UnifiedLakeEngine:
@@ -86,8 +89,16 @@ class UnifiedLakeEngine:
 
         nse_path = self.root / "universe" / "nse_equity_master.parquet"
         bse_path = self.root / "universe" / "bse_scrip_master.parquet"
+        pit_path = self.root / "universe" / "nifty_constituents_pit.parquet"
 
-        isin_to_bse: dict[str, tuple[str, str]] = {}
+        sym_to_industry: dict[str, str] = {}
+        if pit_path.exists():
+            pdf = read_table_safe(pit_path)
+            if "Symbol" in pdf.columns and "Industry" in pdf.columns:
+                for r in pdf.dropna(subset=["Symbol", "Industry"]).to_dict("records"):
+                    sym_to_industry[str(r["Symbol"]).strip().upper()] = str(r["Industry"]).strip()
+
+        isin_to_bse: dict[str, tuple[str, str, str | None]] = {}
         bse_records: list[dict] = []
         if bse_path.exists():
             bdf = read_table_safe(bse_path)
@@ -98,13 +109,16 @@ class UnifiedLakeEngine:
                     sc = sc[:-2]
                 isin = str(r.get("ISIN_NUMBER") or "").strip().upper()
                 name = str(r.get("Scrip_Name") or r.get("scrip_id") or "").strip()
+                ind = str(r.get("INDUSTRY") or "").strip() or None
                 if isin and isin not in ("", "NA", "NAN", "NONE") and sc:
-                    isin_to_bse[isin] = (sc, name)
+                    isin_to_bse[isin] = (sc, name, ind)
 
         if nse_path.exists():
             ndf = read_table_safe(nse_path)
             isin_col = next((c for c in ndf.columns if "ISIN" in c.upper()), "ISIN NUMBER")
             name_col = next((c for c in ndf.columns if "NAME" in c.upper()), "NAME OF COMPANY")
+            fv_col = next((c for c in ndf.columns if "FACE" in c.upper()), "FACE VALUE")
+            list_col = next((c for c in ndf.columns if "LISTING" in c.upper()), "DATE OF LISTING")
             for r in ndf.to_dict("records"):
                 sym = str(r.get("SYMBOL") or "").strip().upper()
                 if not sym:
@@ -113,19 +127,23 @@ class UnifiedLakeEngine:
                 if isin in ("", "NA", "NAN", "NONE"):
                     isin = None
                 name = str(r.get(name_col) or sym).strip()
-                bse_code = isin_to_bse.get(isin, (None, None))[0] if isin else None
+                bse_info = isin_to_bse.get(isin, (None, None, None)) if isin else (None, None, None)
+                fv_raw = pd.to_numeric(r.get(fv_col), errors="coerce")
                 aliases = tuple(self.resolver.all_aliases(sym))
                 ident = SecurityIdentity(
                     symbol=aliases[0],
-                    bse_code=bse_code,
+                    bse_code=bse_info[0],
                     isin=isin,
                     company_name=name,
                     aliases=aliases,
+                    face_value=float(fv_raw) if pd.notna(fv_raw) else None,
+                    industry=sym_to_industry.get(aliases[0]) or bse_info[2],
+                    listing_date=str(r.get(list_col) or "").strip() or None,
                 )
                 for al in aliases:
                     self._by_symbol[al] = ident
-                if bse_code:
-                    self._by_bse[bse_code] = ident
+                if bse_info[0]:
+                    self._by_bse[bse_info[0]] = ident
                 if isin:
                     self._by_isin[isin] = ident
 
@@ -140,12 +158,16 @@ class UnifiedLakeEngine:
                 isin = None
             sym = str(r.get("scrip_id") or r.get("Scrip_Name") or sc).strip().upper()
             name = str(r.get("Scrip_Name") or sym).strip()
+            ind = str(r.get("INDUSTRY") or "").strip() or None
             ident = SecurityIdentity(
                 symbol=sym,
                 bse_code=sc,
                 isin=isin,
                 company_name=name,
                 aliases=(sym,),
+                face_value=None,
+                industry=ind,
+                listing_date=None,
             )
             self._by_bse[sc] = ident
             if sym not in self._by_symbol:
@@ -271,6 +293,48 @@ class UnifiedLakeEngine:
         )
         adj = adj[(adj["Date"] >= s_dt) & (adj["Date"] <= e_dt)].reset_index(drop=True)
         return adj
+
+    def download(
+        self,
+        queries: list[str | int],
+        start: str | date | None = None,
+        end: str | date | None = None,
+        exchange: str = "NSE",
+        auto_adjust: bool = False,
+    ) -> dict[str, pd.DataFrame]:
+        """Vectorized multi-symbol OHLCV download reading each annual Parquet file only once."""
+        s_dt = pd.Timestamp(start) if start else pd.Timestamp("1994-01-01")
+        e_dt = pd.Timestamp(end) if end else pd.Timestamp.now().normalize()
+        exch = exchange.upper()
+        prefix = "nse_cm_" if exch == "NSE" else "bse_cm_"
+        eq_dir = self.root / "equities"
+        if not eq_dir.exists() or not queries:
+            return {}
+
+        idents = [self.resolve(q) for q in queries]
+        alias_to_canon = {al: ident.symbol for ident in idents for al in ident.aliases}
+        all_aliases = list(alias_to_canon.keys())
+
+        frames = []
+        for yr in range(s_dt.year, e_dt.year + 1):
+            p = eq_dir / f"{prefix}{yr}.parquet"
+            if p.exists():
+                sub = self._read_filtered_parquet(p, filters=[("Symbol", "in", all_aliases)])
+                if not sub.empty:
+                    frames.append(sub)
+        if not frames:
+            return {}
+
+        combined = pd.concat(frames, ignore_index=True)
+        combined["_CanonSymbol"] = combined["Symbol"].astype(str).str.strip().str.upper().map(alias_to_canon)
+        out_map: dict[str, pd.DataFrame] = {}
+        for canon_sym, grp in combined.groupby("_CanonSymbol"):
+            if exch == "NSE" and "Series" in grp.columns and "EQ" in set(grp["Series"].astype(str).str.strip()):
+                grp = grp[grp["Series"].astype(str).str.strip() == "EQ"]
+            grp = grp.drop(columns=["_CanonSymbol"]).sort_values("Date").drop_duplicates(subset=["Date"], keep="last")
+            adj = self.adjuster.apply_adjustments(grp, str(canon_sym), exchange=exch, auto_adjust=auto_adjust, include_future_splits=True)
+            out_map[str(canon_sym)] = adj[(adj["Date"] >= s_dt) & (adj["Date"] <= e_dt)].reset_index(drop=True)
+        return out_map
 
     def fundamentals(
         self,
@@ -439,6 +503,31 @@ class UnifiedLakeEngine:
             mask = mask | (df["ScripCode"].astype(str).str.strip() == ident.bse_code)
         return df[mask].reset_index(drop=True)
 
+    def concalls(self, query: str | int | None = None) -> pd.DataFrame:
+        """Return BSE Earnings Call Transcripts, Investor Presentations, Audio & Credit Ratings."""
+        p = self.root / "documents" / "concalls_and_filings.parquet"
+        if not p.exists():
+            return pd.DataFrame()
+        if query is None:
+            return read_table_safe(p)
+        ident = self.resolve(query)
+        if ident.bse_code:
+            return self._read_filtered_parquet(p, filters=[("ScripCode", "==", ident.bse_code)])
+        df = read_table_safe(p)
+        if df.empty or "CompanyName" not in df.columns or not ident.company_name:
+            return pd.DataFrame()
+        return df[df["CompanyName"].astype(str).str.contains(ident.symbol, case=False, na=False)].reset_index(drop=True)
+
+    def insider_trades(self, query: str | int | None = None) -> pd.DataFrame:
+        """Return SEBI PIT Regulation 7(2) Insider Trading & Promoter Pledge disclosures."""
+        p = self.root / "deals" / "insider_trading_pit.parquet"
+        if not p.exists():
+            return pd.DataFrame()
+        if query is None:
+            return read_table_safe(p)
+        ident = self.resolve(query)
+        return self._read_filtered_parquet(p, filters=[("symbol", "in", list(ident.aliases))])
+
     def optimize_layout(self) -> dict[str, int]:
         """
         Re-clusters all Equity Parquet files by `(Symbol, Date)` instead of `(Date, Symbol)`
@@ -497,9 +586,11 @@ class UnifiedLakeEngine:
                 "actions_bse": "actions/bse_corporate_actions.parquet",
                 "mutual_funds": "mutual_funds/amfi_nav_*.parquet",
                 "deals": "deals/bulk_block_deals.parquet",
+                "insider_pit": "deals/insider_trading_pit.parquet",
                 "participant_oi": "flows/fao_participant_oi_*.parquet",
                 "fii_dii": "flows/cash_fii_dii_flows.parquet",
                 "annual_reports": "documents/annual_reports.parquet",
+                "concalls": "documents/concalls_and_filings.parquet",
             }
             for view_name, glob_pat in views.items():
                 matches = list(self.root.glob(glob_pat))
@@ -566,3 +657,11 @@ class LakeTicker:
     @property
     def annual_reports(self) -> pd.DataFrame:
         return self.engine.annual_reports(self.identity.symbol)
+
+    @property
+    def concalls(self) -> pd.DataFrame:
+        return self.engine.concalls(self.identity.symbol)
+
+    @property
+    def insider_trades(self) -> pd.DataFrame:
+        return self.engine.insider_trades(self.identity.symbol)

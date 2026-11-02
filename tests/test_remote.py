@@ -68,6 +68,12 @@ class TestRemoteAndStorageLayout(unittest.TestCase):
         res = client.sql("SELECT 42 AS answer")
         self.assertEqual(int(res.iloc[0]["answer"]), 42)
 
+    def test_remote_client_clean_sym(self):
+        client = RemoteLakeClient("user/bfinance-datalake", load_httpfs=False)
+        self.assertEqual(client._clean_sym("RELIANCE.NS"), "RELIANCE")
+        self.assertEqual(client._clean_sym("500325.BO"), "500325")
+        self.assertEqual(client._clean_sym("TCS"), "TCS")
+
 
 if __name__ == "__main__":
     unittest.main()

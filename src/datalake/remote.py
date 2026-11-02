@@ -71,6 +71,11 @@ class RemoteLakeClient:
     def _asset_url(self, folder: str, filename: str) -> str:
         return f"{self.base_url}/{folder}__{filename}"
 
+    @staticmethod
+    def _clean_sym(symbol: str) -> str:
+        s = str(symbol).strip().upper()
+        return s[:-3] if s.endswith((".NS", ".BO")) else s
+
     def history(
         self,
         symbol: str,
@@ -83,7 +88,7 @@ class RemoteLakeClient:
         without downloading the full Parquet files to disk.
         """
         self._ensure_httpfs()
-        sym = symbol.strip().upper()
+        sym = self._clean_sym(symbol)
         if start_year > end_year:
             start_year, end_year = end_year, start_year
         prefix = "nse_cm_" if exchange.upper() == "NSE" else "bse_cm_"
@@ -98,13 +103,36 @@ class RemoteLakeClient:
         """
         return self.con.execute(query, [sym]).df()
 
+    def download(
+        self,
+        symbols: list[str],
+        start_year: int = 2024,
+        end_year: int = 2026,
+        exchange: str = "NSE",
+    ) -> pd.DataFrame:
+        """Stream multiple symbols in a single vectorized HTTP Range query."""
+        self._ensure_httpfs()
+        if not symbols:
+            return pd.DataFrame()
+        if start_year > end_year:
+            start_year, end_year = end_year, start_year
+        clean_syms = [self._clean_sym(s) for s in symbols]
+        prefix = "nse_cm_" if exchange.upper() == "NSE" else "bse_cm_"
+        urls = [self._asset_url("equities", f"{prefix}{yr}.parquet") for yr in range(start_year, end_year + 1)]
+        url_list_sql = ", ".join(f"'{u}'" for u in urls)
+        placeholders = ", ".join(["?"] * len(clean_syms))
+        return self.con.execute(
+            f"SELECT * FROM read_parquet([{url_list_sql}], union_by_name=true) WHERE Symbol IN ({placeholders}) ORDER BY Symbol, Date ASC",
+            clean_syms,
+        ).df()
+
     def financials(self, symbol: str, period_type: str = "Quarterly") -> pd.DataFrame:
         """Stream a company's Ind-AS XBRL Financials over HTTPS in ~250ms."""
         self._ensure_httpfs()
         url = self._asset_url("fundamentals", "xbrl_financials.parquet")
         return self.con.execute(
             f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ? AND PeriodType = ? ORDER BY PeriodEnd ASC",
-            [symbol.strip().upper(), period_type],
+            [self._clean_sym(symbol), period_type],
         ).df()
 
     def shareholding(self, symbol: str) -> pd.DataFrame:
@@ -113,7 +141,76 @@ class RemoteLakeClient:
         url = self._asset_url("shareholding", "nse_shareholding_summary.parquet")
         return self.con.execute(
             f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ? ORDER BY QuarterEnd ASC",
-            [symbol.strip().upper()],
+            [self._clean_sym(symbol)],
+        ).df()
+
+    def named_holders(self, symbol: str) -> pd.DataFrame:
+        """Stream >1% institutional and named shareholders over HTTPS."""
+        self._ensure_httpfs()
+        url = self._asset_url("shareholding", "named_shareholders.parquet")
+        return self.con.execute(
+            f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ? ORDER BY QuarterEnd DESC, PctOfTotal DESC",
+            [self._clean_sym(symbol)],
+        ).df()
+
+    def corporate_actions(self, symbol: str) -> pd.DataFrame:
+        """Stream parsed corporate actions (splits, bonuses, dividends) over HTTPS."""
+        self._ensure_httpfs()
+        url = self._asset_url("actions", "nse_corporate_actions.parquet")
+        return self.con.execute(
+            f"SELECT * FROM read_parquet('{url}') WHERE symbol = ? ORDER BY ExDate ASC",
+            [self._clean_sym(symbol)],
+        ).df()
+
+    def index_history(self, index_name: str = "NIFTY 50") -> pd.DataFrame:
+        """Stream 30-year Nifty index OHLC, TRI, P/E, P/B, and DivYield over HTTPS."""
+        self._ensure_httpfs()
+        url = self._asset_url("indices", "nifty_30y_ohlc_tri_pe.parquet")
+        return self.con.execute(
+            f"SELECT * FROM read_parquet('{url}') WHERE UPPER(IndexName) = ? ORDER BY Date ASC",
+            [index_name.strip().upper()],
+        ).df()
+
+    def deals(self, symbol: str) -> pd.DataFrame:
+        """Stream Bulk & Block deals for a symbol over HTTPS."""
+        self._ensure_httpfs()
+        url = self._asset_url("deals", "bulk_block_deals.parquet")
+        return self.con.execute(
+            f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ? ORDER BY Date DESC",
+            [self._clean_sym(symbol)],
+        ).df()
+
+    def insider_trades(self, symbol: str) -> pd.DataFrame:
+        """Stream SEBI PIT insider trading disclosures for a symbol over HTTPS."""
+        self._ensure_httpfs()
+        url = self._asset_url("deals", "insider_trading_pit.parquet")
+        return self.con.execute(
+            f"SELECT * FROM read_parquet('{url}') WHERE symbol = ? ORDER BY date DESC",
+            [self._clean_sym(symbol)],
+        ).df()
+
+    def annual_reports(self, symbol: str) -> pd.DataFrame:
+        """Stream 20-year Annual Report PDF links over HTTPS."""
+        self._ensure_httpfs()
+        url = self._asset_url("documents", "annual_reports.parquet")
+        return self.con.execute(
+            f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ? ORDER BY Year DESC",
+            [self._clean_sym(symbol)],
+        ).df()
+
+    def concalls(self, scrip_code_or_symbol: str) -> pd.DataFrame:
+        """Stream Concall Transcripts, Investor Presentations & Credit Ratings over HTTPS."""
+        self._ensure_httpfs()
+        url = self._asset_url("documents", "concalls_and_filings.parquet")
+        q = str(scrip_code_or_symbol).strip()
+        if q.isdigit():
+            return self.con.execute(
+                f"SELECT * FROM read_parquet('{url}') WHERE ScripCode = ? ORDER BY FilingTimestamp DESC",
+                [q],
+            ).df()
+        return self.con.execute(
+            f"SELECT * FROM read_parquet('{url}') WHERE UPPER(CompanyName) LIKE ? ORDER BY FilingTimestamp DESC",
+            [f"%{self._clean_sym(q)}%"],
         ).df()
 
     def option_chain(

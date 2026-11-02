@@ -103,6 +103,25 @@ class TestUnifiedLakeEngine(unittest.TestCase):
             symbols = opt_df["Symbol"].tolist()
             self.assertEqual(symbols, ["INFY", "INFY", "TCS", "TCS"])
 
+    def test_vectorized_download(self):
+        dl_map = self.lake.download(["RELIANCE"])
+        self.assertIn("RELIANCE", dl_map)
+        df = dl_map["RELIANCE"]
+        self.assertFalse(df.empty)
+        self.assertIn("Close", df.columns)
+
+    def test_concalls_and_insider_trades(self):
+        cc = self.lake.concalls("RELIANCE")
+        self.assertIsInstance(cc, pd.DataFrame)
+        ins = self.lake.insider_trades("RELIANCE")
+        self.assertIsInstance(ins, pd.DataFrame)
+
+    def test_security_identity_fields(self):
+        ident = self.lake.resolve("RELIANCE")
+        self.assertTrue(hasattr(ident, "face_value"))
+        self.assertTrue(hasattr(ident, "industry"))
+        self.assertTrue(hasattr(ident, "listing_date"))
+
 
 if __name__ == "__main__":
     unittest.main()

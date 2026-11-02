@@ -160,4 +160,19 @@ jobs:
               mv /tmp/datalake_store.tar.zst /tmp/release_assets/datalake_store.tar.zst
             fi
             gh release upload datalake-latest /tmp/release_assets/* --clobber
+            # Prune any retired assets on datalake-latest that are no longer in manifest.json
+            python3 -c '
+            import json, subprocess
+            try:
+                valid = {m["asset_name"] for m in json.load(open("data/manifest.json"))["files"].values()}
+                valid.update({"manifest.json", "state.db", "datalake_store.tar.zst"})
+                out = subprocess.check_output(["gh", "release", "view", "datalake-latest", "--json", "assets"])
+                for a in json.loads(out).get("assets", []):
+                    name = a.get("name", "")
+                    if name not in valid and not name.startswith("datalake_store.tar.zst.part-"):
+                        print("Deleting retired release asset:", name)
+                        subprocess.run(["gh", "release", "delete-asset", "datalake-latest", name, "-y"])
+            except Exception as e:
+                print("Asset pruning note:", e)
+            '
           fi

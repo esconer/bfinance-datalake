@@ -10,6 +10,7 @@ import shutil
 import time
 from pathlib import Path
 
+from datalake.config import now_ist
 from datalake.engine import UnifiedLakeEngine
 from datalake.http_client import ARCHIVE_HEADERS, ResilientHTTPClient
 
@@ -41,6 +42,7 @@ def build_manifest(data_dir: Path) -> dict:
         }
     manifest = {
         "version": 1,
+        "generated_at": now_ist().isoformat(),
         "file_count": len(files_meta),
         "files": files_meta,
     }
