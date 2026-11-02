@@ -132,35 +132,61 @@ class FundsAndFlowsScraper:
     async def backfill_amfi_history(
         self, start_date: date = date(2006, 4, 1), end_date: date | None = None, force: bool = False
     ) -> None:
-        """Walks AMFI historical NAVs in 30-day windows with a 120s timeout so large windows never time out."""
+        """Walks AMFI historical NAVs in 30-day windows with bounded concurrency and batch Parquet writes."""
         end = end_date or today_ist()
         cur = start_date
+        pending_windows: list[tuple[date, date, str]] = []
         while cur <= end:
             win_end = min(end, cur + timedelta(days=29))
             key = f"{cur.isoformat()}_{win_end.isoformat()}"
             if not force and self.state.is_completed("amfi_nav_window", key):
                 cur = win_end + timedelta(days=1)
                 continue
-
-            params = {"frmdt": cur.strftime("%d-%b-%Y"), "todt": win_end.strftime("%d-%b-%Y")}
-            try:
-                resp = await self.http.get(
-                    self.AMFI_HIST_URL, headers=ARCHIVE_HEADERS, params=params, timeout=120.0
-                )
-                resp.raise_for_status()
-                df = self._parse_amfi_text(resp.text)
-                if not df.empty:
-                    for year, grp in df.groupby(df["Date"].dt.year):
-                        target = self.cfg.root_dir / "mutual_funds" / f"amfi_nav_{int(year)}.parquet"
-                        upsert_parquet_partition(
-                            grp, target, dedup_cols=["Date", "SchemeCode"], sort_cols=["SchemeCode", "Date"]
-                        )
-                    self.state.record("amfi_nav_window", key, "OK", len(df), resp.content)
-                    logger.info("[AMFI History %s] Saved %d rows", key, len(df))
-                await asyncio.sleep(0.5)
-            except Exception as exc:
-                logger.warning("[AMFI History %s] Failed: %s", key, exc)
+            pending_windows.append((cur, win_end, key))
             cur = win_end + timedelta(days=1)
+
+        if not pending_windows:
+            return
+
+        sem = asyncio.Semaphore(3)
+
+        async def _fetch_window(w_start: date, w_end: date, key: str):
+            params = {"frmdt": w_start.strftime("%d-%b-%Y"), "todt": w_end.strftime("%d-%b-%Y")}
+            async with sem:
+                try:
+                    resp = await self.http.get(
+                        self.AMFI_HIST_URL, headers=ARCHIVE_HEADERS, params=params, timeout=120.0
+                    )
+                    resp.raise_for_status()
+                    df = self._parse_amfi_text(resp.text)
+                    await asyncio.sleep(0.3)
+                    return key, df, resp.content, None
+                except Exception as exc:
+                    return key, pd.DataFrame(), None, exc
+
+        for chunk_start in range(0, len(pending_windows), 6):
+            batch = pending_windows[chunk_start : chunk_start + 6]
+            results = await asyncio.gather(*[_fetch_window(ws, we, k) for ws, we, k in batch])
+            frames: list[pd.DataFrame] = []
+            ok_windows: list[tuple[str, int, bytes | None]] = []
+
+            for key, df, raw_b, err in results:
+                if err is not None:
+                    logger.warning("[AMFI History %s] Failed: %s", key, err)
+                elif not df.empty:
+                    frames.append(df)
+                    ok_windows.append((key, len(df), raw_b))
+
+            if frames:
+                combined = pd.concat(frames, ignore_index=True)
+                for year, grp in combined.groupby(combined["Date"].dt.year):
+                    target = self.cfg.root_dir / "mutual_funds" / f"amfi_nav_{int(year)}.parquet"
+                    upsert_parquet_partition(
+                        grp, target, dedup_cols=["Date", "SchemeCode"], sort_cols=["SchemeCode", "Date"]
+                    )
+                for key, r_cnt, raw_b in ok_windows:
+                    self.state.record("amfi_nav_window", key, "OK", r_cnt, raw_b)
+                    logger.info("[AMFI History %s] Saved %d rows", key, r_cnt)
 
     @staticmethod
     def _parse_amfi_text(raw_text: str) -> pd.DataFrame:
@@ -186,8 +212,27 @@ class FundsAndFlowsScraper:
                     code, isin_g, isin_r, name, plan, option, nav_s, dt_s = parts[:8]
                     name = " - ".join(p for p in (name, plan, option) if p)
                 else:
-                    # DownloadNAVHistoryReport: code;name;ISIN growth;ISIN reinvest;NAV;repurchase;sale;date
-                    code, name, isin_g, isin_r, nav_s, _, _, dt_s = parts[:8]
+                    # DownloadNAVHistoryReport_Po.aspx current format:
+                    # Scheme Code;NAV Name;Plan;Option;ISIN Div Payout/ISIN Growth;ISIN Div Reinvestment;Net Asset Value;Date
+                    # Or legacy 8-column format:
+                    # Scheme Code;Scheme Name;ISIN Growth;ISIN Reinvest;Net Asset Value;Repurchase Price;Sale Price;Date
+                    p6 = parts[6]
+                    p4 = parts[4]
+                    is_p6_float = False
+                    if p6 and p6 != "-":
+                        try:
+                            float(p6)
+                            is_p6_float = True
+                        except ValueError:
+                            pass
+                    if is_p6_float or (not p4 or p4 == "-" or ISIN_RE.match(p4)):
+                        code, name, plan, option, isin_g, isin_r, nav_s, dt_s = parts[:8]
+                        if plan or option:
+                            suffix = " - ".join(p for p in (plan, option) if p and p.lower() not in name.lower())
+                            if suffix:
+                                name = f"{name} - {suffix}"
+                    else:
+                        code, name, isin_g, isin_r, nav_s, _, _, dt_s = parts[:8]
             else:
                 continue
             try:

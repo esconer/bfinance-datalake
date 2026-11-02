@@ -101,6 +101,57 @@ def prepare_release_staging(
     return manifest
 
 
+def prune_retired_release_assets(
+    data_dir: Path,
+    tag: str = "datalake-latest",
+    staging_dir: Path | None = None,
+) -> list[str]:
+    """
+    Prune retired Parquet assets and stale archive parts (`datalake_store.tar.zst.part-*`
+    when single `datalake_store.tar.zst` is used, or vice versa) from a GitHub Release.
+    """
+    import subprocess
+
+    manifest_path = Path(data_dir).resolve() / "manifest.json"
+    if not manifest_path.exists():
+        return []
+
+    deleted: list[str] = []
+    try:
+        manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        valid = {m["asset_name"] for m in manifest_data.get("files", {}).values() if "asset_name" in m}
+        valid.update({"manifest.json", "state.db"})
+
+        if staging_dir and Path(staging_dir).exists():
+            stg = Path(staging_dir)
+            staged_parts = {p.name for p in stg.glob("datalake_store.tar.zst.part-*")}
+            if staged_parts:
+                valid.update(staged_parts)
+            else:
+                valid.add("datalake_store.tar.zst")
+        else:
+            valid.add("datalake_store.tar.zst")
+
+        out = subprocess.check_output(["gh", "release", "view", tag, "--json", "assets"], text=True)
+        assets = json.loads(out).get("assets", [])
+        has_single_archive = "datalake_store.tar.zst" in valid
+
+        for a in assets:
+            name = a.get("name", "")
+            if not name:
+                continue
+            if name in valid:
+                continue
+            if name.startswith("datalake_store.tar.zst.part-") and not has_single_archive and staging_dir is None:
+                continue
+            logger.info("[Release Prune] Deleting retired release asset: %s", name)
+            subprocess.run(["gh", "release", "delete-asset", tag, name, "-y"], check=False)
+            deleted.append(name)
+    except Exception as exc:
+        logger.warning("[Release Prune] Asset pruning note: %s", exc)
+    return deleted
+
+
 async def pull_from_github_release(
     repo: str,
     data_dir: Path | str = "./data",

@@ -72,16 +72,22 @@ jobs:
           sudo apt-get install -y cloudflare-warp
           sudo systemctl start warp-svc || true
           sleep 2
-          warp-cli --accept-tos registration new || warp-cli --accept-tos register || true
+          warp-cli --accept-tos registration new || (warp-cli --accept-tos registration delete && warp-cli --accept-tos registration new) || true
+          warp-cli --accept-tos mode warp || true
           warp-cli --accept-tos connect || true
-          for i in 1 2 3 4 5 6; do
-            sleep 3
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            sleep 2
             if curl -fsSL --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q "warp=on"; then
               echo "Cloudflare WARP connected on attempt $i"
               break
             fi
-            warp-cli --accept-tos registration new || true
-            warp-cli --accept-tos connect || true
+            if [ "$i" -eq 5 ]; then
+              warp-cli --accept-tos disconnect || true
+              warp-cli --accept-tos registration delete || true
+              warp-cli --accept-tos registration new || true
+              warp-cli --accept-tos mode warp || true
+              warp-cli --accept-tos connect || true
+            fi
           done
           curl -fsSL --max-time 5 https://www.cloudflare.com/cdn-cgi/trace | grep "warp=" || true
 
@@ -101,12 +107,15 @@ jobs:
           if gh release view datalake-latest >/dev/null 2>&1; then
             echo "Downloading existing datalake-latest archive..."
             gh release download datalake-latest -p "datalake_store.tar.zst*" -D /tmp/ --clobber || true
-            if ls /tmp/datalake_store.tar.zst.part-* >/dev/null 2>&1; then
+            if [ -f /tmp/datalake_store.tar.zst ]; then
+              tar --zstd -xf /tmp/datalake_store.tar.zst -C ./
+              rm -f /tmp/datalake_store.tar.zst /tmp/datalake_store.tar.zst.part-*
+            elif ls /tmp/datalake_store.tar.zst.part-* >/dev/null 2>&1; then
               cat /tmp/datalake_store.tar.zst.part-* | tar --zstd -xf - -C ./
               rm -f /tmp/datalake_store.tar.zst.part-* /tmp/datalake_store.tar.zst
-            elif [ -f /tmp/datalake_store.tar.zst ]; then
-              tar --zstd -xf /tmp/datalake_store.tar.zst -C ./
-              rm -f /tmp/datalake_store.tar.zst
+            fi
+            if [ -f data/manifest.json ]; then
+              cp -f data/manifest.json /tmp/prev_manifest.json
             fi
           else
             echo "Creating initial datalake-latest release..."
@@ -156,7 +165,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if [ -d data ] && [ -f data/state.db ]; then
-            uv run datalake stage-release --staging-dir /tmp/release_assets
+            STAGE_ARGS="--staging-dir /tmp/release_assets"
+            if [ -f /tmp/prev_manifest.json ]; then
+              STAGE_ARGS="$STAGE_ARGS --prev-manifest /tmp/prev_manifest.json"
+            fi
+            uv run datalake stage-release $STAGE_ARGS
             tar --zstd -cf /tmp/datalake_store.tar.zst data/
             tar --zstd -tf /tmp/datalake_store.tar.zst >/dev/null
             ARCHIVE_SIZE=$(stat -c%s /tmp/datalake_store.tar.zst)
@@ -168,19 +181,5 @@ jobs:
               mv /tmp/datalake_store.tar.zst /tmp/release_assets/datalake_store.tar.zst
             fi
             gh release upload datalake-latest /tmp/release_assets/* --clobber
-            # Prune any retired assets on datalake-latest that are no longer in manifest.json
-            python3 -c '
-            import json, subprocess
-            try:
-                valid = {m["asset_name"] for m in json.load(open("data/manifest.json"))["files"].values()}
-                valid.update({"manifest.json", "state.db", "datalake_store.tar.zst"})
-                out = subprocess.check_output(["gh", "release", "view", "datalake-latest", "--json", "assets"])
-                for a in json.loads(out).get("assets", []):
-                    name = a.get("name", "")
-                    if name not in valid and not name.startswith("datalake_store.tar.zst.part-"):
-                        print("Deleting retired release asset:", name)
-                        subprocess.run(["gh", "release", "delete-asset", "datalake-latest", name, "-y"])
-            except Exception as e:
-                print("Asset pruning note:", e)
-            '
+            uv run datalake prune-release --tag datalake-latest --staging-dir /tmp/release_assets || true
           fi

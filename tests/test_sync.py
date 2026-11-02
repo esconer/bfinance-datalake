@@ -7,7 +7,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pandas as pd
 
 from datalake.engine import UnifiedLakeEngine
-from datalake.sync import build_manifest, compute_sha256, prepare_release_staging, pull_from_github_release
+from datalake.sync import (
+    build_manifest,
+    compute_sha256,
+    prepare_release_staging,
+    prune_retired_release_assets,
+    pull_from_github_release,
+)
 
 
 class TestSyncEngine(unittest.TestCase):
@@ -46,6 +52,32 @@ class TestSyncEngine(unittest.TestCase):
             self.assertIn("manifest.json", [p.name for p in stg.glob("*")])
             self.assertIn("state.db", [p.name for p in stg.glob("*")])
             self.assertIn("equities__nse_cm_2026.parquet", [p.name for p in stg.glob("*")])
+
+    def test_prune_retired_release_assets(self):
+        with tempfile.TemporaryDirectory() as src_dir, tempfile.TemporaryDirectory() as stg_dir:
+            src = Path(src_dir)
+            stg = Path(stg_dir)
+            eq_dir = src / "equities"
+            eq_dir.mkdir(parents=True)
+            df = pd.DataFrame({"Symbol": ["TCS"], "Date": pd.to_datetime(["2026-01-01"]), "Close": [3500.0]})
+            df.to_parquet(eq_dir / "nse_cm_2026.parquet")
+            build_manifest(src)
+            (stg / "datalake_store.tar.zst").write_bytes(b"archive")
+
+            fake_gh_assets = json.dumps({
+                "assets": [
+                    {"name": "manifest.json"},
+                    {"name": "state.db"},
+                    {"name": "datalake_store.tar.zst"},
+                    {"name": "datalake_store.tar.zst.part-00"},
+                    {"name": "equities__nse_cm_2026.parquet"},
+                    {"name": "retired__old_file.parquet"},
+                ]
+            })
+            with patch("subprocess.check_output", return_value=fake_gh_assets), patch("subprocess.run") as mock_run:
+                deleted = prune_retired_release_assets(src, tag="datalake-latest", staging_dir=stg)
+                self.assertEqual(set(deleted), {"datalake_store.tar.zst.part-00", "retired__old_file.parquet"})
+                self.assertEqual(mock_run.call_count, 2)
 
     def test_pull_delta_skipping(self):
         with tempfile.TemporaryDirectory() as target_dir:

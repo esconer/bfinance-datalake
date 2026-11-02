@@ -249,6 +249,11 @@ def main() -> None:
     p_stg.add_argument("--staging-dir", default="/tmp/release_assets", help="Output folder for flat release assets")
     p_stg.add_argument("--prev-manifest", default=None, help="Optional previous manifest.json to stage only changed files")
 
+    # 10. prune-release (Used by GitHub Actions after gh release upload)
+    p_prn = sub.add_parser("prune-release", help="Prune retired Parquet assets and stale archive parts from GitHub Release")
+    p_prn.add_argument("--tag", default="datalake-latest", help="Release tag (default: datalake-latest)")
+    p_prn.add_argument("--staging-dir", default=None, help="Optional staging folder to inspect whether archive is split")
+
     args = parser.parse_args()
     cfg = LakeConfig(root_dir=Path(args.data_dir).resolve())
 
@@ -284,6 +289,9 @@ def main() -> None:
     elif args.cmd == "stage-release":
         prev_m = Path(args.prev_manifest).resolve() if args.prev_manifest else None
         prepare_release_staging(cfg.root_dir, Path(args.staging_dir).resolve(), previous_manifest_path=prev_m)
+    elif args.cmd == "prune-release":
+        stg_d = Path(args.staging_dir).resolve() if args.staging_dir else None
+        prune_retired_release_assets(cfg.root_dir, tag=args.tag, staging_dir=stg_d)
 
 
 if __name__ == "__main__":

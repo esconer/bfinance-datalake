@@ -208,5 +208,42 @@ class LakeDoctor:
                     )
                     stats["watermarks_rebuilt_from_disk"] += len(unrecorded_on_disk)
 
+            for pq_rel, ds_sym, key_col in (
+                ("fundamentals/xbrl_financials.parquet", "xbrl_financials_symbol", "Symbol"),
+                ("shareholding/nse_shareholding_summary.parquet", "nse_shareholding_symbol", "Symbol"),
+                ("shareholding/bse_shareholding_history.parquet", "bse_shareholding", "ScripCode"),
+            ):
+                p_sym = self.cfg.root_dir / pq_rel
+                if not p_sym.exists():
+                    continue
+                try:
+                    sdf = read_table_safe(p_sym)
+                except Exception:
+                    continue
+                if sdf.empty or key_col not in sdf.columns:
+                    continue
+                sym_counts = sdf[key_col].dropna().astype(str).str.strip().value_counts().to_dict()
+                existing_rows = conn.execute(
+                    "SELECT partition_key FROM ingestion_log WHERE dataset = ? AND status = 'OK'",
+                    (ds_sym,),
+                ).fetchall()
+                existing_keys = {r[0] for r in existing_rows}
+                missing_syms = [
+                    (ds_sym, str(k), int(cnt), now_str)
+                    for k, cnt in sym_counts.items()
+                    if k and str(k) not in existing_keys
+                ]
+                if missing_syms:
+                    conn.executemany(
+                        """
+                        INSERT INTO ingestion_log (dataset, partition_key, status, row_count, updated_at)
+                        VALUES (?, ?, 'OK', ?, ?)
+                        ON CONFLICT(dataset, partition_key) DO UPDATE SET
+                            status = 'OK', row_count = excluded.row_count, updated_at = excluded.updated_at
+                        """,
+                        missing_syms,
+                    )
+                    stats["watermarks_rebuilt_from_disk"] += len(missing_syms)
+
         logger.info("[Doctor] Self-healing check complete: %s", stats)
         return stats

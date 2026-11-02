@@ -57,6 +57,23 @@ NSE_API_HEADERS = {
 }
 
 _IMPERSONATE_PROFILES = ("chrome124", "chrome120", "chrome116")
+_PROFILE_USER_AGENTS = {
+    "chrome124": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "chrome120": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "chrome116": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/116.0.0.0 Safari/537.36"
+    ),
+}
 
 
 @dataclass
@@ -103,6 +120,16 @@ class ResilientHTTPClient:
         self._nifty_primed = False
         self._prime_lock = asyncio.Lock()
 
+    def _active_ua(self) -> str:
+        prof = _IMPERSONATE_PROFILES[self._profile_idx % len(_IMPERSONATE_PROFILES)]
+        return _PROFILE_USER_AGENTS.get(prof, CHROME_UA)
+
+    def _align_headers(self, headers: dict[str, str]) -> dict[str, str]:
+        out = dict(headers)
+        if "User-Agent" in out:
+            out["User-Agent"] = self._active_ua()
+        return out
+
     async def close(self) -> None:
         if self.client is not None:
             await self.client.aclose()
@@ -125,18 +152,19 @@ class ResilientHTTPClient:
         prime_bse: bool = False,
         timeout: float = 60.0,
     ):
-        req_headers = headers or ARCHIVE_HEADERS
-        if prime_nse or "www.nseindia.com" in url:
-            if not self._nse_primed:
-                await self._prime_host("nse")
-        if prime_bse or "api.bseindia.com" in url:
-            if not self._bse_primed:
-                await self._prime_host("bse")
-
+        base_headers = headers or ARCHIVE_HEADERS
         is_exchange = any(k in url for k in ("nseindia.com", "bseindia.com", "niftyindices.com"))
         last_exc: Exception | None = None
         for attempt in range(retries):
             try:
+                if prime_nse or "www.nseindia.com" in url:
+                    if not self._nse_primed:
+                        await self._prime_host("nse")
+                if prime_bse or "api.bseindia.com" in url:
+                    if not self._bse_primed:
+                        await self._prime_host("bse")
+
+                req_headers = self._align_headers(base_headers)
                 if self.curl_session is not None and is_exchange:
                     c_resp = await self.curl_session.get(
                         url, headers=req_headers, params=params, allow_redirects=True, timeout=timeout
@@ -205,14 +233,15 @@ class ResilientHTTPClient:
         prime_nifty: bool = False,
         timeout: float = 60.0,
     ):
-        req_headers = headers or NIFTY_INDICES_HEADERS
-        if prime_nifty or "niftyindices.com" in url:
-            if not self._nifty_primed:
-                await self._prime_host("nifty")
-
+        base_headers = headers or NIFTY_INDICES_HEADERS
         last_exc: Exception | None = None
         for attempt in range(retries):
             try:
+                if prime_nifty or "niftyindices.com" in url:
+                    if not self._nifty_primed:
+                        await self._prime_host("nifty")
+
+                req_headers = self._align_headers(base_headers)
                 if self.curl_session is not None:
                     c_resp = await self.curl_session.post(
                         url, json=json_body, headers=req_headers, allow_redirects=False, timeout=timeout
@@ -264,46 +293,49 @@ class ResilientHTTPClient:
                 self._nifty_primed = False
 
             prime_headers = {
-                "User-Agent": CHROME_UA,
+                "User-Agent": self._active_ua(),
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
             }
-            if target == "nse" and not self._nse_primed:
-                url = "https://www.nseindia.com"
-                if self.curl_session is not None:
-                    r = await self.curl_session.get(url, headers=prime_headers, timeout=30.0)
+            try:
+                if target == "nse" and not self._nse_primed:
+                    url = "https://www.nseindia.com"
+                    if self.curl_session is not None:
+                        r = await self.curl_session.get(url, headers=prime_headers, timeout=30.0)
+                        if r.status_code == 200:
+                            try:
+                                await self.curl_session.get(
+                                    "https://www.nseindia.com/market-data/live-equity-market",
+                                    headers={**prime_headers, "Referer": "https://www.nseindia.com/"},
+                                    timeout=30.0,
+                                )
+                            except Exception:
+                                pass
+                    elif self.client is not None:
+                        r = await self.client.get(url, headers=prime_headers)
+                    else:
+                        return
                     if r.status_code == 200:
-                        try:
-                            await self.curl_session.get(
-                                "https://www.nseindia.com/market-data/live-equity-market",
-                                headers={**prime_headers, "Referer": "https://www.nseindia.com/"},
-                                timeout=30.0,
-                            )
-                        except Exception:
-                            pass
-                elif self.client is not None:
-                    r = await self.client.get(url, headers=prime_headers)
-                else:
-                    return
-                if r.status_code == 200:
-                    self._nse_primed = True
-            elif target == "bse" and not self._bse_primed:
-                url = "https://www.bseindia.com/"
-                if self.curl_session is not None:
-                    r = await self.curl_session.get(url, headers=prime_headers, timeout=30.0)
-                elif self.client is not None:
-                    r = await self.client.get(url, headers=prime_headers)
-                else:
-                    return
-                if r.status_code == 200:
-                    self._bse_primed = True
-            elif target == "nifty" and not self._nifty_primed:
-                url = "https://www.niftyindices.com/reports/historical-data"
-                if self.curl_session is not None:
-                    r = await self.curl_session.get(url, headers=prime_headers, timeout=30.0)
-                elif self.client is not None:
-                    r = await self.client.get(url, headers=prime_headers)
-                else:
-                    return
-                if r.status_code == 200:
-                    self._nifty_primed = True
+                        self._nse_primed = True
+                elif target == "bse" and not self._bse_primed:
+                    url = "https://www.bseindia.com/"
+                    if self.curl_session is not None:
+                        r = await self.curl_session.get(url, headers=prime_headers, timeout=30.0)
+                    elif self.client is not None:
+                        r = await self.client.get(url, headers=prime_headers)
+                    else:
+                        return
+                    if r.status_code == 200:
+                        self._bse_primed = True
+                elif target == "nifty" and not self._nifty_primed:
+                    url = "https://www.niftyindices.com/reports/historical-data"
+                    if self.curl_session is not None:
+                        r = await self.curl_session.get(url, headers=prime_headers, timeout=30.0)
+                    elif self.client is not None:
+                        r = await self.client.get(url, headers=prime_headers)
+                    else:
+                        return
+                    if r.status_code == 200:
+                        self._nifty_primed = True
+            except Exception as exc:
+                logger.debug("[Prime %s] %s", target, exc)

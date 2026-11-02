@@ -474,18 +474,21 @@ def test_pass_2_audit_suite():
     assert fo_norm.iloc[0]["Close"] == 25.5
     assert fo_norm.iloc[0]["Open"] == 25.5
 
-    # 3. Verify P2-04: AMFI parser enforces integer SchemeCode
+    # 3. Verify P2-04: AMFI parser enforces integer SchemeCode across 6-col, NAVAll 8-col, and DownloadNAVHistoryReport 8-col
     amfi_txt = (
         "Scheme Code;ISIN Div Payout/ ISIN Growth;ISIN Div Reinvestment;Scheme Name;Net Asset Value;Date\n"
         "Open Ended Schemes (Equity)\n"
         "HDFC Mutual Fund\n"
         "100122;INF179K01608;-;HDFC Balanced Fund;150.25;30-Oct-2026\n"
+        "139618;Taurus Investor Education Pool;;Growth;;;10.0000;01-Oct-2024\n"
         "INVALID_CODE;-;-;Bad Row;10.0;30-Oct-2026\n"
     )
     df_amfi = FundsAndFlowsScraper._parse_amfi_text(amfi_txt)
-    assert len(df_amfi) == 1
+    assert len(df_amfi) == 2
     assert pd.api.types.is_integer_dtype(df_amfi["SchemeCode"])
     assert df_amfi.iloc[0]["SchemeCode"] == 100122
+    assert df_amfi.iloc[1]["SchemeCode"] == 139618
+    assert df_amfi.iloc[1]["NAV"] == 10.0
 
 
 def test_pass_3_audit_suite():
@@ -539,6 +542,20 @@ def test_pass_3_audit_suite():
         LakeDoctor(cfg).run_full_check_and_repair()
         summary = {r["dataset"]: r for r in StateStore(cfg.state_db_path).summary()}
         assert summary["equity_eod_nse"]["total_rows"] == 250, f"Expected 250 rows, got {summary['equity_eod_nse']['total_rows']}"
+
+        # 3. Verify empty XBRL filings record HOLIDAY in state.db so xbrl-all-market never gets stuck
+        class _EmptyXBRLHttp:
+            async def get(self, url, **kwargs):
+                if "bseindia.com" in url:
+                    return SimpleHTTPResponse(status_code=200, content=b'{"Table": []}')
+                return SimpleHTTPResponse(status_code=200, content=b"[]")
+
+        st = StateStore(cfg.state_db_path)
+        xbrl = XBRLScraper(_EmptyXBRLHttp(), st, cfg)
+        asyncio.run(xbrl.sync_symbol_financials_nse("EMPTYCO"))
+        asyncio.run(xbrl.sync_bse_shareholding("599999"))
+        assert st.is_completed("xbrl_financials_symbol", "EMPTYCO") is True
+        assert st.is_completed("bse_shareholding", "599999") is True
 
 
 if __name__ == "__main__":

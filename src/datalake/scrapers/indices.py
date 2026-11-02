@@ -81,21 +81,22 @@ class IndicesScraper:
                 cov_min, cov_max, row_cnt = existing_coverage[sym_key]
                 # If existing history has substantial records (> 500 trading days)
                 if row_cnt >= 500:
-                    if cov_max >= (end - timedelta(days=4)):
+                    delta_start = cov_max + timedelta(days=1)
+                    has_pending_weekdays = any(
+                        (delta_start + timedelta(days=i)).weekday() < 5
+                        for i in range(max(0, (end - delta_start).days + 1))
+                    )
+                    if cov_max >= end or not has_pending_weekdays:
                         logger.info(
                             "[Index 30Y Bulk] %s already covered (%s -> %s, %d rows). Skipping redundant fetch.",
                             idx_name, cov_min, cov_max, row_cnt,
                         )
                         continue
-                    if cov_max < end:
-                        delta_start = cov_max + timedelta(days=1)
-                        if delta_start > end:
-                            continue
-                        logger.info(
-                            "[Index 30Y Bulk] %s covered up to %s (%d rows). Fetching incremental delta (%s -> %s)...",
-                            idx_name, cov_max, row_cnt, delta_start, end,
-                        )
-                        cur_start = delta_start
+                    logger.info(
+                        "[Index 30Y Bulk] %s covered up to %s (%d rows). Fetching incremental delta (%s -> %s)...",
+                        idx_name, cov_max, row_cnt, delta_start, end,
+                    )
+                    cur_start = delta_start
 
             logger.info("[Index 30Y Bulk] Fetching OHLC + TRI + PE for %s (%s -> %s)...", idx_name, cur_start, end)
             ohlc_df, tri_df, pe_df = await asyncio.gather(
@@ -186,6 +187,7 @@ class IndicesScraper:
         """Chunks requests into 365-day windows against Sitefinity `/BackPage/{method}`."""
         frames: list[pd.DataFrame] = []
         cur_start = start
+        consecutive_errors = 0
         while cur_start <= end:
             cur_end = min(end, cur_start + timedelta(days=364))
             cinfo = (
@@ -201,6 +203,7 @@ class IndicesScraper:
                     headers=NIFTY_INDICES_HEADERS,
                     prime_nifty=True,
                 )
+                consecutive_errors = 0
                 if resp.status_code == 200 and resp.text.strip().startswith(("{", "[")):
                     payload = resp.json()
                     if isinstance(payload, list) and payload:
@@ -212,6 +215,9 @@ class IndicesScraper:
                             frames.append(pd.DataFrame(rows))
             except Exception as exc:
                 logger.debug("[NiftyIndices %s %s] %s", index_name, method, exc)
+                consecutive_errors += 1
+                if consecutive_errors >= 2:
+                    break
             cur_start = cur_end + timedelta(days=1)
             await asyncio.sleep(self.cfg.polite_delay_sec)
 
@@ -221,6 +227,7 @@ class IndicesScraper:
         """Fallback to NSE's official `/api/historicalOR/indicesHistory` (365-day chunks)."""
         frames: list[pd.DataFrame] = []
         cur_start = start
+        consecutive_errors = 0
         while cur_start <= end:
             cur_end = min(end, cur_start + timedelta(days=364))
             url = (
@@ -229,6 +236,7 @@ class IndicesScraper:
             )
             try:
                 resp = await self.http.get(url, headers=NSE_API_HEADERS, prime_nse=True)
+                consecutive_errors = 0
                 if resp.status_code == 200 and resp.text.strip().startswith("{"):
                     data = resp.json().get("data", [])
                     if isinstance(data, dict):
@@ -237,6 +245,9 @@ class IndicesScraper:
                         frames.append(pd.DataFrame(data))
             except Exception as exc:
                 logger.debug("[NSE Index Fallback %s] %s", index_name, exc)
+                consecutive_errors += 1
+                if consecutive_errors >= 2:
+                    break
             cur_start = cur_end + timedelta(days=1)
             await asyncio.sleep(self.cfg.polite_delay_sec)
 

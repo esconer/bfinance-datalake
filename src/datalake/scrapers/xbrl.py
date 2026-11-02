@@ -119,23 +119,26 @@ class XBRLScraper:
 
         if nse_master.exists():
             ndf = read_table_safe(nse_master)
-            done_nse = self.state.completed_keys("xbrl_financials_symbol")
+            done_fin = self.state.completed_keys("xbrl_financials_symbol")
+            done_shp = self.state.completed_keys("nse_shareholding_symbol")
             all_syms = ndf["SYMBOL"].dropna().astype(str).str.strip().unique().tolist()
-            syms = all_syms if force else [s for s in all_syms if s not in done_nse]
+            syms = all_syms if force else [s for s in all_syms if not (s in done_fin and s in done_shp)]
             if max_companies:
                 syms = syms[:max_companies]
             synced_syms = syms
             if syms:
                 logger.info("[XBRL All-Market] Syncing NSE Financials + Shareholding for %d symbols...", len(syms))
                 for sym in syms:
-                    try:
-                        await self.sync_symbol_financials_nse(sym)
-                    except Exception as exc:
-                        logger.warning("[XBRL All-Market] NSE Financials failed for %s: %s", sym, exc)
-                    try:
-                        await self.sync_symbol_shareholding_nse(sym)
-                    except Exception as exc:
-                        logger.warning("[XBRL All-Market] NSE Shareholding failed for %s: %s", sym, exc)
+                    if force or sym not in done_fin:
+                        try:
+                            await self.sync_symbol_financials_nse(sym)
+                        except Exception as exc:
+                            logger.warning("[XBRL All-Market] NSE Financials failed for %s: %s", sym, exc)
+                    if force or sym not in done_shp:
+                        try:
+                            await self.sync_symbol_shareholding_nse(sym)
+                        except Exception as exc:
+                            logger.warning("[XBRL All-Market] NSE Shareholding failed for %s: %s", sym, exc)
                     await asyncio.sleep(self.cfg.polite_delay_sec)
             else:
                 logger.info("[XBRL All-Market] All %d NSE symbols already completed in state.db.", len(all_syms))
@@ -165,6 +168,8 @@ class XBRLScraper:
     async def sync_symbol_financials_nse(self, symbol: str) -> None:
         sym = symbol.strip().upper()
         rows: list[dict] = []
+        any_200_ok = False
+        already_completed_filings = 0
 
         for period in ("Quarterly", "Annual"):
             disc_url = (
@@ -176,6 +181,10 @@ class XBRLScraper:
                 if resp.status_code != 200 or not resp.text.strip().startswith("["):
                     continue
                 filings = resp.json()
+                if isinstance(filings, list):
+                    any_200_ok = True
+                else:
+                    continue
             except Exception as exc:
                 logger.debug("[XBRL Financials %s %s] %s", sym, period, exc)
                 continue
@@ -199,6 +208,8 @@ class XBRLScraper:
                                     continue
                         except Exception:
                             pass
+                    else:
+                        already_completed_filings += 1
 
                 # JSON Fallback when `xbrl` is `.../corporate/xbrl/-` or XML download unavailable
                 fb_row = self._extract_json_financial_row(item, sym, period)
@@ -214,6 +225,10 @@ class XBRLScraper:
                 sort_cols=["Symbol", "PeriodEnd", "PeriodType"],
             )
             self.state.record("xbrl_financials_symbol", sym, "OK", len(rows))
+        elif already_completed_filings > 0:
+            self.state.record("xbrl_financials_symbol", sym, "OK", already_completed_filings)
+        elif any_200_ok:
+            self.state.record("xbrl_financials_symbol", sym, "HOLIDAY")
 
     @staticmethod
     def _extract_json_financial_row(item: dict, default_symbol: str, default_period: str) -> dict | None:
@@ -458,6 +473,7 @@ class XBRLScraper:
             return
 
         if not table:
+            self.state.record("bse_shareholding", scrip_str, "HOLIDAY", source_url=url)
             return
 
         rows = []
