@@ -24,6 +24,10 @@ def repair_ohlc(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     out = df.copy()
+    for col in ("Open", "High", "Low", "Close", "PrevClose"):
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").astype("float64")
+
     open_zero = (out["Open"].isna()) | (out["Open"] <= 0)
     if open_zero.any():
         fallback = out["PrevClose"].where(out["PrevClose"] > 0, out["Close"])
@@ -55,8 +59,10 @@ def filter_bse_equity_only(df: pd.DataFrame) -> pd.DataFrame:
 
 
 class EquityEODScraper:
-    """Scrapes & updates NSE (1994+) and BSE (2000+) daily OHLCV, ISIN, Trades, and Delivery."""
+    """Scrapes & updates NSE (1994+) and BSE (2006+) daily OHLCV, ISIN, Trades, and Delivery."""
 
+    NSE_LEGACY_START = date(1994, 11, 3)
+    BSE_LEGACY_START = date(2006, 3, 1)
     NSE_UDIFF_CUTOVER = date(2024, 1, 2)
     NSE_FULL_BHAV_CUTOVER = date(2020, 1, 1)
     BSE_UDIFF_CUTOVER = date(2024, 7, 8)
@@ -73,9 +79,13 @@ class EquityEODScraper:
         for exch in exchanges:
             dataset_name = f"equity_eod_{exch.lower()}"
             done_keys = self.state.completed_keys(dataset_name)
+            exch_min_start = self.BSE_LEGACY_START if exch.upper() == "BSE" else self.NSE_LEGACY_START
+            eff_start = max(start_date, exch_min_start)
+            if eff_start > end_date:
+                continue
 
-            for year in range(start_date.year, end_date.year + 1):
-                yr_start = max(start_date, date(year, 1, 1))
+            for year in range(eff_start.year, end_date.year + 1):
+                yr_start = max(eff_start, date(year, 1, 1))
                 yr_end = min(end_date, date(year, 12, 31))
 
                 pending_days = [

@@ -108,8 +108,9 @@ class LakeDoctor:
                 purge_below = 200 if yr >= 2016 else 1
             elif fname.startswith("nse_fo_"):
                 ds_name = "fo_eod_nse"
-                min_rows_for_full_day = 50
-                purge_below = 50
+                yr = int(fname.split("_")[2])
+                min_rows_for_full_day = 50 if yr >= 2002 else 1
+                purge_below = 50 if yr >= 2002 else 1
             elif fname.startswith("bse_fo_"):
                 ds_name = "fo_eod_bse"
                 min_rows_for_full_day = 1
@@ -143,6 +144,17 @@ class LakeDoctor:
 
         now_str = datetime.now(IST).isoformat()
         with state._session() as conn:
+            # Purge pre-launch fake HOLIDAY entries recorded before exchange archive start dates
+            for ds_bound, min_key in (
+                ("equity_eod_bse", "2006-03-01"),
+                ("fo_eod_bse", "2024-07-08"),
+                ("fo_eod_nse", "2000-06-12"),
+            ):
+                conn.execute(
+                    "DELETE FROM ingestion_log WHERE dataset = ? AND partition_key < ? AND status != 'OK'",
+                    (ds_bound, min_key),
+                )
+
             for ds_name, disk_dates in valid_dates_on_disk.items():
                 rows = conn.execute(
                     "SELECT partition_key FROM ingestion_log WHERE dataset = ? AND status = 'OK'",

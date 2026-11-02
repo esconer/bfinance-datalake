@@ -22,6 +22,8 @@ class DerivativesEODScraper:
     """
 
     FO_UDIFF_CUTOVER = date(2024, 7, 8)
+    NSE_FO_START = date(2000, 6, 12)
+    BSE_FO_START = date(2024, 7, 8)
 
     def __init__(self, http: ResilientHTTPClient, state: StateStore, cfg: LakeConfig):
         self.http = http
@@ -35,9 +37,13 @@ class DerivativesEODScraper:
         for exch in exchanges:
             dataset = f"fo_eod_{exch.lower()}"
             done_keys = self.state.completed_keys(dataset)
+            exch_min_date = self.BSE_FO_START if exch.upper() == "BSE" else self.NSE_FO_START
+            eff_start = max(start_date, exch_min_date)
+            if eff_start > end_date:
+                continue
 
-            for year in range(max(2000, start_date.year), end_date.year + 1):
-                yr_start = max(start_date, date(year, 1, 1))
+            for year in range(eff_start.year, end_date.year + 1):
+                yr_start = max(eff_start, date(year, 1, 1))
                 yr_end = min(end_date, date(year, 12, 31))
                 pending = [
                     yr_start + timedelta(days=i)
@@ -94,6 +100,8 @@ class DerivativesEODScraper:
                             self.state.record(dataset, key, "OK", r_cnt, raw_b, s_url)
 
     async def fetch_nse_fo_day(self, day: date) -> tuple[pd.DataFrame | None, bytes | None, str]:
+        if day < self.NSE_FO_START:
+            return None, None, ""
         if day >= self.FO_UDIFF_CUTOVER:
             url = f"https://nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_{day:%Y%m%d}_F_0000.csv.zip"
             resp = await self.http.get(url, headers=ARCHIVE_HEADERS)
@@ -125,18 +133,18 @@ class DerivativesEODScraper:
             "InstrumentType": df["INSTRUMENT"].astype(str).str.strip(),
             "Symbol": df["SYMBOL"].astype(str).str.strip(),
             "ExpiryDate": pd.to_datetime(df["EXPIRY_DT"], format="%d-%b-%Y", errors="coerce"),
-            "StrikePrice": pd.to_numeric(df["STRIKE_PR"], errors="coerce").fillna(0.0),
-            "OptionType": df[opt_col].astype(str).str.strip(),
-            "Open": pd.to_numeric(df["OPEN"], errors="coerce"),
-            "High": pd.to_numeric(df["HIGH"], errors="coerce"),
-            "Low": pd.to_numeric(df["LOW"], errors="coerce"),
-            "Close": pd.to_numeric(df["CLOSE"], errors="coerce"),
-            "SettlePrice": pd.to_numeric(df["SETTLE_PR"], errors="coerce"),
-            "UnderlyingPrice": pd.NA,
-            "Contracts": pd.to_numeric(df["CONTRACTS"], errors="coerce"),
-            "TurnoverValue": pd.to_numeric(df["VAL_INLAKH"], errors="coerce") * 100_000.0,
-            "OpenInterest": pd.to_numeric(df["OPEN_INT"], errors="coerce"),
-            "ChangeInOI": pd.to_numeric(df["CHG_IN_OI"], errors="coerce"),
+            "StrikePrice": pd.to_numeric(df["STRIKE_PR"], errors="coerce").fillna(0.0).astype("float64"),
+            "OptionType": df[opt_col].fillna("XX").astype(str).str.strip(),
+            "Open": pd.to_numeric(df["OPEN"], errors="coerce").astype("float64"),
+            "High": pd.to_numeric(df["HIGH"], errors="coerce").astype("float64"),
+            "Low": pd.to_numeric(df["LOW"], errors="coerce").astype("float64"),
+            "Close": pd.to_numeric(df["CLOSE"], errors="coerce").astype("float64"),
+            "SettlePrice": pd.to_numeric(df["SETTLE_PR"], errors="coerce").astype("float64"),
+            "UnderlyingPrice": pd.Series(float("nan"), index=df.index, dtype="float64"),
+            "Contracts": pd.to_numeric(df["CONTRACTS"], errors="coerce").astype("float64"),
+            "TurnoverValue": (pd.to_numeric(df["VAL_INLAKH"], errors="coerce") * 100_000.0).astype("float64"),
+            "OpenInterest": pd.to_numeric(df["OPEN_INT"], errors="coerce").astype("float64"),
+            "ChangeInOI": pd.to_numeric(df["CHG_IN_OI"], errors="coerce").astype("float64"),
         })
         for col in ("Open", "High", "Low"):
             z = (out[col].isna()) | (out[col] <= 0)
@@ -169,18 +177,18 @@ class DerivativesEODScraper:
             "InstrumentType": df["FinInstrmTp"].astype(str).str.strip(),
             "Symbol": df["TckrSymb"].astype(str).str.strip(),
             "ExpiryDate": pd.to_datetime(df["XpryDt"], errors="coerce"),
-            "StrikePrice": pd.to_numeric(df["StrkPric"], errors="coerce").fillna(0.0),
+            "StrikePrice": pd.to_numeric(df["StrkPric"], errors="coerce").fillna(0.0).astype("float64"),
             "OptionType": df["OptnTp"].fillna("XX").astype(str).str.strip(),
-            "Open": pd.to_numeric(df["OpnPric"], errors="coerce"),
-            "High": pd.to_numeric(df["HghPric"], errors="coerce"),
-            "Low": pd.to_numeric(df["LwPric"], errors="coerce"),
-            "Close": pd.to_numeric(df["ClsPric"], errors="coerce"),
-            "SettlePrice": pd.to_numeric(df["SttlmPric"], errors="coerce"),
-            "UnderlyingPrice": pd.to_numeric(df["UndrlygPric"], errors="coerce"),
-            "Contracts": pd.to_numeric(df["TtlTradgVol"], errors="coerce"),
-            "TurnoverValue": pd.to_numeric(df["TtlTrfVal"], errors="coerce"),
-            "OpenInterest": pd.to_numeric(df["OpnIntrst"], errors="coerce"),
-            "ChangeInOI": pd.to_numeric(df["ChngInOpnIntrst"], errors="coerce"),
+            "Open": pd.to_numeric(df["OpnPric"], errors="coerce").astype("float64"),
+            "High": pd.to_numeric(df["HghPric"], errors="coerce").astype("float64"),
+            "Low": pd.to_numeric(df["LwPric"], errors="coerce").astype("float64"),
+            "Close": pd.to_numeric(df["ClsPric"], errors="coerce").astype("float64"),
+            "SettlePrice": pd.to_numeric(df["SttlmPric"], errors="coerce").astype("float64"),
+            "UnderlyingPrice": pd.to_numeric(df["UndrlygPric"], errors="coerce").astype("float64"),
+            "Contracts": pd.to_numeric(df["TtlTradgVol"], errors="coerce").astype("float64"),
+            "TurnoverValue": pd.to_numeric(df["TtlTrfVal"], errors="coerce").astype("float64"),
+            "OpenInterest": pd.to_numeric(df["OpnIntrst"], errors="coerce").astype("float64"),
+            "ChangeInOI": pd.to_numeric(df["ChngInOpnIntrst"], errors="coerce").astype("float64"),
         })
         for col in ("Open", "High", "Low"):
             z = (out[col].isna()) | (out[col] <= 0)

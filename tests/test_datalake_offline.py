@@ -258,6 +258,75 @@ def test_normalize_deals_frame():
     assert res.iloc[0]["Exchange"] == "NSE"
 
 
+def test_fo_2000_int64_ohlc_and_doctor_preservation():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = LakeConfig(root_dir=Path(tmpdir))
+        cfg.ensure_dirs()
+        state = StateStore(cfg.state_db_path)
+
+        # Simulate 11-Jul-2000 NSE F&O bhavcopy where OPEN/LOW are int64 with 0s and CLOSE is float64
+        csv_2000 = (
+            "INSTRUMENT,SYMBOL,EXPIRY_DT,STRIKE_PR,OPTION_TYP,OPEN,HIGH,LOW,CLOSE,SETTLE_PR,CONTRACTS,VAL_INLAKH,OPEN_INT,CHG_IN_OI,TIMESTAMP\n"
+            "FUTIDX,S&P CNX NIFTY,27-Jul-2000,0,XX,1517,1525,1508,1518.95,1518.95,1886,5712.92,402800,21400,11-JUL-2000\n"
+            "FUTIDX,S&P CNX NIFTY,31-Aug-2000,0,XX,0,1525,0,1515.05,1515.05,94,286.67,72000,1800,11-JUL-2000\n"
+            "FUTIDX,S&P CNX NIFTY,28-Sep-2000,0,XX,0,1538,0,1538.00,1538.00,26,79.88,28400,400,11-JUL-2000\n"
+        )
+        zip_bytes = _make_zip("fo11JUL2000bhav.csv", csv_2000)
+
+        class _DummyFOHttp:
+            async def get(self, url, **kwargs):
+                return SimpleHTTPResponse(status_code=200, content=zip_bytes)
+
+        fo_scraper = DerivativesEODScraper(_DummyFOHttp(), state, cfg)
+        df_fo, _, _ = asyncio.run(fo_scraper.fetch_nse_fo_day(date(2000, 7, 11)))
+        assert df_fo is not None and len(df_fo) == 3
+        assert df_fo.iloc[1]["Open"] == 1515.05
+        assert df_fo.iloc[1]["Low"] == 1515.05
+
+        write_parquet_atomic(df_fo, cfg.root_dir / "derivatives" / "nse_fo_2000_07.parquet")
+        state.record("equity_eod_bse", "1995-01-02", "HOLIDAY")
+        state.record("fo_eod_bse", "2001-01-02", "HOLIDAY")
+
+        report = LakeDoctor(cfg).run_full_check_and_repair()
+        assert report["truncated_days_purged"] == 0
+        assert state.is_completed("fo_eod_nse", "2000-07-11") is True
+        assert state.is_completed("equity_eod_bse", "1995-01-02") is False
+        assert state.is_completed("fo_eod_bse", "2001-01-02") is False
+
+
+def test_bse_concalls_chunked_windows():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = LakeConfig(root_dir=Path(tmpdir))
+        cfg.ensure_dirs()
+        state = StateStore(cfg.state_db_path)
+        seen_ranges: list[tuple[str, str]] = []
+
+        class _DummyBSEHttp:
+            async def get(self, url, params=None, **kwargs):
+                if params:
+                    seen_ranges.append((params["strPrevDate"], params["strToDate"]))
+                payload = json.dumps({
+                    "Table": [{
+                        "NEWSID": f"id-{len(seen_ranges)}",
+                        "SCRIP_CD": "500325",
+                        "SLONGNAME": "Reliance Industries",
+                        "NEWSSUB": "Earnings Call Transcript",
+                        "NEWS_DT": "2026-10-15T18:00:00",
+                        "ATTACHMENTNAME": "rel_q2.pdf",
+                        "OLD": 0,
+                    }]
+                }).encode("utf-8")
+                return SimpleHTTPResponse(status_code=200, content=payload)
+
+        scraper = DealsAndDocumentsScraper(_DummyBSEHttp(), state, cfg)
+        asyncio.run(scraper.sync_concalls_and_presentations(date(2026, 8, 1), date(2026, 10, 30)))
+        assert (cfg.root_dir / "documents" / "concalls_and_filings.parquet").exists()
+        for prev_dt, to_dt in seen_ranges:
+            d1 = pd.to_datetime(prev_dt, format="%Y%m%d")
+            d2 = pd.to_datetime(to_dt, format="%Y%m%d")
+            assert (d2 - d1).days <= 27
+
+
 if __name__ == "__main__":
     test_corporate_action_regex_parser()
     test_repair_ohlc_and_bse_debt_filter()
@@ -265,4 +334,6 @@ if __name__ == "__main__":
     test_doctor_self_healing_and_adjuster()
     test_sanitize_for_parquet_mixed_types()
     test_normalize_deals_frame()
+    test_fo_2000_int64_ohlc_and_doctor_preservation()
+    test_bse_concalls_chunked_windows()
     print("ALL OFFLINE UNIT & INTEGRATION TESTS PASSED!")

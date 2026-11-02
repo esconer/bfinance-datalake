@@ -30,7 +30,6 @@ ARCHIVE_HEADERS = {
     "User-Agent": CHROME_UA,
     "Accept": "text/csv,text/plain,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate",
     "Connection": "keep-alive",
 }
 
@@ -38,7 +37,6 @@ BSE_API_HEADERS = {
     "User-Agent": CHROME_UA,
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate",
     "Referer": "https://www.bseindia.com/",
 }
 
@@ -49,16 +47,16 @@ NIFTY_INDICES_HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
     "Origin": "https://www.niftyindices.com",
     "Referer": "https://www.niftyindices.com/reports/historical-data",
-    "Accept-Encoding": "gzip, deflate",
 }
 
 NSE_API_HEADERS = {
     "User-Agent": CHROME_UA,
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate",
     "Referer": "https://www.nseindia.com/companies-listing/corporate-filings-financial-results",
 }
+
+_IMPERSONATE_PROFILES = ("chrome124", "chrome120", "chrome116")
 
 
 @dataclass
@@ -85,7 +83,7 @@ class SimpleHTTPResponse:
 
 class ResilientHTTPClient:
     """
-    Async HTTP client using `curl_cffi` Chrome 124 TLS impersonation for ALL requests
+    Async HTTP client using `curl_cffi` Chrome TLS impersonation for ALL requests
     (bypassing Akamai/Cloudflare JA3 blocks on NSE, BSE, NiftyIndices, and AMFI).
     """
 
@@ -96,8 +94,9 @@ class ResilientHTTPClient:
             self.client = httpx.AsyncClient(limits=limits, follow_redirects=True, timeout=timeout)
         else:
             self.client = None
+        self._profile_idx = 0
         self.curl_session = (
-            CurlAsyncSession(impersonate="chrome124", timeout=45.0) if HAS_CURL_CFFI else None
+            CurlAsyncSession(impersonate=_IMPERSONATE_PROFILES[0], timeout=45.0) if HAS_CURL_CFFI else None
         )
         self._nse_primed = False
         self._bse_primed = False
@@ -169,11 +168,13 @@ class ResilientHTTPClient:
                 if resp.status_code in (401, 403):
                     if prime_nse or "nseindia.com" in url:
                         self._nse_primed = False
-                        await self._prime_host("nse")
+                        await asyncio.sleep(1.5 * (attempt + 1))
+                        await self._prime_host("nse", reset_session=(attempt > 0))
                         continue
                     if prime_bse or "bseindia.com" in url:
                         self._bse_primed = False
-                        await self._prime_host("bse")
+                        await asyncio.sleep(1.5 * (attempt + 1))
+                        await self._prime_host("bse", reset_session=(attempt > 0))
                         continue
 
                 if resp.status_code in (429, 500, 502, 503, 504):
@@ -228,7 +229,8 @@ class ResilientHTTPClient:
 
                 if resp.status_code in (301, 302, 401, 403) and ("niftyindices.com" in url or prime_nifty):
                     self._nifty_primed = False
-                    await self._prime_host("nifty")
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                    await self._prime_host("nifty", reset_session=(attempt > 0))
                     continue
                 if resp.status_code in (429, 500, 502, 503, 504):
                     await asyncio.sleep(2.0 * (2 ** attempt))
@@ -241,18 +243,36 @@ class ResilientHTTPClient:
             raise last_exc
         raise RuntimeError(f"Exhausted POST retries for {url}")
 
-    async def _prime_host(self, target: str) -> None:
+    async def _prime_host(self, target: str, reset_session: bool = False) -> None:
         async with self._prime_lock:
+            if reset_session and HAS_CURL_CFFI and self.curl_session is not None:
+                try:
+                    await self.curl_session.close()
+                except Exception:
+                    pass
+                self._profile_idx = (self._profile_idx + 1) % len(_IMPERSONATE_PROFILES)
+                self.curl_session = CurlAsyncSession(
+                    impersonate=_IMPERSONATE_PROFILES[self._profile_idx], timeout=45.0
+                )
+
             prime_headers = {
                 "User-Agent": CHROME_UA,
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
-                "Accept-Encoding": "gzip, deflate",
             }
             if target == "nse" and not self._nse_primed:
                 url = "https://www.nseindia.com"
                 if self.curl_session is not None:
-                    r = await self.curl_session.get(url, headers=prime_headers)
+                    r = await self.curl_session.get(url, headers=prime_headers, timeout=30.0)
+                    if r.status_code == 200:
+                        try:
+                            await self.curl_session.get(
+                                "https://www.nseindia.com/market-data/live-equity-market",
+                                headers={**prime_headers, "Referer": "https://www.nseindia.com/"},
+                                timeout=30.0,
+                            )
+                        except Exception:
+                            pass
                 elif self.client is not None:
                     r = await self.client.get(url, headers=prime_headers)
                 else:
@@ -262,7 +282,7 @@ class ResilientHTTPClient:
             elif target == "bse" and not self._bse_primed:
                 url = "https://www.bseindia.com/"
                 if self.curl_session is not None:
-                    r = await self.curl_session.get(url, headers=prime_headers)
+                    r = await self.curl_session.get(url, headers=prime_headers, timeout=30.0)
                 elif self.client is not None:
                     r = await self.client.get(url, headers=prime_headers)
                 else:
@@ -272,7 +292,7 @@ class ResilientHTTPClient:
             elif target == "nifty" and not self._nifty_primed:
                 url = "https://www.niftyindices.com/reports/historical-data"
                 if self.curl_session is not None:
-                    r = await self.curl_session.get(url, headers=prime_headers)
+                    r = await self.curl_session.get(url, headers=prime_headers, timeout=30.0)
                 elif self.client is not None:
                     r = await self.client.get(url, headers=prime_headers)
                 else:

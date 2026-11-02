@@ -65,10 +65,20 @@ jobs:
           echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
           sudo apt-get update -y
           sudo apt-get install -y cloudflare-warp
+          sudo systemctl start warp-svc || true
+          sleep 2
           warp-cli --accept-tos registration new || warp-cli --accept-tos register || true
           warp-cli --accept-tos connect || true
-          sleep 4
-          curl -fsSL https://www.cloudflare.com/cdn-cgi/trace | grep "warp=" || true
+          for i in 1 2 3 4 5 6; do
+            sleep 3
+            if curl -fsSL --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q "warp=on"; then
+              echo "Cloudflare WARP connected on attempt $i"
+              break
+            fi
+            warp-cli --accept-tos registration new || true
+            warp-cli --accept-tos connect || true
+          done
+          curl -fsSL --max-time 5 https://www.cloudflare.com/cdn-cgi/trace | grep "warp=" || true
 
       - name: Install uv & Python 3.12
         uses: astral-sh/setup-uv@v4
@@ -85,8 +95,11 @@ jobs:
           mkdir -p data
           if gh release view datalake-latest >/dev/null 2>&1; then
             echo "Downloading existing datalake-latest archive..."
-            gh release download datalake-latest -p "datalake_store.tar.zst" -D /tmp/ --clobber || true
-            if [ -f /tmp/datalake_store.tar.zst ]; then
+            gh release download datalake-latest -p "datalake_store.tar.zst*" -D /tmp/ --clobber || true
+            if ls /tmp/datalake_store.tar.zst.part-* >/dev/null 2>&1; then
+              cat /tmp/datalake_store.tar.zst.part-* | tar --zstd -xf - -C ./
+              rm -f /tmp/datalake_store.tar.zst.part-* /tmp/datalake_store.tar.zst
+            elif [ -f /tmp/datalake_store.tar.zst ]; then
               tar --zstd -xf /tmp/datalake_store.tar.zst -C ./
               rm -f /tmp/datalake_store.tar.zst
             fi
@@ -136,7 +149,15 @@ jobs:
         run: |
           if [ -d data ] && [ -f data/state.db ]; then
             uv run datalake stage-release --staging-dir /tmp/release_assets
-            tar --zstd -cf /tmp/release_assets/datalake_store.tar.zst data/
-            tar --zstd -tf /tmp/release_assets/datalake_store.tar.zst >/dev/null
+            tar --zstd -cf /tmp/datalake_store.tar.zst data/
+            tar --zstd -tf /tmp/datalake_store.tar.zst >/dev/null
+            ARCHIVE_SIZE=$(stat -c%s /tmp/datalake_store.tar.zst)
+            if [ "$ARCHIVE_SIZE" -gt 1887436800 ]; then
+              split -b 1800M -d -a 2 /tmp/datalake_store.tar.zst /tmp/release_assets/datalake_store.tar.zst.part-
+              rm -f /tmp/datalake_store.tar.zst
+              gh release delete-asset datalake-latest datalake_store.tar.zst --yes 2>/dev/null || true
+            else
+              mv /tmp/datalake_store.tar.zst /tmp/release_assets/datalake_store.tar.zst
+            fi
             gh release upload datalake-latest /tmp/release_assets/* --clobber
           fi

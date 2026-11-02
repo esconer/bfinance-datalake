@@ -131,7 +131,9 @@ async def run_xbrl_sync(
         xbrl = XBRLScraper(http, state, cfg)
         dd = DealsAndDocumentsScraper(http, state, cfg)
         if all_market:
-            await xbrl.sync_all_market(max_companies=limit)
+            synced_syms, synced_scrips = await xbrl.sync_all_market(max_companies=limit)
+            if synced_scrips or synced_syms:
+                await dd.sync_annual_reports_bse(synced_scrips[:200], symbols=synced_syms[:200])
             return
         for sym in symbols:
             await xbrl.sync_symbol_financials_nse(sym)
@@ -139,7 +141,7 @@ async def run_xbrl_sync(
         if bse_scrips:
             for scrip in bse_scrips:
                 await xbrl.sync_bse_shareholding(scrip)
-            await dd.sync_annual_reports_bse(bse_scrips)
+            await dd.sync_annual_reports_bse(bse_scrips, symbols=symbols)
 
 
 async def run_pre2016_nse(cfg: LakeConfig, symbols: list[str], start_year: int, end_year: int) -> None:

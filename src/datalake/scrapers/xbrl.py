@@ -97,15 +97,20 @@ class XBRLScraper:
         self.state = state
         self.cfg = cfg
 
-    async def sync_all_market(self, max_companies: int | None = None) -> None:
+    async def sync_all_market(self, max_companies: int | None = None) -> tuple[list[str], list[str]]:
         nse_master = self.cfg.root_dir / "universe" / "nse_equity_master.parquet"
         bse_master = self.cfg.root_dir / "universe" / "bse_scrip_master.parquet"
+        synced_syms: list[str] = []
+        synced_scrips: list[str] = []
 
         if nse_master.exists():
             ndf = read_table_safe(nse_master)
-            syms = ndf["SYMBOL"].dropna().astype(str).str.strip().unique().tolist()
+            done_nse = self.state.completed_keys("xbrl_financials_symbol")
+            all_syms = ndf["SYMBOL"].dropna().astype(str).str.strip().unique().tolist()
+            syms = [s for s in all_syms if s not in done_nse] or all_syms
             if max_companies:
                 syms = syms[:max_companies]
+            synced_syms = syms
             logger.info("[XBRL All-Market] Syncing NSE Financials + Shareholding for %d symbols...", len(syms))
             for sym in syms:
                 await self.sync_symbol_financials_nse(sym)
@@ -115,12 +120,18 @@ class XBRLScraper:
         if bse_master.exists():
             bdf = read_table_safe(bse_master)
             bdf = bdf[bdf["Status"] == "Active"] if "Status" in bdf.columns else bdf
-            scrips = bdf["SCRIP_CD"].dropna().astype(str).str.strip().unique().tolist()
+            done_bse = self.state.completed_keys("bse_shareholding")
+            all_scrips = bdf["SCRIP_CD"].dropna().astype(str).str.strip().unique().tolist()
+            scrips = [sc for sc in all_scrips if sc not in done_bse] or all_scrips
             if max_companies:
                 scrips = scrips[:max_companies]
+            synced_scrips = scrips
+            logger.info("[XBRL All-Market] Syncing BSE Shareholding for %d scrips...", len(scrips))
             for scrip in scrips:
                 await self.sync_bse_shareholding(scrip)
                 await asyncio.sleep(self.cfg.polite_delay_sec)
+
+        return synced_syms, synced_scrips
 
     async def sync_symbol_financials_nse(self, symbol: str) -> None:
         sym = symbol.strip().upper()

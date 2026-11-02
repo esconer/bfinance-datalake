@@ -200,48 +200,57 @@ class DealsAndDocumentsScraper:
         target = self.cfg.root_dir / "documents" / "concalls_and_filings.parquet"
         all_rows = []
 
-        for doc_label, cat, subcat in BSE_DOC_SUBCATEGORIES:
-            page = 1
-            while page <= 25:
-                params = {
-                    "pageno": str(page),
-                    "strCat": cat,
-                    "strPrevDate": start_date.strftime("%Y%m%d"),
-                    "strScrip": scrip_code,
-                    "strSearch": "P",
-                    "strToDate": end_date.strftime("%Y%m%d"),
-                    "strType": "C",
-                    "subcategory": subcat,
-                }
-                url = "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
-                try:
-                    resp = await self.http.get(url, headers=BSE_API_HEADERS, params=params, prime_bse=True)
-                    if resp.status_code != 200 or not resp.text.strip().startswith("{"):
-                        break
-                    table = resp.json().get("Table", [])
-                except Exception:
-                    break
-                if not table:
-                    break
+        # BSE AnnSubCategoryGetData/w enforces: "Date range cannot exceed 1 month."
+        cur = start_date
+        windows: list[tuple[date, date]] = []
+        while cur <= end_date:
+            win_end = min(end_date, cur + timedelta(days=27))
+            windows.append((cur, win_end))
+            cur = win_end + timedelta(days=1)
 
-                for item in table:
-                    att = item.get("ATTACHMENTNAME")
-                    folder = "AttachHis" if item.get("OLD") == 1 else "AttachLive"
-                    pdf_url = f"https://www.bseindia.com/xml-data/corpfiling/{folder}/{att}" if att else None
-                    all_rows.append({
-                        "NewsId": str(item.get("NEWSID", "")),
-                        "ScripCode": str(item.get("SCRIP_CD", "")),
-                        "CompanyName": str(item.get("SLONGNAME", "")),
-                        "DocumentType": doc_label,
-                        "Category": cat,
-                        "SubCategory": subcat,
-                        "Headline": str(item.get("NEWSSUB", "")),
-                        "FilingTimestamp": str(item.get("NEWS_DT", "")),
-                        "PDFUrl": pdf_url,
-                    })
-                if len(table) < 50:
-                    break
-                page += 1
+        for w_start, w_end in windows:
+            for doc_label, cat, subcat in BSE_DOC_SUBCATEGORIES:
+                page = 1
+                while page <= 25:
+                    params = {
+                        "pageno": str(page),
+                        "strCat": cat,
+                        "strPrevDate": w_start.strftime("%Y%m%d"),
+                        "strScrip": scrip_code,
+                        "strSearch": "P",
+                        "strToDate": w_end.strftime("%Y%m%d"),
+                        "strType": "C",
+                        "subcategory": subcat,
+                    }
+                    url = "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
+                    try:
+                        resp = await self.http.get(url, headers=BSE_API_HEADERS, params=params, prime_bse=True)
+                        if resp.status_code != 200 or not resp.text.strip().startswith("{"):
+                            break
+                        table = resp.json().get("Table", [])
+                    except Exception:
+                        break
+                    if not table:
+                        break
+
+                    for item in table:
+                        att = item.get("ATTACHMENTNAME")
+                        folder = "AttachHis" if item.get("OLD") == 1 else "AttachLive"
+                        pdf_url = f"https://www.bseindia.com/xml-data/corpfiling/{folder}/{att}" if att else None
+                        all_rows.append({
+                            "NewsId": str(item.get("NEWSID", "")),
+                            "ScripCode": str(item.get("SCRIP_CD", "")),
+                            "CompanyName": str(item.get("SLONGNAME", "")),
+                            "DocumentType": doc_label,
+                            "Category": cat,
+                            "SubCategory": subcat,
+                            "Headline": str(item.get("NEWSSUB", "")),
+                            "FilingTimestamp": str(item.get("NEWS_DT", "")),
+                            "PDFUrl": pdf_url,
+                        })
+                    if len(table) < 50:
+                        break
+                    page += 1
 
         if all_rows:
             df = pd.DataFrame(all_rows)

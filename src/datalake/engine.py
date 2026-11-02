@@ -434,9 +434,10 @@ class UnifiedLakeEngine:
                 except Exception:
                     continue
                 if not df.empty and "Symbol" in df.columns and "Date" in df.columns:
-                    df = df.sort_values(["Symbol", "Date"]).reset_index(drop=True)
-                    write_parquet_atomic(df, pq)
-                    reclustered += 1
+                    sorted_df = df.sort_values(["Symbol", "Date"])
+                    if not df.index.equals(sorted_df.index):
+                        write_parquet_atomic(sorted_df.reset_index(drop=True), pq)
+                        reclustered += 1
         self._cached_raw_equity.cache_clear()
         return {"files_clustered_by_symbol_date": reclustered}
 
