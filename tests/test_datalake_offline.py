@@ -289,6 +289,8 @@ def test_fo_2000_int64_ohlc_and_doctor_preservation():
 
         report = LakeDoctor(cfg).run_full_check_and_repair()
         assert report["truncated_days_purged"] == 0
+        assert (cfg.root_dir / "derivatives" / "nse_fo_2000.parquet").exists()
+        assert not (cfg.root_dir / "derivatives" / "nse_fo_2000_07.parquet").exists()
         assert state.is_completed("fo_eod_nse", "2000-07-11") is True
         assert state.is_completed("equity_eod_bse", "1995-01-02") is False
         assert state.is_completed("fo_eod_bse", "2001-01-02") is False

@@ -278,7 +278,7 @@ async def run_live_smoke_test(smoke_dir: Path) -> int:
             "2020",
             "NSE Legacy F&O Option Chains (2020-01-02)",
             fo.sync_range(date(2020, 1, 2), date(2020, 1, 2), exchanges=("NSE",)),
-            cfg.root_dir / "derivatives" / "nse_fo_2020_01.parquet",
+            cfg.root_dir / "derivatives" / "nse_fo_2020.parquet",
         )
 
     doc_stats = LakeDoctor(cfg).run_full_check_and_repair()

@@ -106,10 +106,19 @@ class RemoteLakeClient:
             [symbol.strip().upper()],
         ).df()
 
-    def option_chain(self, symbol: str, year: int, month: int, trade_date: str | date | None = None) -> pd.DataFrame:
+    def option_chain(
+        self,
+        symbol: str,
+        year: int | None = None,
+        month: int | None = None,
+        trade_date: str | date | None = None,
+    ) -> pd.DataFrame:
         """Stream an EOD Option Chain for a specific symbol over HTTPS in ~400ms."""
         self._ensure_httpfs()
-        url = self._asset_url("derivatives", f"nse_fo_{year}_{month:02d}.parquet")
+        if trade_date and year is None:
+            year = pd.Timestamp(trade_date).year
+        yr = year or pd.Timestamp.now().year
+        url = self._asset_url("derivatives", f"nse_fo_{yr}.parquet")
         if trade_date:
             return self.con.execute(
                 f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ? AND CAST(Date AS DATE) = CAST(? AS DATE) ORDER BY ExpiryDate, StrikePrice, OptionType",

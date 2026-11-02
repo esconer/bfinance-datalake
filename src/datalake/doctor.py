@@ -7,7 +7,7 @@ import pandas as pd
 
 from datalake.config import IST, LakeConfig
 from datalake.state import StateStore
-from datalake.storage import NUMERIC_FLOAT_COLS, read_table_safe, write_parquet_atomic
+from datalake.storage import NUMERIC_FLOAT_COLS, read_table_safe, upsert_parquet_partition, write_parquet_atomic
 
 logger = logging.getLogger("datalake.doctor")
 
@@ -68,6 +68,26 @@ class LakeDoctor:
             "indices_daily_all": set(),
             "nse_participant_oi": set(),
         }
+
+        # Auto-migrate legacy monthly F&O files (nse_fo_YYYY_MM.parquet -> nse_fo_YYYY.parquet)
+        fo_dir = self.cfg.root_dir / "derivatives"
+        if fo_dir.exists():
+            for pq_mo in sorted(fo_dir.glob("*_fo_*_*.parquet")):
+                parts = pq_mo.stem.split("_")
+                if len(parts) == 4 and parts[2].isdigit() and parts[3].isdigit():
+                    yearly_target = fo_dir / f"{parts[0]}_fo_{parts[2]}.parquet"
+                    try:
+                        df_mo = read_table_safe(pq_mo)
+                        if not df_mo.empty:
+                            upsert_parquet_partition(
+                                df_mo,
+                                yearly_target,
+                                dedup_cols=["Date", "Exchange", "InstrumentType", "Symbol", "ExpiryDate", "StrikePrice", "OptionType"],
+                                sort_cols=["Symbol", "Date", "ExpiryDate", "StrikePrice", "OptionType"],
+                            )
+                        pq_mo.unlink(missing_ok=True)
+                    except Exception as exc:
+                        logger.warning("[Doctor] Failed migrating %s: %s", pq_mo.name, exc)
 
         for pq_path in sorted(self.cfg.root_dir.rglob("*.parquet")):
             try:

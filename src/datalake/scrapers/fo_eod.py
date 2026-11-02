@@ -68,8 +68,8 @@ class DerivativesEODScraper:
                         except Exception as exc:
                             return d, None, None, None, exc
 
-                for chunk_start in range(0, len(pending), 22):
-                    batch = pending[chunk_start : chunk_start + 22]
+                for chunk_start in range(0, len(pending), 66):
+                    batch = pending[chunk_start : chunk_start + 66]
                     results = await asyncio.gather(*[_worker(d) for d in batch])
                     frames: list[pd.DataFrame] = []
                     ok_records: list[tuple[str, int, bytes | None, str | None]] = []
@@ -88,8 +88,8 @@ class DerivativesEODScraper:
 
                     if frames:
                         combined = pd.concat(frames, ignore_index=True)
-                        for (yr, mo), grp in combined.groupby([combined["Date"].dt.year, combined["Date"].dt.month]):
-                            target = self.cfg.root_dir / "derivatives" / f"{exch.lower()}_fo_{int(yr)}_{int(mo):02d}.parquet"
+                        for yr, grp in combined.groupby(combined["Date"].dt.year):
+                            target = self.cfg.root_dir / "derivatives" / f"{exch.lower()}_fo_{int(yr)}.parquet"
                             upsert_parquet_partition(
                                 grp,
                                 target,

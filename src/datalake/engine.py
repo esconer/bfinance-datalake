@@ -330,7 +330,9 @@ class UnifiedLakeEngine:
 
         if trade_date:
             dt = pd.Timestamp(trade_date).normalize()
-            files = [fo_dir / f"{exch}_fo_{dt.year}_{dt.month:02d}.parquet"]
+            yearly = fo_dir / f"{exch}_fo_{dt.year}.parquet"
+            monthly = fo_dir / f"{exch}_fo_{dt.year}_{dt.month:02d}.parquet"
+            files = [yearly] if yearly.exists() else [monthly]
         else:
             files = sorted(fo_dir.glob(f"{exch}_fo_*.parquet"))[-1:]
 
