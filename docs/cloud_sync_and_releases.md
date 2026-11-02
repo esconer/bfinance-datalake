@@ -66,14 +66,19 @@ Sync Summary: {'up_to_date_skipped': 45, 'downloaded': 3, 'total_files': 48}
 Used inside CI/CD workflows prior to `gh release upload`:
 
 ```bash
+# Full staging
 uv run datalake stage-release --staging-dir /tmp/release_assets
+
+# Incremental staging (only stages changed/new files compared to previous manifest)
+uv run datalake stage-release --staging-dir /tmp/release_assets --prev-manifest /tmp/prev_manifest.json
 ```
 
 This command:
-1. Calls `UnifiedLakeEngine.optimize_layout()` to re-cluster all Parquet files by `(Symbol, Date)` for sub-5ms predicate pushdown.
-2. Computes SHA-256 checksums and writes `manifest.json`.
+1. Calls `UnifiedLakeEngine.optimize_layout()` to re-cluster all Parquet files by `(Symbol, Date)` and derivatives by `(Symbol, Date, ExpiryDate, StrikePrice, OptionType)` with `row_group_size = 10_000` for sub-5ms predicate pushdown.
+2. Computes SHA-256 checksums and writes `manifest.json` with an accurate `"generated_at"` ISO timestamp.
 3. Renames nested files into flat, release-safe names (e.g., `equities/nse_cm_2026.parquet` $\to$ `equities__nse_cm_2026.parquet`).
-4. Stages `manifest.json`, `state.db`, and all partitions < 1.95 GB into the staging folder.
+4. Stages `manifest.json`, `state.db`, and all new or changed partitions < 1.95 GB into the staging folder (skipping historical unchanged years when `--prev-manifest` is supplied).
+5. During `datalake pull`, any local `.parquet` file on disk that is no longer present in the remote `manifest.json` (such as legacy monthly F&O files) is automatically pruned to prevent double-counting in DuckDB queries.
 
 ---
 

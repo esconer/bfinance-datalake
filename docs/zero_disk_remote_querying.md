@@ -60,18 +60,28 @@ from datalake.remote import RemoteLakeClient
 remote = RemoteLakeClient(repo="your-username/bfinance-datalake", tag="datalake-latest")
 
 # 1. Stream daily OHLCV + Delivery for RELIANCE (2024 to 2026) in ~350 ms
-df_ohlcv = remote.history("RELIANCE", start_year=2024, end_year=2026)
+df_ohlcv = remote.history("RELIANCE.NS", start_year=2024, end_year=2026)
 
-# 2. Stream Ind-AS XBRL Quarterly Financials in ~250 ms
+# 2. Vectorized multi-symbol download via single HTTP Range query
+df_multi = remote.download(["RELIANCE", "TCS", "INFY"], start_year=2025, end_year=2026)
+
+# 3. Stream Ind-AS XBRL Quarterly Financials in ~250 ms
 df_fin = remote.financials("RELIANCE", period_type="Quarterly")
 
-# 3. Stream quarterly Promoter & Public Shareholding in ~250 ms
+# 4. Stream quarterly Promoter & Public Shareholding and >1% Institutional Holders
 df_shp = remote.shareholding("RELIANCE")
+df_holders = remote.named_holders("RELIANCE")
 
-# 4. Stream an EOD Option Chain partition in ~400 ms
-df_fo = remote.option_chain("NIFTY", year=2026, month=10, trade_date="2026-10-30")
+# 5. Stream corporate actions, deals, insider trades, and concalls
+df_act = remote.corporate_actions("RELIANCE")
+df_deals = remote.deals("RELIANCE")
+df_insider = remote.insider_trades("RELIANCE")
+df_concall = remote.concalls("500325")
 
-# 5. Run arbitrary remote SQL joins directly over HTTPS
+# 6. Stream an EOD Option Chain partition (from yearly nse_fo_YYYY.parquet) in ~350 ms
+df_fo = remote.option_chain("NIFTY", year=2026, trade_date="2026-10-30")
+
+# 7. Run arbitrary remote SQL joins directly over HTTPS
 df_sql = remote.sql("""
     SELECT Symbol, Date, Close, DeliveryPct
     FROM read_parquet('https://github.com/your-username/bfinance-datalake/releases/download/datalake-latest/equities__nse_cm_2026.parquet')
@@ -96,20 +106,36 @@ RemoteLakeClient(
 ```
 - `repo`: GitHub repository path (e.g., `'your-username/bfinance-datalake'`).
 - `tag`: Target GitHub Release tag (defaults to `'datalake-latest'`).
-- `token`: Optional GitHub personal access token (or auto-read from `GITHUB_TOKEN` / `GH_TOKEN`).
+- `token`: Optional GitHub personal access token (or auto-read from `GITHUB_TOKEN` / `GH_TOKEN`). Injects `Authorization: Bearer <token>` into DuckDB `httpfs` via `CREATE OR REPLACE SECRET gh_token` for seamless private release access.
 - `load_httpfs`: Whether to initialize DuckDB's `httpfs` extension (defaults to `True`).
 
 ### Methods
 - **`history(symbol: str, start_year: int = 2024, end_year: int = 2026, exchange: str = "NSE") -> pd.DataFrame`**  
-  Streams daily price, volume, and delivery data for `symbol` across the year range using predicate pushdown.
+  Streams daily price, volume, and delivery data for `symbol` across the year range using predicate pushdown. Strips `.NS` / `.BO` automatically.
+- **`download(symbols: list[str], start_year: int = 2024, end_year: int = 2026, exchange: str = "NSE") -> pd.DataFrame`**  
+  Streams multiple stocks simultaneously in a single vectorized HTTP Range query using `WHERE Symbol IN (...)`.
 - **`financials(symbol: str, period_type: str = "Quarterly") -> pd.DataFrame`**  
   Streams Ind-AS XBRL financials (`PeriodType='Quarterly'` or `'Annual'`).
 - **`shareholding(symbol: str) -> pd.DataFrame`**  
   Streams promoter, institutional, and public shareholding history.
-- **`option_chain(symbol: str, year: int, month: int, trade_date: str | date | None = None) -> pd.DataFrame`**  
-  Streams contracts from the monthly derivatives partition (`nse_fo_YYYY_MM.parquet`).
+- **`named_holders(symbol: str) -> pd.DataFrame`**  
+  Streams >1% institutional and public shareholders.
+- **`corporate_actions(symbol: str) -> pd.DataFrame`**  
+  Streams parsed splits, bonus issues, and cash dividends.
+- **`option_chain(symbol: str, year: int | None = None, month: int | None = None, trade_date: str | date | None = None) -> pd.DataFrame`**  
+  Streams EOD options and futures contracts from yearly `derivatives__nse_fo_{year}.parquet` partitions.
+- **`index_history(index_name: str = "NIFTY 50") -> pd.DataFrame`**  
+  Streams 30-year index spot OHLC, Total Return Index (TRI), P/E, P/B, and Dividend Yield.
+- **`deals(symbol: str) -> pd.DataFrame`**  
+  Streams Bulk and Block deals.
+- **`insider_trades(symbol: str) -> pd.DataFrame`**  
+  Streams SEBI PIT Regulation 7(2) insider trades and promoter pledge disclosures.
+- **`annual_reports(symbol: str) -> pd.DataFrame`**  
+  Streams official PDF download URLs for 18+ fiscal years of annual reports.
+- **`concalls(scrip_code_or_symbol: str) -> pd.DataFrame`**  
+  Streams BSE concall transcripts, investor presentations, audio links, and credit ratings.
 - **`sql(query: str, params: list | None = None) -> pd.DataFrame`**  
-  Executes arbitrary SQL queries over remote HTTPS Parquet URLs.
+  Executes arbitrary analytical SQL queries over remote HTTPS Parquet URLs via DuckDB.
 
 ---
 

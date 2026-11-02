@@ -14,7 +14,7 @@ Comprehensive technical specifications, schema definitions, live empirical probe
 * [**Documentation Master Index & Historical Timeline**](docs/README.md) - High-level architectural overview, 30-year market evolution timeline, and network resilience.
 * [**Upstox Historical Candle CDN Integration**](docs/upstox_data_integration.md) - Public unauthenticated CDN endpoints, OHLCV schemas, split/bonus adjustment proof, and 2000–2015 cloud seeding.
 * [**Equity EOD Integration (NSE & BSE Cash Equities)**](docs/equity_eod_data_integration.md) - Modern UDIFF cutover (2024), Full Bhavdata (2020–2024), Legacy Bhavcopies (1995–2024), MTO Gross Delivery (2002–2024), and NSE HistoricalOR fallback.
-* [**Derivatives F&O Integration (NSE & BSE)**](docs/derivatives_fo_data_integration.md) - Inception of Index Futures (June 12, 2000), Stock Futures/Options, modern UDIFF format, settlement prices, strike grids, open interest (OI), and monthly Parquet partitioning.
+* [**Derivatives F&O Integration (NSE & BSE)**](docs/derivatives_fo_data_integration.md) - Inception of Index Futures (June 12, 2000), Stock Futures/Options, modern UDIFF format, settlement prices, strike grids, open interest (OI), and yearly Parquet partitioning (`nse_fo_YYYY.parquet`).
 * [**Nifty Indices Historical & Snapshot Data Integration**](docs/indices_data_integration.md) - 30Y continuous OHLC, Total Return Index (TRI), Valuation Ratios (P/E, P/B, Div Yield) via Sitefinity MVC `/BackPage/*`, and market-wide daily snapshots (120+ indices).
 * [**Corporate Universe, Security Masters & Actions**](docs/universe_and_actions_data_integration.md) - NSE & BSE security masters, 1,078 symbol rename DAG, Point-in-Time (PIT) Nifty 50 constituents, 30Y regex corporate actions parser, and multiplicative backward adjustment math.
 * [**XBRL Fundamentals & Shareholding Patterns**](docs/xbrl_fundamentals_and_shareholding_data_integration.md) - Ind-AS XBRL taxonomies (`in-bse-fin` and `in-bse-bank`), quarterly/annual financial statements, 25-year BSE multi-decade shareholding patterns (107 quarters for Reliance back to 2001), promoter pledge, and >1% institutional holders.
@@ -33,32 +33,39 @@ Query any stock across all 15 datasets simultaneously using its NSE Symbol, BSE 
 
 ```python
 from datalake import UnifiedLakeEngine
+from datalake.remote import RemoteLakeClient
 
-# Point to local Parquet data lake (or auto-sync via UnifiedLakeEngine.from_github)
+# Option A: Point to local Parquet data lake (or auto-sync via UnifiedLakeEngine.from_github)
 lake = UnifiedLakeEngine("./data")
 
-# 1. Universal Crosswalk Resolution
+# 1. Universal Crosswalk Resolution with Metadata
 rel = lake.ticker("500325")  # Also resolves by "RELIANCE" or "INE002A01018"
 print(rel.identity)
-# SecurityIdentity(symbol='RELIANCE', bse_code='500325', isin='INE002A01018', ...)
+# SecurityIdentity(symbol='RELIANCE', bse_code='500325', isin='INE002A01018',
+#                  face_value=10.0, industry='Refineries', listing_date='1995-11-29', ...)
 
 # 2. Daily OHLCV Price Bars with backward split & dividend Adj Close
 df_price = rel.history(start="1995-01-01", auto_adjust=True)
 
-# 3. Ind-AS XBRL Balance Sheet, P&L & Cash Flow Statements
+# 3. Vectorized Multi-Symbol Download (Single pass over yearly partitions)
+stocks = lake.download(["RELIANCE", "TCS", "INFY"], start="2020-01-01", auto_adjust=True)
+
+# 4. Ind-AS XBRL Balance Sheet, P&L & Cash Flow Statements
 df_qtr = rel.quarterly_financials
 df_ann = rel.financials
 
-# 4. Multi-Decade Shareholding & Promoter Pledge
+# 5. Multi-Decade Shareholding & Promoter Pledge
 df_shp = rel.shareholding
 df_inst = rel.institutional_holders
 
-# 5. Corporate Actions, Bulk/Block Deals & Annual Report PDFs
+# 6. Corporate Actions, Deals, Concalls & Annual Reports
 df_act = rel.actions
 df_deals = rel.deals
+df_insider = rel.insider_trades
+df_concalls = rel.concalls
 df_ar = rel.annual_reports
 
-# 6. Zero-Copy DuckDB SQL Screeners Across All Parquet Datasets
+# 7. Zero-Copy DuckDB SQL Screeners Across All Parquet Datasets
 df_screen = lake.sql("""
     SELECT e.Symbol, e.Date, e.Close, e.DeliveryPct, f.Sales_Cr, f.NetProfit_Cr
     FROM equities_nse e
@@ -67,6 +74,11 @@ df_screen = lake.sql("""
       AND e.DeliveryPct > 55.0
     LIMIT 25;
 """)
+
+# Option B: Zero-Disk Remote Querying (Streams byte-ranges via DuckDB httpfs, 0 MB disk)
+remote = RemoteLakeClient(repo="esconer/bfinance-datalake")
+df_rem = remote.history("RELIANCE", start_year=2024, end_year=2026)
+df_opt = remote.option_chain("NIFTY", year=2026)
 ```
 
 ---
@@ -102,8 +114,18 @@ uv run datalake status
 uv run datalake doctor
 
 # 10. Stage Release Assets & Generate manifest.json (Used by GitHub Actions)
-uv run datalake stage-release --staging-dir /tmp/release_assets
+uv run datalake stage-release --staging-dir /tmp/release_assets --prev-manifest /tmp/prev_manifest.json
 ```
+
+---
+
+## Architecture with `bfinance` (Batch + Speed Layers)
+
+`bfinance-datalake` is engineered to act as the foundational **Historical Batch Layer** for [`esconer/bfinance`](https://github.com/esconer/bfinance):
+
+* **Batch Layer (`bfinance-datalake`)**: Houses 1995 $\to$ Yesterday's market close across all 15 datasets in Zstandard Parquet. Offers 1–5 ms local NVMe querying or ~350 ms remote zero-disk streaming via DuckDB `httpfs`.
+* **Speed Layer (`bfinance`)**: Captures live market hours (9:15 AM $\to$ 3:30 PM IST), intraday candles (1m, 5m, 15m, 1h), and live CMP.
+* **Live Tail Stitcher**: Transparently appends today's unclosed EOD quote to 30 years of adjusted Parquet bars, eliminating 95% of upstream exchange rate limits while providing up-to-the-second data.
 
 ---
 

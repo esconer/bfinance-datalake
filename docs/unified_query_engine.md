@@ -78,13 +78,16 @@ The primary engine instance that caches crosswalk mappings and serves queries ac
 #### Methods
 
 - **`resolve(query: str | int) -> SecurityIdentity`**
-  Resolves any NSE symbol, BSE code, or ISIN to a `SecurityIdentity(symbol, bse_code, isin, company_name, aliases)`. Strips suffixes like `.NS` or `.BO` automatically.
+  Resolves any NSE symbol, BSE code, or ISIN to a `SecurityIdentity(symbol, bse_code, isin, company_name, aliases, face_value, industry, listing_date)`. Strips suffixes like `.NS` or `.BO` automatically.
 
 - **`ticker(query: str | int) -> LakeTicker`**
   Returns a `LakeTicker` facade for the resolved security.
 
 - **`history(query, start=None, end=None, exchange="NSE", auto_adjust=False) -> pd.DataFrame`**
   Retrieves daily OHLCV + Delivery data. Backward-computes `Dividends`, `Stock Splits`, and `Adj Close` using corporate action records. When `auto_adjust=True`, open/high/low/close and volume are scaled by split/dividend factors.
+
+- **`download(queries, start=None, end=None, exchange="NSE", auto_adjust=False) -> dict[str, pd.DataFrame]`**
+  Vectorized multi-symbol OHLCV download that reads each annual Parquet partition only once using `Symbol IN (...)` pushdown, returning a dictionary mapping each canonical symbol to its adjusted DataFrame (25x–50x faster than sequential history calls).
 
 - **`fundamentals(query, period_type=None, consolidated=True) -> pd.DataFrame`**
   Queries Ind-AS XBRL filings (P&L, Balance Sheet, Cash Flow). Filter by `period_type="Quarterly"` or `period_type="Annual"`.
@@ -99,7 +102,7 @@ The primary engine instance that caches crosswalk mappings and serves queries ac
   Returns parsed dividends, splits, and bonus issues for the resolved security across both exchanges.
 
 - **`option_chain(symbol="NIFTY", trade_date=None, expiry=None, exchange="NSE") -> pd.DataFrame`**
-  Fetches EOD derivatives contracts (CE/PE, strike, settlement price, OI, change in OI). Defaults to the latest available trade date.
+  Fetches EOD derivatives contracts (CE/PE, strike, settlement price, OI, change in OI) from yearly `nse_fo_YYYY.parquet` partitions. Defaults to the latest available trade date.
 
 - **`index_history(index_name="NIFTY 50", start=None, end=None) -> pd.DataFrame`**
   Fetches index spot OHLC, Total Return Index (TRI), and valuation metrics (P/E, P/B, Dividend Yield).
@@ -110,11 +113,17 @@ The primary engine instance that caches crosswalk mappings and serves queries ac
 - **`deals(query=None) -> pd.DataFrame`**
   Returns Bulk and Block deals. If `query` is specified, filters to that security.
 
+- **`insider_trades(query=None) -> pd.DataFrame`**
+  Returns SEBI PIT Regulation 7(2) insider trading and promoter pledge disclosures.
+
+- **`concalls(query=None) -> pd.DataFrame`**
+  Returns BSE earnings call transcripts, investor presentations, audio links, and credit ratings.
+
 - **`annual_reports(query) -> pd.DataFrame`**
   Returns direct PDF and ZIP download links for 20+ years of NSE and BSE annual reports.
 
 - **`optimize_layout() -> dict[str, int]`**
-  Re-clusters all equity Parquet files on disk by `["Symbol", "Date"]` so PyArrow reads only contiguous single-stock row groups.
+  Re-clusters all equity Parquet files on disk by `["Symbol", "Date"]` and derivatives partitions by `["Symbol", "Date", "ExpiryDate", "StrikePrice", "OptionType"]` with `row_group_size = 10_000` so PyArrow/DuckDB reads only contiguous single-stock row groups.
 
 - **`sql(query: str) -> pd.DataFrame`**
   Executes high-performance SQL queries over DuckDB virtual views.
@@ -137,6 +146,8 @@ Convenience wrapper returned by `lake.ticker(...)`:
 | `.institutional_holders` | `pd.DataFrame` | Named >1% institutional and public holders |
 | `.actions` | `pd.DataFrame` | Parsed corporate actions (splits, dividends) |
 | `.deals` | `pd.DataFrame` | Bulk and block deals |
+| `.insider_trades` | `pd.DataFrame` | SEBI PIT insider trading disclosures |
+| `.concalls` | `pd.DataFrame` | Concall transcripts, presentations, audio links |
 | `.annual_reports` | `pd.DataFrame` | Annual report PDF/ZIP URLs |
 
 ---
@@ -182,6 +193,8 @@ df_screen = lake.sql("""
 - `actions_bse`: BSE corporate actions
 - `mutual_funds`: AMFI NAV partitions (`amfi_nav_*.parquet`)
 - `deals`: Bulk and block deals
+- `insider_pit`: SEBI PIT Regulation 7(2) insider trades (`deals/insider_trading_pit.parquet`)
+- `concalls`: BSE earnings call transcripts & investor filings (`documents/concalls_and_filings.parquet`)
 - `participant_oi`: Participant Open Interest by client category
 - `fii_dii`: Daily Cash FII/DII net flows
 - `annual_reports`: Annual report document URLs
