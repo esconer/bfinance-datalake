@@ -26,12 +26,27 @@ HAS_PARQUET = _has_parquet_engine()
 
 
 NUMERIC_FLOAT_COLS: frozenset[str] = frozenset({
+    # Corporate Action numeric columns
     "DividendPerShareRs",
     "BonusNew",
     "BonusHeld",
     "SplitFromFV",
     "SplitToFV",
     "ShareMultiplier",
+    # Shareholding numeric columns
+    "PromoterPct",
+    "PublicPct",
+    "TotalShares",
+    "PromoterPledgedShares",
+    "PromoterPledgedPct",
+    "MutualFundsPct",
+    "FPI_Pct",
+    "InsurancePct",
+    "RetailPct",
+    "Shares",
+    "PctOfTotal",
+    "PledgedShares",
+    "PledgedPct",
 })
 
 
@@ -70,7 +85,7 @@ def sanitize_for_parquet(df: pd.DataFrame) -> pd.DataFrame:
         out = out.loc[:, ~out.columns.duplicated()].copy()
 
     for col in out.columns:
-        if col in NUMERIC_FLOAT_COLS:
+        if col in NUMERIC_FLOAT_COLS or col.endswith(("_Cr", "_Rs", "_Pct")):
             default_v = 1.0 if col == "ShareMultiplier" else None
             out[col] = _coerce_numeric_series(out[col], default_val=default_v)
         elif pd.api.types.is_object_dtype(out[col]):

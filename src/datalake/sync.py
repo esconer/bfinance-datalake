@@ -48,15 +48,28 @@ def build_manifest(data_dir: Path) -> dict:
     return manifest
 
 
-def prepare_release_staging(data_dir: Path, staging_dir: Path) -> dict:
+def prepare_release_staging(
+    data_dir: Path,
+    staging_dir: Path,
+    previous_manifest_path: Path | None = None,
+) -> dict:
     """
     Run by GitHub Actions before `gh release upload`:
       1. Clusters Equity Parquet files by `(Symbol, Date)` for sub-5ms predicate pushdown.
       2. Generates `manifest.json`.
-      3. Copies `manifest.json`, `state.db`, and all `folder__file.parquet` assets into `staging_dir`.
+      3. Copies `manifest.json`, `state.db`, and all `folder__file.parquet` assets into `staging_dir`
+         (staging only new/modified files if previous_manifest_path is provided).
     """
     data_dir = data_dir.resolve()
     staging_dir = staging_dir.resolve()
+
+    old_shas: dict[str, str] = {}
+    if previous_manifest_path and previous_manifest_path.exists():
+        try:
+            old_m = json.loads(previous_manifest_path.read_text(encoding="utf-8"))
+            old_shas = {k: v.get("sha256", "") for k, v in old_m.get("files", {}).items()}
+        except Exception:
+            pass
 
     UnifiedLakeEngine(data_dir).optimize_layout()
     manifest = build_manifest(data_dir)
@@ -69,13 +82,20 @@ def prepare_release_staging(data_dir: Path, staging_dir: Path) -> dict:
     if (data_dir / "state.db").exists():
         shutil.copy2(data_dir / "state.db", staging_dir / "state.db")
 
+    staged_count = 0
     for rel_path, meta in manifest["files"].items():
+        if old_shas.get(rel_path) == meta["sha256"]:
+            continue
         src = data_dir / rel_path
         dst = staging_dir / meta["asset_name"]
         if src.exists() and meta["size_bytes"] < 1_950_000_000:
             shutil.copy2(src, dst)
+            staged_count += 1
 
-    logger.info("[Release Stage] Prepared %d Parquet assets in %s", len(manifest["files"]), staging_dir)
+    logger.info(
+        "[Release Stage] Staged %d changed/new Parquet assets (out of %d total) in %s",
+        staged_count, len(manifest["files"]), staging_dir,
+    )
     return manifest
 
 

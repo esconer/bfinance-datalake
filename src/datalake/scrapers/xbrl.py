@@ -86,6 +86,18 @@ def _is_valid_xbrl_url(url: str | None) -> bool:
     return s.lower().endswith((".xml", ".html"))
 
 
+def _safe_float(v: object) -> float:
+    if v is None or v is pd.NA:
+        return float("nan")
+    s = str(v).replace(",", "").strip()
+    if not s or s == "-":
+        return float("nan")
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return float("nan")
+
+
 class XBRLScraper:
     """
     Discovers and parses NSE/BSE Ind-AS Financial XBRL XMLs (with JSON fallback when XBRL link is '/-')
@@ -113,8 +125,14 @@ class XBRLScraper:
             synced_syms = syms
             logger.info("[XBRL All-Market] Syncing NSE Financials + Shareholding for %d symbols...", len(syms))
             for sym in syms:
-                await self.sync_symbol_financials_nse(sym)
-                await self.sync_symbol_shareholding_nse(sym)
+                try:
+                    await self.sync_symbol_financials_nse(sym)
+                except Exception as exc:
+                    logger.warning("[XBRL All-Market] NSE Financials failed for %s: %s", sym, exc)
+                try:
+                    await self.sync_symbol_shareholding_nse(sym)
+                except Exception as exc:
+                    logger.warning("[XBRL All-Market] NSE Shareholding failed for %s: %s", sym, exc)
                 await asyncio.sleep(self.cfg.polite_delay_sec)
 
         if bse_master.exists():
@@ -128,7 +146,10 @@ class XBRLScraper:
             synced_scrips = scrips
             logger.info("[XBRL All-Market] Syncing BSE Shareholding for %d scrips...", len(scrips))
             for scrip in scrips:
-                await self.sync_bse_shareholding(scrip)
+                try:
+                    await self.sync_bse_shareholding(scrip)
+                except Exception as exc:
+                    logger.warning("[XBRL All-Market] BSE Shareholding failed for %s: %s", scrip, exc)
                 await asyncio.sleep(self.cfg.polite_delay_sec)
 
         return synced_syms, synced_scrips
@@ -318,21 +339,38 @@ class XBRLScraper:
     async def sync_symbol_shareholding_nse(self, symbol: str) -> None:
         sym = symbol.strip().upper()
         url = f"https://www.nseindia.com/api/corporate-share-holdings-master?index=equities&symbol={sym}"
-        resp = await self.http.get(url, headers=NSE_API_HEADERS, prime_nse=True)
-        if resp.status_code != 200 or not resp.text.strip().startswith("["):
+        try:
+            resp = await self.http.get(url, headers=NSE_API_HEADERS, prime_nse=True)
+            if resp.status_code != 200 or not resp.text.strip().startswith("["):
+                return
+            items = resp.json()
+            if not isinstance(items, list):
+                return
+        except Exception as exc:
+            logger.debug("[NSE Shareholding %s] %s", sym, exc)
             return
 
         summary_rows = []
         named_rows = []
-        for item in resp.json():
+        for item in items:
+            if not isinstance(item, dict):
+                continue
             xbrl_url = item.get("xbrl")
-            qtr_date = item.get("date")
+            qtr_date = str(item.get("date") or "").strip()
+            if not qtr_date:
+                continue
             base_row = {
                 "Symbol": sym,
                 "QuarterEnd": qtr_date,
-                "PromoterPct": pd.to_numeric(item.get("pr_and_prgrp"), errors="coerce"),
-                "PublicPct": pd.to_numeric(item.get("public_val"), errors="coerce"),
-                "SourceURL": xbrl_url or url,
+                "PromoterPct": _safe_float(item.get("pr_and_prgrp")),
+                "PublicPct": _safe_float(item.get("public_val")),
+                "PromoterPledgedShares": float("nan"),
+                "PromoterPledgedPct": float("nan"),
+                "MutualFundsPct": float("nan"),
+                "FPI_Pct": float("nan"),
+                "InsurancePct": float("nan"),
+                "RetailPct": float("nan"),
+                "SourceURL": str(xbrl_url or url),
             }
             if _is_valid_xbrl_url(xbrl_url):
                 key = f"{sym}:{qtr_date}"
@@ -343,7 +381,7 @@ class XBRLScraper:
                             parsed = self.parse_full_shp_xbrl(x_resp.content)
                             for k, v in parsed["summary"].items():
                                 if v is not None:
-                                    base_row[k] = v
+                                    base_row[k] = float(v)
                             for nh in parsed["named_holders"]:
                                 named_rows.append({"Symbol": sym, "QuarterEnd": qtr_date, **nh})
                             self.state.record("nse_shareholding_xbrl", key, "OK", 1, x_resp.content, xbrl_url)
@@ -399,15 +437,15 @@ class XBRLScraper:
                 "Symbol": sym,
                 "QuarterId": qtr_id,
                 "QuarterEnd": qtr_name,
-                "PromoterPct": pd.to_numeric(item.get("ese_p"), errors="coerce"),
-                "PublicPct": pd.to_numeric(item.get("ese_np"), errors="coerce"),
-                "TotalShares": pd.to_numeric(item.get(" tot_no_shs", item.get("tot_no_shs")), errors="coerce"),
-                "PromoterPledgedShares": pd.NA,
-                "PromoterPledgedPct": pd.NA,
-                "MutualFundsPct": pd.NA,
-                "FPI_Pct": pd.NA,
-                "InsurancePct": pd.NA,
-                "RetailPct": pd.NA,
+                "PromoterPct": _safe_float(item.get("ese_p")),
+                "PublicPct": _safe_float(item.get("ese_np")),
+                "TotalShares": _safe_float(item.get(" tot_no_shs", item.get("tot_no_shs"))),
+                "PromoterPledgedShares": float("nan"),
+                "PromoterPledgedPct": float("nan"),
+                "MutualFundsPct": float("nan"),
+                "FPI_Pct": float("nan"),
+                "InsurancePct": float("nan"),
+                "RetailPct": float("nan"),
             }
             if xbrl_rel and str(xbrl_rel).startswith("/XBRLFILES/"):
                 xbrl_url = f"https://www.bseindia.com{xbrl_rel}"
