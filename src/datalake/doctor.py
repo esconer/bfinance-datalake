@@ -36,7 +36,7 @@ class LakeDoctor:
             "watermarks_rebuilt_from_disk": 0,
         }
 
-        for tmp_file in self.cfg.root_dir.rglob("*.tmp"):
+        for tmp_file in list(self.cfg.root_dir.rglob("*.tmp")) + list(self.cfg.root_dir.rglob("*.dl_tmp")) + list(self.cfg.root_dir.rglob("*.dl.tmp")):
             logger.warning("[Doctor] Removing leftover temp file: %s", tmp_file)
             tmp_file.unlink(missing_ok=True)
             stats["tmp_files_cleaned"] += 1
@@ -108,7 +108,7 @@ class LakeDoctor:
                 purge_below = 200 if yr >= 2016 else 1
             elif fname.startswith("nse_fo_"):
                 ds_name = "fo_eod_nse"
-                yr = int(fname.split("_")[2])
+                yr = int(fname.split("_")[2].split(".")[0])
                 min_rows_for_full_day = 50 if yr >= 2002 else 1
                 purge_below = 50 if yr >= 2002 else 1
             elif fname.startswith("bse_fo_"):

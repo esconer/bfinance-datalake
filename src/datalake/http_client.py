@@ -68,7 +68,7 @@ class SimpleHTTPResponse:
     @property
     def text(self) -> str:
         try:
-            return self.content.decode("utf-8")
+            return self.content.decode("utf-8-sig")
         except UnicodeDecodeError:
             # AMFI and some legacy NSE/BSE pages are Windows-1252, not UTF-8.
             return self.content.decode("cp1252", errors="replace")
@@ -223,7 +223,12 @@ class ResilientHTTPClient:
                         headers=dict(c_resp.headers),
                     )
                 elif self.client is not None:
-                    resp = await self.client.post(url, json=json_body, headers=req_headers, timeout=timeout)
+                    h_resp = await self.client.post(url, json=json_body, headers=req_headers, timeout=timeout)
+                    resp = SimpleHTTPResponse(
+                        status_code=h_resp.status_code,
+                        content=h_resp.content,
+                        headers=dict(h_resp.headers),
+                    )
                 else:
                     raise RuntimeError("curl_cffi or httpx required for POST calls")
 
@@ -254,6 +259,9 @@ class ResilientHTTPClient:
                 self.curl_session = CurlAsyncSession(
                     impersonate=_IMPERSONATE_PROFILES[self._profile_idx], timeout=45.0
                 )
+                self._nse_primed = False
+                self._bse_primed = False
+                self._nifty_primed = False
 
             prime_headers = {
                 "User-Agent": CHROME_UA,

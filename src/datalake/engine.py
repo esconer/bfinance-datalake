@@ -88,27 +88,31 @@ class UnifiedLakeEngine:
         bse_path = self.root / "universe" / "bse_scrip_master.parquet"
 
         isin_to_bse: dict[str, tuple[str, str]] = {}
+        bse_records: list[dict] = []
         if bse_path.exists():
             bdf = read_table_safe(bse_path)
-            for _, r in bdf.iterrows():
-                sc = str(r.get("SCRIP_CD", "")).strip()
-                isin = str(r.get("ISIN_NUMBER", "")).strip().upper()
-                name = str(r.get("Scrip_Name", r.get("scrip_id", ""))).strip()
-                if isin and isin not in ("", "NA", "NAN") and sc:
+            bse_records = bdf.to_dict("records")
+            for r in bse_records:
+                sc = str(r.get("SCRIP_CD") or "").strip()
+                if sc.endswith(".0"):
+                    sc = sc[:-2]
+                isin = str(r.get("ISIN_NUMBER") or "").strip().upper()
+                name = str(r.get("Scrip_Name") or r.get("scrip_id") or "").strip()
+                if isin and isin not in ("", "NA", "NAN", "NONE") and sc:
                     isin_to_bse[isin] = (sc, name)
 
         if nse_path.exists():
             ndf = read_table_safe(nse_path)
             isin_col = next((c for c in ndf.columns if "ISIN" in c.upper()), "ISIN NUMBER")
             name_col = next((c for c in ndf.columns if "NAME" in c.upper()), "NAME OF COMPANY")
-            for _, r in ndf.iterrows():
-                sym = str(r.get("SYMBOL", "")).strip().upper()
+            for r in ndf.to_dict("records"):
+                sym = str(r.get("SYMBOL") or "").strip().upper()
                 if not sym:
                     continue
-                isin = str(r.get(isin_col, "")).strip().upper()
-                if isin in ("", "NA", "NAN"):
+                isin = str(r.get(isin_col) or "").strip().upper()
+                if isin in ("", "NA", "NAN", "NONE"):
                     isin = None
-                name = str(r.get(name_col, sym)).strip()
+                name = str(r.get(name_col) or sym).strip()
                 bse_code = isin_to_bse.get(isin, (None, None))[0] if isin else None
                 aliases = tuple(self.resolver.all_aliases(sym))
                 ident = SecurityIdentity(
@@ -125,27 +129,29 @@ class UnifiedLakeEngine:
                 if isin:
                     self._by_isin[isin] = ident
 
-        if bse_path.exists():
-            bdf = read_table_safe(bse_path)
-            for _, r in bdf.iterrows():
-                sc = str(r.get("SCRIP_CD", "")).strip()
-                if not sc or sc in self._by_bse:
-                    continue
-                isin = str(r.get("ISIN_NUMBER", "")).strip().upper() or None
-                sym = str(r.get("scrip_id", r.get("Scrip_Name", sc))).strip().upper()
-                name = str(r.get("Scrip_Name", sym)).strip()
-                ident = SecurityIdentity(
-                    symbol=sym,
-                    bse_code=sc,
-                    isin=isin,
-                    company_name=name,
-                    aliases=(sym,),
-                )
-                self._by_bse[sc] = ident
-                if sym not in self._by_symbol:
-                    self._by_symbol[sym] = ident
-                if isin and isin not in self._by_isin:
-                    self._by_isin[isin] = ident
+        for r in bse_records:
+            sc = str(r.get("SCRIP_CD") or "").strip()
+            if sc.endswith(".0"):
+                sc = sc[:-2]
+            if not sc or sc in self._by_bse:
+                continue
+            isin = str(r.get("ISIN_NUMBER") or "").strip().upper()
+            if isin in ("", "NA", "NAN", "NONE"):
+                isin = None
+            sym = str(r.get("scrip_id") or r.get("Scrip_Name") or sc).strip().upper()
+            name = str(r.get("Scrip_Name") or sym).strip()
+            ident = SecurityIdentity(
+                symbol=sym,
+                bse_code=sc,
+                isin=isin,
+                company_name=name,
+                aliases=(sym,),
+            )
+            self._by_bse[sc] = ident
+            if sym not in self._by_symbol:
+                self._by_symbol[sym] = ident
+            if isin and isin not in self._by_isin:
+                self._by_isin[isin] = ident
 
     def resolve(self, query: str | int) -> SecurityIdentity:
         """Resolve any NSE symbol, old renamed symbol, BSE 6-digit code, or 12-char ISIN into a unified identity."""

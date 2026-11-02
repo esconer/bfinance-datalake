@@ -30,7 +30,10 @@ def repair_ohlc(df: pd.DataFrame) -> pd.DataFrame:
 
     open_zero = (out["Open"].isna()) | (out["Open"] <= 0)
     if open_zero.any():
-        fallback = out["PrevClose"].where(out["PrevClose"] > 0, out["Close"])
+        if "PrevClose" in out.columns:
+            fallback = out["PrevClose"].where(out["PrevClose"] > 0, out["Close"])
+        else:
+            fallback = out["Close"]
         out.loc[open_zero, "Open"] = fallback[open_zero]
 
     oc_max = out[["Open", "Close"]].max(axis=1)

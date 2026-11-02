@@ -327,6 +327,72 @@ def test_bse_concalls_chunked_windows():
             assert (d2 - d1).days <= 27
 
 
+def test_bug_fix_2_audit_suite():
+    # 1. Verify BUG-01: _safe_float
+    from datalake.scrapers.xbrl import _safe_float
+    assert pd.isna(_safe_float(None))
+    assert pd.isna(_safe_float("-"))
+    assert _safe_float("1,23,45,678") == 12345678.0
+    assert _safe_float("50.31") == 50.31
+
+    # 2. Verify BUG-04: UTF-8 BOM
+    raw_bom_csv = b"\xef\xbb\xbf\"Date \",\"Symbol \",\"Security Name \",\"Client Name \",\"Buy / Sell \",\"Quantity Traded \",\"Trade Price / Wght. Avg. Price \",\"Remarks \"\n\"30-OCT-2026\",\"RELIANCE\",\"Reliance Ind\",\"FUND A\",\"BUY\",\"1,00,000\",\"1350.50\",\"-\"\n"
+    resp = SimpleHTTPResponse(status_code=200, content=raw_bom_csv)
+    assert not resp.text.startswith("\ufeff")
+    raw_df = pd.read_csv(io.StringIO(resp.text))
+    norm_df = _normalize_deals_frame(raw_df, deal_type="BULK", exchange="NSE")
+    assert len(norm_df) == 1
+    assert norm_df.iloc[0]["Symbol"] == "RELIANCE"
+
+    # 3. Verify BUG-05: Annual reports dedup
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = LakeConfig(root_dir=Path(tmpdir))
+        cfg.ensure_dirs()
+        state = StateStore(cfg.state_db_path)
+
+        class _MockARHttp:
+            async def get(self, url, **kwargs):
+                if "nseindia.com" in url:
+                    sym = url.split("symbol=")[-1]
+                    return SimpleHTTPResponse(
+                        status_code=200,
+                        content=f'{{"data":[{{"fromYr":"2025","toYr":"2026","fileName":"https://nsearchives.nseindia.com/ar/{sym}_2026.pdf"}}]}}'.encode(),
+                    )
+                scrip = url.split("scripcode=")[-1].split("&")[0]
+                return SimpleHTTPResponse(
+                    status_code=200,
+                    content=f'{{"Table":[{{"year":"2026","file_name":"report_2026.pdf"}}]}}'.encode(),
+                )
+
+        dd = DealsAndDocumentsScraper(_MockARHttp(), state, cfg)
+        asyncio.run(dd.sync_annual_reports_bse(["500325", "532540"], symbols=["RELIANCE", "TCS"]))
+        df = read_table_safe(cfg.root_dir / "documents" / "annual_reports.parquet")
+        assert len(df) == 4, f"Expected 4 annual reports, got {len(df)}"
+
+    # 4. Verify BUG-07: Cyclic symbol renames
+    sc_df = pd.DataFrame([
+        {"CompanyName": "Test Corp", "OldSymbol": "SYMA", "NewSymbol": "SYMB", "ChangeDate": pd.Timestamp("2005-01-01")},
+        {"CompanyName": "Test Corp", "OldSymbol": "SYMB", "NewSymbol": "SYMA", "ChangeDate": pd.Timestamp("2012-01-01")},
+    ])
+    resolver = SymbolRenameResolver(sc_df)
+    assert resolver.traded_as_on("SYMA", date(2015, 1, 1)) == "SYMA"
+    assert resolver.traded_as_on("SYMA", date(2008, 1, 1)) == "SYMB"
+    assert resolver.traded_as_on("SYMA", date(2003, 1, 1)) == "SYMA"
+
+    # 5. Verify BUG-09: Compound corporate action parser case-insensitive
+    res = parse_action_purpose("Interim Dividend - Rs 5 Per Share And Face Value Split From Rs 10 To Rs 2")
+    assert res["DividendPerShareRs"] == 5.0
+    assert res["ShareMultiplier"] == 5.0
+
+    # 6. Verify BUG-12: Empty XML and repair_ohlc without PrevClose
+    df_no_prev = pd.DataFrame([{"Open": 0.0, "High": 100.0, "Low": 90.0, "Close": 95.0}])
+    rep = repair_ohlc(df_no_prev)
+    assert rep.iloc[0]["Open"] == 95.0
+
+    assert XBRLScraper.parse_indas_xbrl(b"", "RELIANCE", "http://test") == []
+    assert XBRLScraper.parse_full_shp_xbrl(b"<!-- empty comment -->") == {"summary": {}, "named_holders": []}
+
+
 if __name__ == "__main__":
     test_corporate_action_regex_parser()
     test_repair_ohlc_and_bse_debt_filter()
@@ -336,4 +402,5 @@ if __name__ == "__main__":
     test_normalize_deals_frame()
     test_fo_2000_int64_ohlc_and_doctor_preservation()
     test_bse_concalls_chunked_windows()
+    test_bug_fix_2_audit_suite()
     print("ALL OFFLINE UNIT & INTEGRATION TESTS PASSED!")

@@ -263,8 +263,12 @@ class XBRLScraper:
 
     @classmethod
     def parse_indas_xbrl(cls, xml_bytes: bytes, default_symbol: str, source_url: str) -> list[dict]:
+        if not xml_bytes or not xml_bytes.strip():
+            return []
         parser = etree.XMLParser(recover=True, huge_tree=True)
         root = etree.fromstring(xml_bytes, parser=parser)
+        if root is None:
+            return []
 
         contexts: dict[str, dict] = {}
         for ctx in root.xpath("//*[local-name()='context']"):
@@ -396,6 +400,10 @@ class XBRLScraper:
                 dedup_cols=["Symbol", "QuarterEnd"],
                 sort_cols=["Symbol", "QuarterEnd"],
             )
+            self.state.record("nse_shareholding_symbol", sym, "OK", len(summary_rows))
+        else:
+            self.state.record("nse_shareholding_symbol", sym, "HOLIDAY")
+
         if named_rows:
             upsert_parquet_partition(
                 pd.DataFrame(named_rows),
@@ -404,14 +412,23 @@ class XBRLScraper:
                 sort_cols=["Symbol", "QuarterEnd", "PctOfTotal"],
             )
 
-    async def sync_bse_shareholding(self, scrip_code: str | int, symbol: str | None = None) -> None:
+    async def sync_bse_shareholding(
+        self,
+        scrip_code: str | int,
+        symbol: str | None = None,
+        max_xbrl_quarters: int | None = None,
+    ) -> None:
         # Also sync NSE shareholding if a symbol was provided so shareholding always populates
         if symbol:
             await self.sync_symbol_shareholding_nse(symbol)
 
+        scrip_str = str(scrip_code).strip()
+        if scrip_str.endswith(".0"):
+            scrip_str = scrip_str[:-2]
+
         url = (
             f"https://api.bseindia.com/BseIndiaAPI/api/Corp_Shareholding_ng/w"
-            f"?scripcode={scrip_code}&flag=0&indtype="
+            f"?scripcode={scrip_str}&flag=0&indtype="
         )
         try:
             resp = await self.http.get(url, headers=BSE_API_HEADERS, prime_bse=True)
@@ -485,8 +502,12 @@ class XBRLScraper:
 
     @staticmethod
     def parse_full_shp_xbrl(raw_bytes: bytes) -> dict:
+        if not raw_bytes or not raw_bytes.strip():
+            return {"summary": {}, "named_holders": []}
         parser = etree.XMLParser(recover=True, huge_tree=True)
         root = etree.fromstring(raw_bytes, parser=parser)
+        if root is None:
+            return {"summary": {}, "named_holders": []}
 
         ctx_to_member: dict[str, tuple[str, bool]] = {}
         for ctx in root.xpath("//*[local-name()='context']"):

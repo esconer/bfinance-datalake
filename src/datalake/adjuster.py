@@ -46,14 +46,18 @@ class OHLCVAdjuster:
 
         exch = exchange.upper()
         key = str(symbol_or_scrip).strip().upper()
+        if key.endswith(".0"):
+            key = key[:-2]
+
         if exch == "NSE" and "symbol" in act_df.columns:
             aliases = set(self.resolver.all_aliases(key))
             sub = act_df[act_df["symbol"].astype(str).str.strip().str.upper().isin(aliases)].copy()
         elif "scrip_code" in act_df.columns:
-            sub = act_df[
-                (act_df["scrip_code"].astype(str).str.strip() == key)
-                | (act_df.get("short_name", pd.Series(dtype=str)).astype(str).str.strip().str.upper() == key)
-            ].copy()
+            sc_series = act_df["scrip_code"].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
+            mask = sc_series == key
+            if "short_name" in act_df.columns:
+                mask = mask | (act_df["short_name"].astype(str).str.strip().str.upper() == key)
+            sub = act_df[mask].copy()
         else:
             return pd.DataFrame(columns=["ExDate", "DividendPerShareRs", "ShareMultiplier"])
 

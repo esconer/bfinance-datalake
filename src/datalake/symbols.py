@@ -42,14 +42,16 @@ class SymbolRenameResolver:
     def traded_as_on(self, current_symbol: str, target_date: date) -> str:
         """Return the NSE symbol that `current_symbol` actually traded under on `target_date`."""
         sym = current_symbol.strip().upper()
-        visited = {sym}
-        while sym in self._back_edges:
+        upper_bound = date.max
+        steps = 0
+        while sym in self._back_edges and steps < 32:
             stepped = False
             for chg_dt, old_sym in self._back_edges[sym]:
-                if target_date < chg_dt and old_sym not in visited:
+                if target_date < chg_dt < upper_bound:
                     sym = old_sym
-                    visited.add(sym)
+                    upper_bound = chg_dt
                     stepped = True
+                    steps += 1
                     break
             if not stepped:
                 break
@@ -59,19 +61,25 @@ class SymbolRenameResolver:
         """Return `[current_symbol, ...all historical predecessor symbols...]`."""
         sym = symbol.strip().upper()
         visited_fwd = {sym}
+        upper_dt = date.min
         while sym in self._fwd_edges:
-            _, nxt = self._fwd_edges[sym][-1]
-            if nxt in visited_fwd:
+            stepped = False
+            for chg_dt, nxt in reversed(self._fwd_edges[sym]):
+                if chg_dt >= upper_dt and nxt not in visited_fwd:
+                    visited_fwd.add(nxt)
+                    upper_dt = chg_dt
+                    sym = nxt
+                    stepped = True
+                    break
+            if not stepped:
                 break
-            visited_fwd.add(nxt)
-            sym = nxt
 
         chain = [sym]
-        cur = sym
-        while cur in self._back_edges:
-            _, old_sym = self._back_edges[cur][0]
-            if old_sym in chain:
-                break
-            chain.append(old_sym)
-            cur = old_sym
+        queue = [sym]
+        while queue:
+            cur = queue.pop(0)
+            for _, old_sym in self._back_edges.get(cur, ()):
+                if old_sym not in chain:
+                    chain.append(old_sym)
+                    queue.append(old_sym)
         return chain

@@ -54,7 +54,7 @@ def parse_action_purpose(text: str) -> dict:
         out["ActionType"] = "SKIP_NON_EQUITY"
         return out
 
-    clauses = re.split(r"[/;]|(?:\band\b)", s)
+    clauses = re.split(r"[/;]|(?:\band\b)", s, flags=re.I)
     for clause in clauses:
         if re.search(r"buy\s*back|\brights?\b|split|sub[-\s]*division", clause, re.I):
             continue
@@ -164,8 +164,10 @@ class UniverseAndActionsScraper:
                 f"?Group=&Scripcode=&industry=&segment=Equity&status={status}"
             )
             b_resp = await self.http.get(bse_url, headers=BSE_API_HEADERS)
-            if b_resp.status_code == 200 and isinstance(b_resp.json(), list):
-                bse_frames.append(pd.DataFrame(b_resp.json()).assign(Status=status))
+            if b_resp.status_code == 200 and b_resp.text.lstrip().startswith("["):
+                payload = b_resp.json()
+                if isinstance(payload, list) and payload:
+                    bse_frames.append(pd.DataFrame(payload).assign(Status=status))
 
         if bse_frames:
             bse_df = pd.concat(bse_frames, ignore_index=True)
@@ -212,6 +214,8 @@ class UniverseAndActionsScraper:
             try:
                 resp = await self.http.get(url, headers=BSE_API_HEADERS)
                 resp.raise_for_status()
+                if not resp.text.lstrip().startswith("["):
+                    continue
                 rows = resp.json()
                 if isinstance(rows, list) and rows:
                     df = pd.DataFrame(rows)

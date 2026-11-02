@@ -290,8 +290,8 @@ class DealsAndDocumentsScraper:
             upsert_parquet_partition(
                 pd.DataFrame(rows),
                 target,
-                dedup_cols=["Symbol", "Year", "FileName"],
-                sort_cols=["Symbol", "Year"],
+                dedup_cols=["Symbol", "ScripCode", "Year", "FileName"],
+                sort_cols=["Symbol", "ScripCode", "Year"],
             )
             self.state.record("annual_reports_nse", f"batch_{len(symbols)}", "OK", len(rows))
 
@@ -324,7 +324,7 @@ class DealsAndDocumentsScraper:
             upsert_parquet_partition(
                 pd.DataFrame(rows),
                 target,
-                dedup_cols=["ScripCode", "Year", "FileName"],
-                sort_cols=["ScripCode", "Year"],
+                dedup_cols=["Symbol", "ScripCode", "Year", "FileName"],
+                sort_cols=["Symbol", "ScripCode", "Year"],
             )
             self.state.record("annual_reports_bse", f"batch_{len(scrip_codes)}", "OK", len(rows))
