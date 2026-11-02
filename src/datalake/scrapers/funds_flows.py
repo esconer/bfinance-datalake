@@ -129,14 +129,16 @@ class FundsAndFlowsScraper:
             )
         return combined
 
-    async def backfill_amfi_history(self, start_date: date = date(2006, 4, 1), end_date: date | None = None) -> None:
+    async def backfill_amfi_history(
+        self, start_date: date = date(2006, 4, 1), end_date: date | None = None, force: bool = False
+    ) -> None:
         """Walks AMFI historical NAVs in 30-day windows with a 120s timeout so large windows never time out."""
         end = end_date or today_ist()
         cur = start_date
         while cur <= end:
             win_end = min(end, cur + timedelta(days=29))
             key = f"{cur.isoformat()}_{win_end.isoformat()}"
-            if self.state.is_completed("amfi_nav_window", key):
+            if not force and self.state.is_completed("amfi_nav_window", key):
                 cur = win_end + timedelta(days=1)
                 continue
 
@@ -210,9 +212,9 @@ class FundsAndFlowsScraper:
             df = df.dropna(subset=["Date"])
         return df
 
-    async def sync_participant_oi(self, start_date: date, end_date: date) -> None:
+    async def sync_participant_oi(self, start_date: date, end_date: date, force: bool = False) -> None:
         dataset = "nse_participant_oi"
-        done_keys = self.state.completed_keys(dataset)
+        done_keys = set() if force else self.state.completed_keys(dataset)
         freeze_cutoff = today_ist() - timedelta(days=self.cfg.holiday_freeze_days)
         sem = asyncio.Semaphore(self.cfg.archive_concurrency)
 

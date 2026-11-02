@@ -75,13 +75,19 @@ class EquityEODScraper:
         self.state = state
         self.cfg = cfg
 
-    async def sync_range(self, start_date: date, end_date: date, exchanges: tuple[str, ...] = ("NSE", "BSE")) -> None:
+    async def sync_range(
+        self,
+        start_date: date,
+        end_date: date,
+        exchanges: tuple[str, ...] = ("NSE", "BSE"),
+        force: bool = False,
+    ) -> None:
         sem = asyncio.Semaphore(self.cfg.archive_concurrency)
         freeze_cutoff = today_ist() - timedelta(days=self.cfg.holiday_freeze_days)
 
         for exch in exchanges:
             dataset_name = f"equity_eod_{exch.lower()}"
-            done_keys = self.state.completed_keys(dataset_name)
+            done_keys = set() if force else self.state.completed_keys(dataset_name)
             exch_min_start = self.BSE_LEGACY_START if exch.upper() == "BSE" else self.NSE_LEGACY_START
             eff_start = max(start_date, exch_min_start)
             if eff_start > end_date:

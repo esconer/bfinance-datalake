@@ -110,14 +110,16 @@ class DealsAndDocumentsScraper:
             )
             self.state.record(f"nse_{deal_type.lower()}_deals", today_ist().isoformat(), "OK", len(df), resp.content, url)
 
-    async def backfill_historical_bulk_block_deals(self, start_year: int = 2005, end_year: int | None = None) -> None:
+    async def backfill_historical_bulk_block_deals(
+        self, start_year: int = 2005, end_year: int | None = None, force: bool = False
+    ) -> None:
         cur_year = end_year or today_ist().year
         target = self.cfg.root_dir / "deals" / "bulk_block_deals.parquet"
 
         for opt_type, label in (("bulk_deals", "BULK"), ("block_deals", "BLOCK")):
             for year in range(start_year, cur_year + 1):
                 key = f"{label}:{year}"
-                if year < cur_year and self.state.is_completed("nse_historical_or_deals", key):
+                if not force and year < cur_year and self.state.is_completed("nse_historical_or_deals", key):
                     continue
                 url = (
                     f"https://www.nseindia.com/api/historicalOR/bulk-block-short-deals"
@@ -143,14 +145,16 @@ class DealsAndDocumentsScraper:
                 except Exception as exc:
                     logger.warning("[Historical Deals %s] Failed: %s", key, exc)
 
-    async def sync_insider_trading_pit(self, start_date: date, end_date: date) -> None:
+    async def sync_insider_trading_pit(
+        self, start_date: date, end_date: date, force: bool = False
+    ) -> None:
         cur = start_date
         target = self.cfg.root_dir / "deals" / "insider_trading_pit.parquet"
 
         while cur <= end_date:
             win_end = min(end_date, cur + timedelta(days=89))
             key = f"{cur:%Y-%m-%d}_{win_end:%Y-%m-%d}"
-            if win_end < today_ist() - timedelta(days=7) and self.state.is_completed("insider_pit", key):
+            if not force and win_end < today_ist() - timedelta(days=7) and self.state.is_completed("insider_pit", key):
                 cur = win_end + timedelta(days=1)
                 continue
 

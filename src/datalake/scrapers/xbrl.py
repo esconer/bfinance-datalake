@@ -109,7 +109,9 @@ class XBRLScraper:
         self.state = state
         self.cfg = cfg
 
-    async def sync_all_market(self, max_companies: int | None = None) -> tuple[list[str], list[str]]:
+    async def sync_all_market(
+        self, max_companies: int | None = None, force: bool = False
+    ) -> tuple[list[str], list[str]]:
         nse_master = self.cfg.root_dir / "universe" / "nse_equity_master.parquet"
         bse_master = self.cfg.root_dir / "universe" / "bse_scrip_master.parquet"
         synced_syms: list[str] = []
@@ -119,38 +121,44 @@ class XBRLScraper:
             ndf = read_table_safe(nse_master)
             done_nse = self.state.completed_keys("xbrl_financials_symbol")
             all_syms = ndf["SYMBOL"].dropna().astype(str).str.strip().unique().tolist()
-            syms = [s for s in all_syms if s not in done_nse] or all_syms
+            syms = all_syms if force else [s for s in all_syms if s not in done_nse]
             if max_companies:
                 syms = syms[:max_companies]
             synced_syms = syms
-            logger.info("[XBRL All-Market] Syncing NSE Financials + Shareholding for %d symbols...", len(syms))
-            for sym in syms:
-                try:
-                    await self.sync_symbol_financials_nse(sym)
-                except Exception as exc:
-                    logger.warning("[XBRL All-Market] NSE Financials failed for %s: %s", sym, exc)
-                try:
-                    await self.sync_symbol_shareholding_nse(sym)
-                except Exception as exc:
-                    logger.warning("[XBRL All-Market] NSE Shareholding failed for %s: %s", sym, exc)
-                await asyncio.sleep(self.cfg.polite_delay_sec)
+            if syms:
+                logger.info("[XBRL All-Market] Syncing NSE Financials + Shareholding for %d symbols...", len(syms))
+                for sym in syms:
+                    try:
+                        await self.sync_symbol_financials_nse(sym)
+                    except Exception as exc:
+                        logger.warning("[XBRL All-Market] NSE Financials failed for %s: %s", sym, exc)
+                    try:
+                        await self.sync_symbol_shareholding_nse(sym)
+                    except Exception as exc:
+                        logger.warning("[XBRL All-Market] NSE Shareholding failed for %s: %s", sym, exc)
+                    await asyncio.sleep(self.cfg.polite_delay_sec)
+            else:
+                logger.info("[XBRL All-Market] All %d NSE symbols already completed in state.db.", len(all_syms))
 
         if bse_master.exists():
             bdf = read_table_safe(bse_master)
             bdf = bdf[bdf["Status"] == "Active"] if "Status" in bdf.columns else bdf
             done_bse = self.state.completed_keys("bse_shareholding")
             all_scrips = bdf["SCRIP_CD"].dropna().astype(str).str.strip().unique().tolist()
-            scrips = [sc for sc in all_scrips if sc not in done_bse] or all_scrips
+            scrips = all_scrips if force else [sc for sc in all_scrips if sc not in done_bse]
             if max_companies:
                 scrips = scrips[:max_companies]
             synced_scrips = scrips
-            logger.info("[XBRL All-Market] Syncing BSE Shareholding for %d scrips...", len(scrips))
-            for scrip in scrips:
-                try:
-                    await self.sync_bse_shareholding(scrip)
-                except Exception as exc:
-                    logger.warning("[XBRL All-Market] BSE Shareholding failed for %s: %s", scrip, exc)
-                await asyncio.sleep(self.cfg.polite_delay_sec)
+            if scrips:
+                logger.info("[XBRL All-Market] Syncing BSE Shareholding for %d scrips...", len(scrips))
+                for scrip in scrips:
+                    try:
+                        await self.sync_bse_shareholding(scrip)
+                    except Exception as exc:
+                        logger.warning("[XBRL All-Market] BSE Shareholding failed for %s: %s", scrip, exc)
+                    await asyncio.sleep(self.cfg.polite_delay_sec)
+            else:
+                logger.info("[XBRL All-Market] All %d BSE scrips already completed in state.db.", len(all_scrips))
 
         return synced_syms, synced_scrips
 

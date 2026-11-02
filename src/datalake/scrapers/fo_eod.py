@@ -30,13 +30,19 @@ class DerivativesEODScraper:
         self.state = state
         self.cfg = cfg
 
-    async def sync_range(self, start_date: date, end_date: date, exchanges: tuple[str, ...] = ("NSE",)) -> None:
+    async def sync_range(
+        self,
+        start_date: date,
+        end_date: date,
+        exchanges: tuple[str, ...] = ("NSE",),
+        force: bool = False,
+    ) -> None:
         sem = asyncio.Semaphore(self.cfg.archive_concurrency)
         freeze_cutoff = today_ist() - timedelta(days=self.cfg.holiday_freeze_days)
 
         for exch in exchanges:
             dataset = f"fo_eod_{exch.lower()}"
-            done_keys = self.state.completed_keys(dataset)
+            done_keys = set() if force else self.state.completed_keys(dataset)
             exch_min_date = self.BSE_FO_START if exch.upper() == "BSE" else self.NSE_FO_START
             eff_start = max(start_date, exch_min_date)
             if eff_start > end_date:

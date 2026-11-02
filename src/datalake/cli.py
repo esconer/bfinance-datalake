@@ -50,31 +50,31 @@ async def run_backfill(
 
         logger.info("=== Step 1/6: Security Masters, Symbol Renames, PIT Nifty Constituents & 30Y Corporate Actions ===")
         await univ.sync_security_masters()
-        await univ.sync_corporate_actions(start_year=max(1995, start.year), end_year=end.year)
+        await univ.sync_corporate_actions(start_year=max(1995, start.year), end_year=end.year, force=force)
 
         logger.info("=== Step 2/6: 30-Year Nifty Indices OHLC + TRI + P/E Bulk Backfill ===")
         await indices.backfill_30y_bulk(start_date=start, end_date=end, force=force)
         await indices.sync_daily_snapshots(start_date=max(date(2012, 1, 2), start), end_date=end)
 
         logger.info("=== Step 3/6: NSE & BSE Daily Equity OHLCV + Delivery (%s -> %s) ===", start, end)
-        await eq.sync_range(start_date=start, end_date=end, exchanges=("NSE", "BSE"))
+        await eq.sync_range(start_date=start, end_date=end, exchanges=("NSE", "BSE"), force=force)
 
         if include_fo:
             logger.info("=== Step 4/6: NSE & BSE F&O Futures + Option Chains (%s -> %s) ===", start, end)
-            await fo.sync_range(start_date=start, end_date=end, exchanges=("NSE", "BSE"))
+            await fo.sync_range(start_date=start, end_date=end, exchanges=("NSE", "BSE"), force=force)
 
         logger.info("=== Step 5/6: F&O Participant OI, Cash FII/DII, Bulk/Block Deals, Insider PIT & Concalls ===")
-        await ff.sync_participant_oi(start_date=max(date(2012, 1, 2), start), end_date=end)
+        await ff.sync_participant_oi(start_date=max(date(2012, 1, 2), start), end_date=end, force=force)
         await dd.sync_cash_fii_dii_daily()
         await dd.sync_bulk_and_block_deals()
-        await dd.backfill_historical_bulk_block_deals(start_year=max(2005, start.year), end_year=end.year)
-        await dd.sync_insider_trading_pit(start_date=max(date(2018, 1, 1), start), end_date=end)
+        await dd.backfill_historical_bulk_block_deals(start_year=max(2005, start.year), end_year=end.year, force=force)
+        await dd.sync_insider_trading_pit(start_date=max(date(2018, 1, 1), start), end_date=end, force=force)
         await dd.sync_concalls_and_presentations(start_date=max(end - timedelta(days=90), start), end_date=end)
 
         logger.info("=== Step 6/6: AMFI Mutual Fund NAVs ===")
         await ff.sync_amfi_daily()
         if include_amfi_history:
-            await ff.backfill_amfi_history(start_date=max(date(2006, 4, 1), start), end_date=end)
+            await ff.backfill_amfi_history(start_date=max(date(2006, 4, 1), start), end_date=end, force=force)
 
     LakeDoctor(cfg).run_full_check_and_repair()
 
@@ -124,7 +124,12 @@ async def run_daily_update(cfg: LakeConfig, lookback_days: int = 7, include_fo: 
 
 
 async def run_xbrl_sync(
-    cfg: LakeConfig, symbols: list[str], bse_scrips: list[str], all_market: bool, limit: int | None
+    cfg: LakeConfig,
+    symbols: list[str],
+    bse_scrips: list[str],
+    all_market: bool,
+    limit: int | None,
+    force: bool = False,
 ) -> None:
     cfg.ensure_dirs()
     state = StateStore(cfg.state_db_path)
@@ -132,7 +137,7 @@ async def run_xbrl_sync(
         xbrl = XBRLScraper(http, state, cfg)
         dd = DealsAndDocumentsScraper(http, state, cfg)
         if all_market:
-            synced_syms, synced_scrips = await xbrl.sync_all_market(max_companies=limit)
+            synced_syms, synced_scrips = await xbrl.sync_all_market(max_companies=limit, force=force)
             if synced_scrips or synced_syms:
                 await dd.sync_annual_reports_bse(synced_scrips[:200], symbols=synced_syms[:200])
             return
@@ -212,6 +217,7 @@ def main() -> None:
     p_xb.add_argument("--bse-scrips", default="500325,532540,500180,500209,500875", help="Comma-separated BSE codes")
     p_xb.add_argument("--all-market", action="store_true", help="Automatically loop through all NSE & BSE companies")
     p_xb.add_argument("--limit", type=int, default=None, help="Optional cap when running --all-market")
+    p_xb.add_argument("--force", action="store_true", help="Force re-sync even if symbols already completed in state.db")
 
     # 4. pre2016-nse
     p_p16 = sub.add_parser("pre2016-nse", help="Backfill 1995-2015 NSE Equity + Delivery via historicalOR endpoint")
@@ -257,7 +263,7 @@ def main() -> None:
     elif args.cmd == "xbrl":
         syms = [s.strip() for s in args.symbols.split(",") if s.strip()]
         scrips = [s.strip() for s in args.bse_scrips.split(",") if s.strip()]
-        asyncio.run(run_xbrl_sync(cfg, syms, scrips, args.all_market, args.limit))
+        asyncio.run(run_xbrl_sync(cfg, syms, scrips, args.all_market, args.limit, force=args.force))
         print_status(cfg)
     elif args.cmd == "pre2016-nse":
         syms = [s.strip() for s in args.symbols.split(",") if s.strip()]

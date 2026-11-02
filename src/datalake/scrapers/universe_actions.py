@@ -195,7 +195,9 @@ class UniverseAndActionsScraper:
             )
             self.state.record("nifty_constituents_pit", today.isoformat(), "OK", sum(len(f) for f in const_frames))
 
-    async def sync_corporate_actions(self, start_year: int = 2000, end_year: int | None = None) -> None:
+    async def sync_corporate_actions(
+        self, start_year: int = 2000, end_year: int | None = None, force: bool = False
+    ) -> None:
         cur_year = end_year or today_ist().year
         dataset = "corporate_actions_bse"
         target = self.cfg.root_dir / "actions" / "bse_corporate_actions.parquet"
@@ -203,7 +205,7 @@ class UniverseAndActionsScraper:
         frames = []
         for year in range(start_year, cur_year + 1):
             key = str(year)
-            if year < cur_year and self.state.is_completed(dataset, key):
+            if not force and year < cur_year and self.state.is_completed(dataset, key):
                 continue
 
             url = (
@@ -239,9 +241,11 @@ class UniverseAndActionsScraper:
                 row_group_size=2_000,
             )
 
-        await self.sync_nse_corporate_actions(start_year=start_year, end_year=cur_year)
+        await self.sync_nse_corporate_actions(start_year=start_year, end_year=cur_year, force=force)
 
-    async def sync_nse_corporate_actions(self, start_year: int = 1995, end_year: int | None = None) -> None:
+    async def sync_nse_corporate_actions(
+        self, start_year: int = 1995, end_year: int | None = None, force: bool = False
+    ) -> None:
         """Walks NSE Corporate Actions year-by-year across both `equities` (1995+) and `sme` (2013+)."""
         cur_year = end_year or today_ist().year
         target = self.cfg.root_dir / "actions" / "nse_corporate_actions.parquet"
@@ -252,7 +256,7 @@ class UniverseAndActionsScraper:
             frames = []
             for year in range(min_yr, cur_year + 1):
                 key = str(year)
-                if year < cur_year and self.state.is_completed(dataset, key):
+                if not force and year < cur_year and self.state.is_completed(dataset, key):
                     continue
                 url = (
                     f"https://www.nseindia.com/api/corporates-corporateActions?index={idx_type}"
