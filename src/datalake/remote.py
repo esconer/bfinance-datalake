@@ -59,6 +59,14 @@ class RemoteLakeClient:
             self.con.execute("SET http_keep_alive=true;")
         except Exception:
             pass
+        if self.token:
+            try:
+                self.con.execute(
+                    "CREATE OR REPLACE SECRET gh_token (TYPE HTTP, EXTRA_HTTP_HEADERS MAP {'Authorization': ?});",
+                    [f"Bearer {self.token}"],
+                )
+            except Exception:
+                pass
 
     def _asset_url(self, folder: str, filename: str) -> str:
         return f"{self.base_url}/{folder}__{filename}"
@@ -76,6 +84,8 @@ class RemoteLakeClient:
         """
         self._ensure_httpfs()
         sym = symbol.strip().upper()
+        if start_year > end_year:
+            start_year, end_year = end_year, start_year
         prefix = "nse_cm_" if exchange.upper() == "NSE" else "bse_cm_"
         urls = [self._asset_url("equities", f"{prefix}{yr}.parquet") for yr in range(start_year, end_year + 1)]
         url_list_sql = ", ".join(f"'{u}'" for u in urls)

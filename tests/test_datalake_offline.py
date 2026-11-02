@@ -395,6 +395,37 @@ def test_bug_fix_2_audit_suite():
     assert XBRLScraper.parse_full_shp_xbrl(b"<!-- empty comment -->") == {"summary": {}, "named_holders": []}
 
 
+def test_pass_1_audit_suite():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        (root / "actions").mkdir(parents=True)
+        (root / "universe").mkdir(parents=True)
+
+        # 1. Verify P1-07: StateStore.max_ok_date ignores non-ISO keys
+        st = StateStore(root / "state.db")
+        st.record("test_ds", "2026-10-30", "OK", 100)
+        st.record("test_ds", "RELIANCE:2026", "OK", 10)
+        assert st.max_ok_date("test_ds") == date(2026, 10, 30), "max_ok_date failed with non-ISO key!"
+
+        # 2. Verify P1-01 & P1-02: OHLCVAdjuster applies future splits when querying historical window
+        act_df = pd.DataFrame([{
+            "symbol": "RELIANCE",
+            "ExDate": pd.Timestamp("2024-10-28"),
+            "DividendPerShareRs": 0.0,
+            "ShareMultiplier": 2.0,
+            "ActionType": "BONUS",
+        }])
+        write_parquet_atomic(act_df, root / "actions" / "nse_corporate_actions.parquet")
+
+        df_2023 = pd.DataFrame([
+            {"Date": pd.Timestamp("2023-12-28"), "Open": 2600.0, "High": 2600.0, "Low": 2600.0, "Close": 2600.0, "Volume": 100},
+            {"Date": pd.Timestamp("2023-12-29"), "Open": 2580.0, "High": 2580.0, "Low": 2580.0, "Close": 2580.0, "Volume": 100},
+        ])
+        adj = OHLCVAdjuster(root).apply_adjustments(df_2023, "RELIANCE", exchange="NSE", include_future_splits=True)
+        assert adj.loc[0, "Adj Close"] == 1300.0
+        assert adj.loc[1, "Adj Close"] == 1290.0
+
+
 if __name__ == "__main__":
     test_corporate_action_regex_parser()
     test_repair_ohlc_and_bse_debt_filter()
@@ -405,4 +436,5 @@ if __name__ == "__main__":
     test_fo_2000_int64_ohlc_and_doctor_preservation()
     test_bse_concalls_chunked_windows()
     test_bug_fix_2_audit_suite()
+    test_pass_1_audit_suite()
     print("ALL OFFLINE UNIT & INTEGRATION TESTS PASSED!")

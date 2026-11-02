@@ -86,6 +86,7 @@ class OHLCVAdjuster:
         symbol_or_scrip: str,
         exchange: str = "NSE",
         auto_adjust: bool = False,
+        include_future_splits: bool = False,
     ) -> pd.DataFrame:
         if df.empty:
             return df.copy()
@@ -95,30 +96,39 @@ class OHLCVAdjuster:
         out["Dividends"] = 0.0
         out["Stock Splits"] = 0.0
 
+        post_window_split_factor = 1.0
         actions = self.get_symbol_actions(symbol_or_scrip, exchange=exchange)
         if not actions.empty:
             trading_dates = out["Date"].to_numpy()
             min_dt, max_dt = trading_dates[0], trading_dates[-1]
 
             in_win = actions[(actions["ExDate"] >= min_dt) & (actions["ExDate"] <= max_dt)]
-            for _, row in in_win.iterrows():
-                idx = int(np.searchsorted(trading_dates, row["ExDate"].to_numpy(), side="left"))
-                if 0 <= idx < len(out):
-                    if row["DividendPerShareRs"] > 0:
-                        out.loc[idx, "Dividends"] += float(row["DividendPerShareRs"])
-                    if row["ShareMultiplier"] != 1.0:
-                        cur_split = out.loc[idx, "Stock Splits"]
-                        out.loc[idx, "Stock Splits"] = (
-                            float(row["ShareMultiplier"])
-                            if cur_split == 0.0
-                            else cur_split * float(row["ShareMultiplier"])
-                        )
+            if not in_win.empty:
+                ex_arr = in_win["ExDate"].to_numpy(dtype=trading_dates.dtype)
+                indices = np.searchsorted(trading_dates, ex_arr, side="left")
+                for idx_val, (_, row) in zip(indices, in_win.iterrows()):
+                    idx = int(idx_val)
+                    if 0 <= idx < len(out):
+                        if row["DividendPerShareRs"] > 0:
+                            out.loc[idx, "Dividends"] += float(row["DividendPerShareRs"])
+                        if row["ShareMultiplier"] != 1.0:
+                            cur_split = out.loc[idx, "Stock Splits"]
+                            out.loc[idx, "Stock Splits"] = (
+                                float(row["ShareMultiplier"])
+                                if cur_split == 0.0
+                                else cur_split * float(row["ShareMultiplier"])
+                            )
+            if include_future_splits:
+                future_splits = actions[(actions["ExDate"] > max_dt) & (actions["ShareMultiplier"] != 1.0)]
+                if not future_splits.empty:
+                    post_window_split_factor = 1.0 / float(future_splits["ShareMultiplier"].prod())
 
         split_mult = out["Stock Splits"].replace(0.0, 1.0).to_numpy(dtype=float)
         rev_cum_splits = np.cumprod(split_mult[::-1])[::-1]
         cum_split_factor = np.ones(len(out), dtype=float)
         if len(out) > 1:
             cum_split_factor[:-1] = 1.0 / rev_cum_splits[1:]
+        cum_split_factor *= post_window_split_factor
 
         close_arr = out["Close"].to_numpy(dtype=float)
         div_arr = out["Dividends"].to_numpy(dtype=float)

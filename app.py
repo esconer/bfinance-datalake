@@ -50,11 +50,15 @@ def main() -> None:
     test_datalake_offline.test_bse_concalls_chunked_windows()
     print("  -> PASSED")
 
-    print("[9/10] Running bug fix audit verification suite...")
+    print("[9/11] Running bug fix audit verification suite...")
     test_datalake_offline.test_bug_fix_2_audit_suite()
     print("  -> PASSED")
 
-    print("[10/10] Running storage layout & cloud sync unit test suites...")
+    print("[10/11] Running Pass 1 (P1-01 to P1-07) verification suite...")
+    test_datalake_offline.test_pass_1_audit_suite()
+    print("  -> PASSED")
+
+    print("[11/11] Running storage layout & cloud sync unit test suites...")
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
     suite.addTests(loader.loadTestsFromName("test_remote"))

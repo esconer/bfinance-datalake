@@ -189,7 +189,16 @@ class UnifiedLakeEngine:
             try:
                 return pd.read_parquet(path, filters=filters)
             except Exception:
-                pass
+                # Retry with alternate int <-> str filter scalar if schema type differs
+                try:
+                    alt_filters = [
+                        (c, op, int(v) if isinstance(v, str) and v.isdigit() else str(v))
+                        if op == "==" else (c, op, v)
+                        for c, op, v in filters
+                    ]
+                    return pd.read_parquet(path, filters=alt_filters)
+                except Exception:
+                    pass
         df = read_table_safe(path)
         if filters and not df.empty:
             for col, op, val in filters:
@@ -257,7 +266,9 @@ class UnifiedLakeEngine:
             return pd.DataFrame()
 
         key_for_actions = ident.symbol if exchange.upper() == "NSE" else (ident.bse_code or ident.symbol)
-        adj = self.adjuster.apply_adjustments(raw, key_for_actions, exchange=exchange, auto_adjust=auto_adjust)
+        adj = self.adjuster.apply_adjustments(
+            raw, key_for_actions, exchange=exchange, auto_adjust=auto_adjust, include_future_splits=True
+        )
         adj = adj[(adj["Date"] >= s_dt) & (adj["Date"] <= e_dt)].reset_index(drop=True)
         return adj
 
@@ -334,7 +345,7 @@ class UnifiedLakeEngine:
             monthly = fo_dir / f"{exch}_fo_{dt.year}_{dt.month:02d}.parquet"
             files = [yearly] if yearly.exists() else [monthly]
         else:
-            files = sorted(fo_dir.glob(f"{exch}_fo_*.parquet"))[-1:]
+            files = sorted(fo_dir.glob(f"{exch}_fo_*.parquet"), key=lambda p: p.stem.split("_")[2:])[-1:]
 
         frames = [self._read_filtered_parquet(f, filters=[("Symbol", "==", sym)]) for f in files if f.exists()]
         if not frames:
@@ -342,11 +353,11 @@ class UnifiedLakeEngine:
         df = pd.concat(frames, ignore_index=True)
         if df.empty:
             return df
+        dt_norm = pd.to_datetime(df["Date"]).dt.normalize()
         if trade_date:
-            df = df[pd.to_datetime(df["Date"]).dt.normalize() == pd.Timestamp(trade_date).normalize()]
+            df = df[dt_norm == pd.Timestamp(trade_date).normalize()]
         else:
-            latest_dt = pd.to_datetime(df["Date"]).max()
-            df = df[pd.to_datetime(df["Date"]) == latest_dt]
+            df = df[dt_norm == dt_norm.max()]
         if expiry:
             df = df[pd.to_datetime(df["ExpiryDate"]).dt.normalize() == pd.Timestamp(expiry).normalize()]
         return df.sort_values(["ExpiryDate", "StrikePrice", "OptionType"]).reset_index(drop=True)
@@ -443,6 +454,19 @@ class UnifiedLakeEngine:
                     continue
                 if not df.empty and "Symbol" in df.columns and "Date" in df.columns:
                     sorted_df = df.sort_values(["Symbol", "Date"])
+                    if not df.index.equals(sorted_df.index):
+                        write_parquet_atomic(sorted_df.reset_index(drop=True), pq)
+                        reclustered += 1
+        fo_dir = self.root / "derivatives"
+        if fo_dir.exists():
+            for pq in sorted(fo_dir.glob("*.parquet")):
+                try:
+                    df = read_table_safe(pq)
+                except Exception:
+                    continue
+                sort_cols = [c for c in ("Symbol", "Date", "ExpiryDate", "StrikePrice", "OptionType") if c in df.columns]
+                if not df.empty and len(sort_cols) >= 2:
+                    sorted_df = df.sort_values(sort_cols)
                     if not df.index.equals(sorted_df.index):
                         write_parquet_atomic(sorted_df.reset_index(drop=True), pq)
                         reclustered += 1

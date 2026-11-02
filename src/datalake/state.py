@@ -73,7 +73,11 @@ class StateStore:
     def max_ok_date(self, dataset: str) -> date | None:
         with self._session() as conn:
             row = conn.execute(
-                "SELECT MAX(partition_key) FROM ingestion_log WHERE dataset = ? AND status = 'OK'",
+                """
+                SELECT MAX(partition_key) FROM ingestion_log
+                WHERE dataset = ? AND status = 'OK'
+                  AND partition_key GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
+                """,
                 (dataset,),
             ).fetchone()
         if row and row[0]:
