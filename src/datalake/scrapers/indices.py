@@ -97,6 +97,9 @@ class IndicesScraper:
                 "CLOSE": "Close",
                 "EOD_CLOSE_INDEX_VAL": "Close",
             })
+            df = df.loc[:, ~df.columns.duplicated()].copy()
+            if "Date" not in df.columns or "Close" not in df.columns:
+                continue
             keep_base = [c for c in ("Date", "Open", "High", "Low", "Close") if c in df.columns]
             df = df[keep_base].copy()
             df["Date"] = pd.to_datetime(df["Date"], format="mixed", dayfirst=True, errors="coerce")
@@ -118,6 +121,7 @@ class IndicesScraper:
 
             if not pe_df.empty and ("Date" in pe_df.columns or "DATE" in pe_df.columns):
                 p = pe_df.rename(columns={"DATE": "Date"}).copy()
+                p = p.loc[:, ~p.columns.duplicated()].copy()
                 p["Date"] = pd.to_datetime(p["Date"], format="mixed", dayfirst=True, errors="coerce")
                 for src, dst in (
                     ("pe", "PE"), ("PE", "PE"),
@@ -229,19 +233,24 @@ class IndicesScraper:
                         if head_txt.startswith("<") or "Index Name" not in head_txt:
                             return d, None, None, url, None
                         df = pd.read_csv(io.StringIO(resp.text), on_bad_lines="skip")
-                        df.columns = [c.strip() for c in df.columns]
+                        df.columns = [str(c).lstrip("\ufeff").strip() for c in df.columns]
+                        def _num_col(col_name: str) -> pd.Series:
+                            if col_name not in df.columns:
+                                return pd.Series(float("nan"), index=df.index, dtype="float64")
+                            return pd.to_numeric(df[col_name].astype(str).str.strip().replace("-", pd.NA), errors="coerce")
+
                         out = pd.DataFrame({
                             "Date": pd.Timestamp(d),
                             "IndexName": df["Index Name"].astype(str).str.strip(),
-                            "Open": pd.to_numeric(df["Open Index Value"].astype(str).str.strip().replace("-", pd.NA), errors="coerce"),
-                            "High": pd.to_numeric(df["High Index Value"].astype(str).str.strip().replace("-", pd.NA), errors="coerce"),
-                            "Low": pd.to_numeric(df["Low Index Value"].astype(str).str.strip().replace("-", pd.NA), errors="coerce"),
-                            "Close": pd.to_numeric(df["Closing Index Value"].astype(str).str.strip().replace("-", pd.NA), errors="coerce"),
-                            "Volume": pd.to_numeric(df["Volume"].astype(str).str.strip().replace("-", pd.NA), errors="coerce"),
-                            "TurnoverCr": pd.to_numeric(df["Turnover (Rs. Cr.)"].astype(str).str.strip().replace("-", pd.NA), errors="coerce"),
-                            "PE": pd.to_numeric(df["P/E"].astype(str).str.strip().replace("-", pd.NA), errors="coerce"),
-                            "PB": pd.to_numeric(df["P/B"].astype(str).str.strip().replace("-", pd.NA), errors="coerce"),
-                            "DivYield": pd.to_numeric(df["Div Yield"].astype(str).str.strip().replace("-", pd.NA), errors="coerce"),
+                            "Open": _num_col("Open Index Value"),
+                            "High": _num_col("High Index Value"),
+                            "Low": _num_col("Low Index Value"),
+                            "Close": _num_col("Closing Index Value"),
+                            "Volume": _num_col("Volume"),
+                            "TurnoverCr": _num_col("Turnover (Rs. Cr.)"),
+                            "PE": _num_col("P/E"),
+                            "PB": _num_col("P/B"),
+                            "DivYield": _num_col("Div Yield"),
                         })
                         for c in ("Open", "High", "Low"):
                             out[c] = out[c].fillna(out["Close"])

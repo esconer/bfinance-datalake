@@ -54,11 +54,15 @@ def main() -> None:
     test_datalake_offline.test_bug_fix_2_audit_suite()
     print("  -> PASSED")
 
-    print("[10/11] Running Pass 1 (P1-01 to P1-07) verification suite...")
+    print("[10/12] Running Pass 1 (P1-01 to P1-07) verification suite...")
     test_datalake_offline.test_pass_1_audit_suite()
     print("  -> PASSED")
 
-    print("[11/11] Running storage layout & cloud sync unit test suites...")
+    print("[11/12] Running Pass 2 (P2-01 to P2-06) verification suite...")
+    test_datalake_offline.test_pass_2_audit_suite()
+    print("  -> PASSED")
+
+    print("[12/12] Running storage layout & cloud sync unit test suites...")
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
     suite.addTests(loader.loadTestsFromName("test_remote"))

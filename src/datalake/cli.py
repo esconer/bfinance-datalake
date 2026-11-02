@@ -136,11 +136,17 @@ async def run_xbrl_sync(
                 await dd.sync_annual_reports_bse(synced_scrips[:200], symbols=synced_syms[:200])
             return
         for sym in symbols:
-            await xbrl.sync_symbol_financials_nse(sym)
-            await xbrl.sync_symbol_shareholding_nse(sym)
+            try:
+                await xbrl.sync_symbol_financials_nse(sym)
+                await xbrl.sync_symbol_shareholding_nse(sym)
+            except Exception as exc:
+                logger.warning("[XBRL CLI] Failed symbol %s: %s", sym, exc)
         if bse_scrips:
             for scrip in bse_scrips:
-                await xbrl.sync_bse_shareholding(scrip)
+                try:
+                    await xbrl.sync_bse_shareholding(scrip)
+                except Exception as exc:
+                    logger.warning("[XBRL CLI] Failed BSE scrip %s: %s", scrip, exc)
             await dd.sync_annual_reports_bse(bse_scrips, symbols=symbols)
 
 
@@ -233,6 +239,7 @@ def main() -> None:
     # 9. stage-release (Used by GitHub Actions before gh release upload)
     p_stg = sub.add_parser("stage-release", help="Optimize Parquet layout, build manifest.json, and stage assets")
     p_stg.add_argument("--staging-dir", default="/tmp/release_assets", help="Output folder for flat release assets")
+    p_stg.add_argument("--prev-manifest", default=None, help="Optional previous manifest.json to stage only changed files")
 
     args = parser.parse_args()
     cfg = LakeConfig(root_dir=Path(args.data_dir).resolve())
@@ -267,7 +274,8 @@ def main() -> None:
         stats = asyncio.run(pull_from_github_release(args.repo, cfg.root_dir, tag=args.tag, token=args.token, pattern=args.pattern))
         print("Sync Summary:", stats)
     elif args.cmd == "stage-release":
-        prepare_release_staging(cfg.root_dir, Path(args.staging_dir).resolve())
+        prev_m = Path(args.prev_manifest).resolve() if args.prev_manifest else None
+        prepare_release_staging(cfg.root_dir, Path(args.staging_dir).resolve(), previous_manifest_path=prev_m)
 
 
 if __name__ == "__main__":

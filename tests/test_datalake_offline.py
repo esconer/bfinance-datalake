@@ -426,6 +426,68 @@ def test_pass_1_audit_suite():
         assert adj.loc[1, "Adj Close"] == 1290.0
 
 
+def test_pass_2_audit_suite():
+    # 1. Verify P2-01: NSE UDIFF sets InstrumentId = Symbol ('RELIANCE'), while BSE sets FinInstrmId ('500325')
+    udiff_sample = pd.DataFrame([{
+        "Sgmt": "CM",
+        "FinInstrmId": 2885,
+        "TckrSymb": "RELIANCE",
+        "SctySrs": "EQ",
+        "ISIN": "INE002A01018",
+        "OpnPric": 1300.0,
+        "HghPric": 1320.0,
+        "LwPric": 1290.0,
+        "ClsPric": 1310.0,
+        "LastPric": 1310.0,
+        "PrvsClsgPric": 1295.0,
+        "TtlTradgVol": 100000,
+        "TtlTrfVal": 131000000.0,
+        "TtlNbOfTxsExctd": 5000,
+    }])
+    nse_norm = EquityEODScraper._normalize_udiff(udiff_sample.copy(), date(2026, 10, 30), "NSE")
+    assert nse_norm.iloc[0]["InstrumentId"] == "RELIANCE", f"Expected RELIANCE, got {nse_norm.iloc[0]['InstrumentId']}"
+
+    bse_sample = udiff_sample.copy()
+    bse_sample["FinInstrmId"] = 500325.0
+    bse_norm = EquityEODScraper._normalize_udiff(bse_sample, date(2026, 10, 30), "BSE")
+    assert bse_norm.iloc[0]["InstrumentId"] == "500325", f"Expected 500325, got {bse_norm.iloc[0]['InstrumentId']}"
+
+    # 2. Verify P2-03: FO zero close repair
+    fo_sample = pd.DataFrame([{
+        "FinInstrmTp": "OPTSTK",
+        "TckrSymb": "RELIANCE",
+        "XpryDt": "2026-11-26",
+        "StrkPric": 1300.0,
+        "OptnTp": "CE",
+        "OpnPric": 0.0,
+        "HghPric": 0.0,
+        "LwPric": 0.0,
+        "ClsPric": 0.0,
+        "SttlmPric": 25.5,
+        "UndrlygPric": 1310.0,
+        "TtlTradgVol": 0.0,
+        "TtlTrfVal": 0.0,
+        "OpnIntrst": 50000.0,
+        "ChngInOpnIntrst": 1000.0,
+    }])
+    fo_norm = DerivativesEODScraper._normalize_fo_udiff(fo_sample, date(2026, 10, 30), "NSE")
+    assert fo_norm.iloc[0]["Close"] == 25.5
+    assert fo_norm.iloc[0]["Open"] == 25.5
+
+    # 3. Verify P2-04: AMFI parser enforces integer SchemeCode
+    amfi_txt = (
+        "Scheme Code;ISIN Div Payout/ ISIN Growth;ISIN Div Reinvestment;Scheme Name;Net Asset Value;Date\n"
+        "Open Ended Schemes (Equity)\n"
+        "HDFC Mutual Fund\n"
+        "100122;INF179K01608;-;HDFC Balanced Fund;150.25;30-Oct-2026\n"
+        "INVALID_CODE;-;-;Bad Row;10.0;30-Oct-2026\n"
+    )
+    df_amfi = FundsAndFlowsScraper._parse_amfi_text(amfi_txt)
+    assert len(df_amfi) == 1
+    assert pd.api.types.is_integer_dtype(df_amfi["SchemeCode"])
+    assert df_amfi.iloc[0]["SchemeCode"] == 100122
+
+
 if __name__ == "__main__":
     test_corporate_action_regex_parser()
     test_repair_ohlc_and_bse_debt_filter()
@@ -437,4 +499,5 @@ if __name__ == "__main__":
     test_bse_concalls_chunked_windows()
     test_bug_fix_2_audit_suite()
     test_pass_1_audit_suite()
+    test_pass_2_audit_suite()
     print("ALL OFFLINE UNIT & INTEGRATION TESTS PASSED!")

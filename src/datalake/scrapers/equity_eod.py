@@ -531,7 +531,7 @@ class EquityEODScraper:
             out = pd.DataFrame({
                 "Date": pd.Timestamp(day),
                 "Exchange": "BSE",
-                "InstrumentId": df["SC_CODE"].astype(str).str.strip(),
+                "InstrumentId": df["SC_CODE"].astype(str).str.replace(r"\.0$", "", regex=True).str.strip(),
                 "Symbol": df["SC_NAME"].astype(str).str.strip(),
                 "Series": df["SC_GROUP"].astype(str).str.strip(),
                 "ISIN": pd.NA,
@@ -555,7 +555,7 @@ class EquityEODScraper:
                     idf.columns = [c.strip() for c in idf.columns]
                     if "SC_CODE" in idf.columns and "ISIN_CODE" in idf.columns:
                         imap = pd.DataFrame({
-                            "InstrumentId": idf["SC_CODE"].astype(str).str.strip(),
+                            "InstrumentId": idf["SC_CODE"].astype(str).str.replace(r"\.0$", "", regex=True).str.strip(),
                             "ISIN": idf["ISIN_CODE"].astype(str).str.strip(),
                         }).drop_duplicates(subset=["InstrumentId"])
                         out = out.drop(columns=["ISIN"], errors="ignore").merge(imap, on="InstrumentId", how="left")
@@ -587,7 +587,7 @@ class EquityEODScraper:
             if not scrip_col or not qty_col:
                 return None
             return pd.DataFrame({
-                "InstrumentId": df[scrip_col].astype(str).str.strip(),
+                "InstrumentId": df[scrip_col].astype(str).str.replace(r"\.0$", "", regex=True).str.strip(),
                 "DeliverableQty": pd.to_numeric(df[qty_col], errors="coerce"),
                 "DeliveryPct": pd.to_numeric(df[pct_col], errors="coerce") if pct_col else pd.NA,
             }).drop_duplicates(subset=["InstrumentId"])
@@ -599,11 +599,17 @@ class EquityEODScraper:
         df.columns = [c.strip() for c in df.columns]
         if "Sgmt" in df.columns:
             df = df[df["Sgmt"].astype(str).str.strip() == "CM"].copy()
+        sym_s = df["TckrSymb"].astype(str).str.strip()
+        inst_id = (
+            sym_s
+            if exchange.upper() == "NSE"
+            else df["FinInstrmId"].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
+        )
         return pd.DataFrame({
             "Date": pd.Timestamp(day),
             "Exchange": exchange,
-            "InstrumentId": df["FinInstrmId"].astype(str).str.strip(),
-            "Symbol": df["TckrSymb"].astype(str).str.strip(),
+            "InstrumentId": inst_id,
+            "Symbol": sym_s,
             "Series": df["SctySrs"].astype(str).str.strip(),
             "ISIN": df["ISIN"].astype(str).str.strip(),
             "Open": pd.to_numeric(df["OpnPric"], errors="coerce"),

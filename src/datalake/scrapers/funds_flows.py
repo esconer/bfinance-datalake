@@ -192,10 +192,10 @@ class FundsAndFlowsScraper:
                 nav = float(nav_s)
             except ValueError:
                 continue
-            if nav <= 0.0 or not dt_s:
+            if nav <= 0.0 or not dt_s or not code.isdigit():
                 continue
             rows.append({
-                "SchemeCode": int(code) if code.isdigit() else code,
+                "SchemeCode": int(code),
                 "SchemeName": name,
                 "AMC": amc,
                 "Category": cat,
@@ -241,7 +241,7 @@ class FundsAndFlowsScraper:
                             return d, None, None, url, None
                         lines = [ln for ln in resp.text.splitlines() if ln.strip()]
                         header_idx = next((i for i, ln in enumerate(lines) if "Client Type" in ln), 0)
-                        df = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])))
+                        df = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])), on_bad_lines="skip")
                         df.columns = [c.strip() for c in df.columns]
                         df = df[df["Client Type"].astype(str).str.strip().isin(["Client", "DII", "FII", "Pro"])].copy()
                         df["Client Type"] = df["Client Type"].astype(str).str.strip()

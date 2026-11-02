@@ -132,7 +132,7 @@ class DerivativesEODScraper:
             "Exchange": "NSE",
             "InstrumentType": df["INSTRUMENT"].astype(str).str.strip(),
             "Symbol": df["SYMBOL"].astype(str).str.strip(),
-            "ExpiryDate": pd.to_datetime(df["EXPIRY_DT"], format="%d-%b-%Y", errors="coerce"),
+            "ExpiryDate": pd.to_datetime(df["EXPIRY_DT"].astype(str).str.strip(), format="mixed", dayfirst=True, errors="coerce"),
             "StrikePrice": pd.to_numeric(df["STRIKE_PR"], errors="coerce").fillna(0.0).astype("float64"),
             "OptionType": df[opt_col].fillna("XX").astype(str).str.strip(),
             "Open": pd.to_numeric(df["OPEN"], errors="coerce").astype("float64"),
@@ -146,6 +146,8 @@ class DerivativesEODScraper:
             "OpenInterest": pd.to_numeric(df["OPEN_INT"], errors="coerce").astype("float64"),
             "ChangeInOI": pd.to_numeric(df["CHG_IN_OI"], errors="coerce").astype("float64"),
         })
+        zc = (out["Close"].isna()) | (out["Close"] <= 0)
+        out.loc[zc, "Close"] = out.loc[zc, "SettlePrice"]
         for col in ("Open", "High", "Low"):
             z = (out[col].isna()) | (out[col] <= 0)
             out.loc[z, col] = out.loc[z, "Close"]
@@ -190,6 +192,8 @@ class DerivativesEODScraper:
             "OpenInterest": pd.to_numeric(df["OpnIntrst"], errors="coerce").astype("float64"),
             "ChangeInOI": pd.to_numeric(df["ChngInOpnIntrst"], errors="coerce").astype("float64"),
         })
+        zc = (out["Close"].isna()) | (out["Close"] <= 0)
+        out.loc[zc, "Close"] = out.loc[zc, "SettlePrice"]
         for col in ("Open", "High", "Low"):
             z = (out[col].isna()) | (out[col] <= 0)
             out.loc[z, col] = out.loc[z, "Close"]
