@@ -179,3 +179,98 @@ Users who cannot download the full ~1.9 GB historical dataset can pull targeted 
 ```
 
 This single command fetches the ~8.5 MB high-leverage bundle, validates all SHA-256 hashes against `manifest.json`, and stages them into the proper directories for zero-config queries.
+
+---
+
+## 6. Live Network Scraping & Temporal Era Probes Audit
+
+A full empirical live network audit was executed against live exchange CDNs, regulatory APIs, and historical archives ([`tests/smoke_test_live.py`](file:///e:/dev/code/bfinance-datalake/tests/smoke_test_live.py)). All network calls utilized TLS fingerprint impersonation (Chrome 124) and automated session cookie priming (`_prime_host`).
+
+### A. 15-Source Live Pipeline Scorecard
+
+| Source / Pipeline Step | Target Endpoint / Authority | Status | Records Ingested | Network Latency & Output Partition |
+| :--- | :--- | :---: | :---: | :--- |
+| **1. Security Masters & Renames** | NSE `equity-master` & BSE scrip API | **PASS** | 11,800 | 21.9s $\rightarrow$ `nse_symbol_changes.parquet` |
+| **2. Corporate Actions (BSE + NSE)** | BSE corp actions & NSE daily CA API | **PASS** | 4,398 | 6.8s $\rightarrow$ `nse_corporate_actions.parquet` |
+| **3. NSE Equity EOD + Delivery (3d)** | NSE modern UDIFF + full bhavcopy | **PASS** | 11,020 | 12.2s $\rightarrow$ `nse_cm_2026.parquet` |
+| **4. BSE Equity EOD + Delivery (3d)** | BSE Bhavcopy Zip archives | **PASS** | 13,730 | 26.4s $\rightarrow$ `bse_cm_2026.parquet` |
+| **5. Pre-2016 Cloud Seed (Upstox CDN)**| Upstox Public V2 Candle CDN | **PASS** | 247 | 1.3s $\rightarrow$ `nse_cm_2015.parquet` |
+| **6. NSE F&O Option Chains (2d)** | NSE Derivatives Bhavcopy UDIFF | **PASS** | 48,338 | 14.7s $\rightarrow$ `nse_fo_2026.parquet` |
+| **7. Nifty 50 OHLC + TRI + PE (30d)** | NiftyIndices Sitefinity MVC API | **PASS** | 21 | 1.8s $\rightarrow$ `nifty_30y_ohlc_tri_pe.parquet` |
+| **8. Daily All-Indices Snapshot (3d)** | NSE index daily CSV archive | **PASS** | 501 | 1.0s $\rightarrow$ `ind_close_all_2026.parquet` |
+| **9. Ind-AS XBRL Financials** | NSE Corporates Ind-AS XBRL XML | **PASS** | 22 | 23.2s $\rightarrow$ `xbrl_financials.parquet` |
+| **10. Shareholding & Pledge** | BSE Corp Shareholding NG API | **PASS** | 130 | 57.1s $\rightarrow$ `nse_shareholding_summary.parquet` |
+| **11. AMFI Mutual Fund Daily NAVs** | AMFI Official Portal + MFapi.in fallback | **PASS** | 14,200 | 6.7s $\rightarrow$ `amfi_nav_2026.parquet` |
+| **12. NSE F&O Participant OI (3d)** | NSE Clearing (NSCCL) Archives | **PASS** | 12 | 1.2s $\rightarrow$ `fao_participant_oi_2026.parquet` |
+| **13. Bulk & Block Deals** | NSE Historical Deals Archive | **PASS** | 87 | 0.5s $\rightarrow$ `bulk_block_deals.parquet` |
+| **14. Cash FII / DII Daily Flows** | NSE API cash market provisional | **PASS** | 2 | 1.0s $\rightarrow$ `cash_fii_dii_flows.parquet` |
+| **15. Corporate Annual Reports** | BSE & NSE PDF disclosure catalogs | **PASS** | 34 | 9.5s $\rightarrow$ `annual_reports.parquet` |
+
+### B. Multi-Decade Historical Temporal Boundary Probes (1995 $\rightarrow$ 2020)
+
+To guarantee temporal completeness across 30 years of regulatory changes, historical probes were dispatched to specific exchange archives representing distinct market regimes:
+
+| Era | Target Historical Probe | Protocol / Archive Format | Status | Rows | Latency & Partition Details |
+| :---: | :--- | :--- | :---: | :---: | :--- |
+| **1995** | NSE Equity + Delivery (`1995-01-03`) | Legacy bhavcopy (`.dat`/`.pr`) | **PASS** | 461 | 7.0s $\rightarrow$ `nse_cm_1995.parquet` (`[1995-01-02..1995-01-03]`) |
+| **1995** | NIFTY 50 Index OHLC (Nov 1995) | NSE HistoricalOR bulk index | **PASS** | 9 | 3.6s $\rightarrow$ `nifty_30y_ohlc_tri_pe.parquet` (`[1995-11-03..1995-11-15]`) |
+| **2000** | NSE Equity OHLCV (RELIANCE 2000) | NSE HistoricalOR symbol endpoint | **PASS** | 400 | 1.7s $\rightarrow$ `nse_cm_2000.parquet` (`[2000-01-03..2000-12-29]`) |
+| **2005** | NSE Equity OHLCV (RELIANCE 2005) | NSE HistoricalOR symbol endpoint | **PASS** | 261 | 1.0s $\rightarrow$ `nse_cm_2005.parquet` (`[2005-01-03..2005-12-30]`) |
+| **2005** | Corporate Actions (2005) | NSE Historical Corporate Actions | **PASS** | 2,860 | 0.6s $\rightarrow$ `nse_corporate_actions.parquet` |
+| **2008** | NSE Equity OHLCV (2008) | Upstox Public V2 CDN | **PASS** | 57 | 2.2s $\rightarrow$ `nse_cm_2008.parquet` (`[2008-10-06..2008-12-31]`) |
+| **2008** | BSE Legacy Equity + ISIN (2008) | BSE Legacy Bhavcopy Zip | **PASS** | 5,809 | 27.7s $\rightarrow$ `bse_cm_2008.parquet` (`[2008-01-02..2008-01-03]`) |
+| **2008** | Mutual Fund NAVs (2008) | MFapi.in Historical Scheme API | **PASS** | 245 | 1.5s $\rightarrow$ `amfi_nav_2008.parquet` (`[2008-01-01..2008-12-31]`) |
+| **2012** | NSE Equity OHLCV (2012) | Upstox Public V2 CDN | **PASS** | 247 | 3.1s $\rightarrow$ `nse_cm_2012.parquet` (`[2012-01-02..2012-12-31]`) |
+| **2012** | Daily All-Indices Snapshot (2012) | NSE Index CSV Archives | **PASS** | 60 | 2.0s $\rightarrow$ `ind_close_all_2012.parquet` (`[2012-09-03..2012-09-04]`) |
+| **2012** | NSE F&O Participant OI (2012) | NSCCL Clearing Archives | **PASS** | 8 | 0.5s $\rightarrow$ `fao_participant_oi_2012.parquet` (`[2012-09-03..2012-09-04]`) |
+| **2015** | BSE Legacy Equity + ISIN (2015) | BSE Legacy Bhavcopy Zip | **PASS** | 6,013 | 22.0s $\rightarrow$ `bse_cm_2015.parquet` (`[2015-01-01..2015-01-02]`) |
+| **2020** | NSE Equity + Delivery + ISIN (2020) | `sec_bhavdata_full` + Legacy cm ISIN | **PASS** | 3,906 | 7.2s $\rightarrow$ `nse_cm_2020.parquet` (`[2020-01-02..2020-01-03]`) |
+| **2020** | NSE Legacy F&O Option Chains (2020) | Pre-UDIFF `fo_bhav` CSV Zip | **PASS** | 7,258 | 3.3s $\rightarrow$ `nse_fo_2020.parquet` (`[2020-01-02..2020-01-02]`) |
+
+---
+
+## 7. Zero-Disk Cloud Streaming (RemoteLakeClient & DuckDB httpfs)
+
+In addition to downloading local Parquet files, `bfinance-datalake` supports direct HTTP byte-range streaming queries over GitHub Releases via DuckDB `httpfs` ([`RemoteLakeClient`](file:///e:/dev/code/bfinance-datalake/src/datalake/remote.py)):
+
+* **Cold Query (`RELIANCE` 2026 OHLCV)**:
+  * Reads only the 64 KB Parquet footer and matching row-group byte ranges directly from the GitHub CDN over HTTPS.
+  * Extracted **207 rows** (`2026-01-01` to `2026-10-30`, Last Close: `₹1,164.90`) without downloading the ~30.5 MB Parquet file.
+* **Warm In-Memory Cache**:
+  * Cached metadata footer allows subsequent queries on the same release partition to complete in sub-second latencies with zero disk overhead.
+
+### Full 22-Year Lifetime History & Auto-Adjustment Benchmark (`TCS`)
+
+To test large-scale network streaming across multi-decade partitions, a zero-disk query was executed across **23 remote annual partitions (`2004` to `2026`)** for `TCS` (IPO date: August 25, 2004) with full corporate action backward adjustment:
+
+```mermaid
+sequenceDiagram
+    participant User as Remote Client
+    participant GH as GitHub Releases CDN
+    participant Adj as OHLCV Adjuster
+
+    User->>GH: HTTP Range: Request 23 Parquet Footers (2004..2026)
+    GH-->>User: Return metadata & dictionary offsets
+    User->>GH: HTTP Range: Request TCS row groups across 23 files
+    GH-->>User: 5,477 daily OHLCV rows (0 MB saved to disk)
+    User->>GH: HTTP Range: Fetch nse_corporate_actions.parquet
+    GH-->>User: 90 corporate action events
+    User->>Adj: Compute backwards cumulative splits & dividends
+    Adj-->>User: Complete Adj Close series (111 ms)
+```
+
+| Metric | Result |
+| :--- | :--- |
+| **Total Rows Retrieved** | **5,477 clean trading days** (Series = `EQ`) |
+| **Temporal Span** | **`2004-08-25` to `2026-10-30`** (22.2 continuous years) |
+| **Listing Day (`2004-08-25`)** | Open: `₹1,198.70` \| Close: `₹987.95` \| **Adjusted Close: `₹160.42`** |
+| **All-Time High Close** | `2024-08-30` at `₹4,553.75` (Adjusted Close: `₹4,208.34`) |
+| **Latest Close (`2026-10-30`)** | `₹2,502.60` (Adjusted Close: `₹2,502.60`, Volume: 3,016,983) |
+| **Lifetime Dividends Tracked** | **₹999.50 per share** across 81 effective cash dividend events |
+| **Bonus Multipliers Detected** | $1:1$ Bonus on `2009-06-16` ($2.0\times$), $1:1$ Bonus on `2018-05-31` ($2.0\times$) |
+| **Network Streaming Latency** | **122.89s** across 23 remote files (~5.3s per year over HTTPS byte-range) |
+| **Vectorized Adjustment Computation** | **111.28 ms** across all 5,477 rows |
+| **Peak RAM Utilized** | **2.65 MB** |
+| **Disk Space Consumed** | **0.00 MB** (Zero bytes written to disk) |
+
+

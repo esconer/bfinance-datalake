@@ -235,7 +235,8 @@ class UniverseAndActionsScraper:
                 _normalize_action_frame(pd.concat(frames, ignore_index=True)),
                 target,
                 dedup_cols=["scrip_code", "exdate", "Purpose"],
-                sort_cols=["ExDate", "scrip_code"],
+                sort_cols=["scrip_code", "ExDate"],
+                row_group_size=2_000,
             )
 
         await self.sync_nse_corporate_actions(start_year=start_year, end_year=cur_year)
@@ -281,5 +282,6 @@ class UniverseAndActionsScraper:
                     _normalize_action_frame(pd.concat(frames, ignore_index=True)),
                     target,
                     dedup_cols=["symbol", "series", "exDate", "subject"],
-                    sort_cols=["ExDate", "symbol"],
+                    sort_cols=["symbol", "ExDate"],
+                    row_group_size=2_000,
                 )

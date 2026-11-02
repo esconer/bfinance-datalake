@@ -559,6 +559,19 @@ class UnifiedLakeEngine:
                     if not df.index.equals(sorted_df.index):
                         write_parquet_atomic(sorted_df.reset_index(drop=True), pq)
                         reclustered += 1
+        act_dir = self.root / "actions"
+        if act_dir.exists():
+            for pq in sorted(act_dir.glob("*.parquet")):
+                try:
+                    df = read_table_safe(pq)
+                except Exception:
+                    continue
+                key_col = "symbol" if "symbol" in df.columns else ("scrip_code" if "scrip_code" in df.columns else None)
+                if not df.empty and key_col and "ExDate" in df.columns:
+                    sorted_df = df.sort_values([key_col, "ExDate"])
+                    if not df.index.equals(sorted_df.index):
+                        write_parquet_atomic(sorted_df.reset_index(drop=True), pq, row_group_size=2_000)
+                        reclustered += 1
         self._cached_raw_equity.cache_clear()
         return {"files_clustered_by_symbol_date": reclustered}
 
