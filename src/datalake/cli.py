@@ -34,6 +34,7 @@ async def run_backfill(
     end: date,
     include_fo: bool,
     include_amfi_history: bool,
+    force: bool = False,
 ) -> None:
     cfg.ensure_dirs()
     LakeDoctor(cfg).run_full_check_and_repair()
@@ -52,7 +53,7 @@ async def run_backfill(
         await univ.sync_corporate_actions(start_year=max(1995, start.year), end_year=end.year)
 
         logger.info("=== Step 2/6: 30-Year Nifty Indices OHLC + TRI + P/E Bulk Backfill ===")
-        await indices.backfill_30y_bulk(start_date=start, end_date=end)
+        await indices.backfill_30y_bulk(start_date=start, end_date=end, force=force)
         await indices.sync_daily_snapshots(start_date=max(date(2012, 1, 2), start), end_date=end)
 
         logger.info("=== Step 3/6: NSE & BSE Daily Equity OHLCV + Delivery (%s -> %s) ===", start, end)
@@ -198,6 +199,7 @@ def main() -> None:
     p_bf.add_argument("--end", default=None, help="End date YYYY-MM-DD (default: today IST)")
     p_bf.add_argument("--include-fo", action="store_true", help="Also backfill daily NSE/BSE F&O Option Chains & Futures")
     p_bf.add_argument("--amfi-history", action="store_true", help="Also backfill 30-day AMFI NAV windows since 2006")
+    p_bf.add_argument("--force", action="store_true", help="Force redownload even if partitions/indices are already complete on disk")
 
     # 2. daily
     p_dy = sub.add_parser("daily", help="Incremental daily update from last watermark to today IST")
@@ -247,7 +249,7 @@ def main() -> None:
     if args.cmd == "backfill":
         start_dt = date.fromisoformat(args.start)
         end_dt = date.fromisoformat(args.end) if args.end else today_ist()
-        asyncio.run(run_backfill(cfg, start_dt, end_dt, args.include_fo, args.amfi_history))
+        asyncio.run(run_backfill(cfg, start_dt, end_dt, args.include_fo, args.amfi_history, force=args.force))
         print_status(cfg)
     elif args.cmd == "daily":
         asyncio.run(run_daily_update(cfg, args.lookback_days, include_fo=not args.no_fo))

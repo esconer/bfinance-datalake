@@ -11,7 +11,7 @@ import pandas as pd
 from datalake.config import LakeConfig, today_ist
 from datalake.http_client import ARCHIVE_HEADERS, NIFTY_INDICES_HEADERS, NSE_API_HEADERS, ResilientHTTPClient
 from datalake.state import StateStore
-from datalake.storage import upsert_parquet_partition
+from datalake.storage import read_table_safe, upsert_parquet_partition
 
 logger = logging.getLogger("datalake.indices")
 
@@ -53,18 +53,57 @@ class IndicesScraper:
         start_date: date = date(1995, 1, 1),
         end_date: date | None = None,
         indices: tuple[str, ...] = CORE_NIFTY_INDICES,
+        force: bool = False,
     ) -> None:
         end = end_date or today_ist()
         target = self.cfg.root_dir / "indices" / "nifty_30y_ohlc_tri_pe.parquet"
 
+        existing_coverage: dict[str, tuple[date, date, int]] = {}
+        if not force and target.exists():
+            try:
+                existing_df = read_table_safe(target)
+                if not existing_df.empty and "IndexName" in existing_df.columns and "Date" in existing_df.columns:
+                    for idx_n, grp in existing_df.groupby("IndexName"):
+                        dts = pd.to_datetime(grp["Date"], errors="coerce").dropna()
+                        if not dts.empty:
+                            existing_coverage[str(idx_n).strip().upper()] = (
+                                dts.min().date(),
+                                dts.max().date(),
+                                len(grp),
+                            )
+            except Exception as exc:
+                logger.debug("[Index 30Y Bulk] Could not read existing coverage: %s", exc)
+
         for idx_name in indices:
-            logger.info("[Index 30Y Bulk] Fetching OHLC + TRI + PE for %s (%s -> %s)...", idx_name, start_date, end)
+            cur_start = start_date
+            sym_key = str(idx_name).strip().upper()
+            if not force and sym_key in existing_coverage:
+                cov_min, cov_max, row_cnt = existing_coverage[sym_key]
+                # If existing history has substantial records (> 500 trading days)
+                if row_cnt >= 500:
+                    if cov_max >= (end - timedelta(days=4)):
+                        logger.info(
+                            "[Index 30Y Bulk] %s already covered (%s -> %s, %d rows). Skipping redundant fetch.",
+                            idx_name, cov_min, cov_max, row_cnt,
+                        )
+                        continue
+                    if cov_max < end:
+                        delta_start = cov_max + timedelta(days=1)
+                        if delta_start > end:
+                            continue
+                        logger.info(
+                            "[Index 30Y Bulk] %s covered up to %s (%d rows). Fetching incremental delta (%s -> %s)...",
+                            idx_name, cov_max, row_cnt, delta_start, end,
+                        )
+                        cur_start = delta_start
+
+            logger.info("[Index 30Y Bulk] Fetching OHLC + TRI + PE for %s (%s -> %s)...", idx_name, cur_start, end)
             ohlc_df, tri_df, pe_df = await asyncio.gather(
-                self._post_nifty(idx_name, start_date, end, "getHistoricaldatatabletoString"),
-                self._post_nifty(idx_name, start_date, end, "getTotalReturnIndexString"),
+                self._post_nifty(idx_name, cur_start, end, "getHistoricaldatatabletoString"),
+                self._post_nifty(idx_name, cur_start, end, "getTotalReturnIndexString"),
                 self._post_nifty(
                     idx_name,
-                    start_date,
+                    cur_start,
                     end,
                     "getpepbHistoricaldataDBtoString",
                     extra=",'pe':'true','pb':'true','dy':'true'",
@@ -80,7 +119,7 @@ class IndicesScraper:
 
             # Fallback to NSE /api/historicalOR/indicesHistory if niftyindices.com returned empty
             if ohlc_df.empty:
-                ohlc_df = await self._fetch_nse_historical_or_index(idx_name, start_date, end)
+                ohlc_df = await self._fetch_nse_historical_or_index(idx_name, cur_start, end)
 
             if ohlc_df.empty:
                 continue
@@ -138,7 +177,7 @@ class IndicesScraper:
                 upsert_parquet_partition(
                     df, target, dedup_cols=["Date", "IndexName"], sort_cols=["IndexName", "Date"]
                 )
-                self.state.record("indices_30y_bulk", f"{idx_name}:{start_date}_{end}", "OK", row_count=len(df))
+                self.state.record("indices_30y_bulk", f"{idx_name}:{cur_start}_{end}", "OK", row_count=len(df))
             await asyncio.sleep(self.cfg.polite_delay_sec)
 
     async def _post_nifty(

@@ -38,6 +38,11 @@ on:
         required: false
         default: false
         type: boolean
+      force:
+        description: "Force redownload even if partitions/indices already exist on disk"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -124,6 +129,9 @@ jobs:
             fi
             if [ "${{ github.event.inputs.include_amfi_history }}" = "true" ]; then
               ARGS="$ARGS --amfi-history"
+            fi
+            if [ "${{ github.event.inputs.force }}" = "true" ]; then
+              ARGS="$ARGS --force"
             fi
             uv run datalake backfill $ARGS
           elif [ "$MODE" = "seed-cloud-pre2016" ]; then
