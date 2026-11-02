@@ -58,13 +58,18 @@ def main() -> None:
     test_datalake_offline.test_pass_1_audit_suite()
     print("  -> PASSED")
 
-    print("[11/12] Running Pass 2 (P2-01 to P2-06) verification suite...")
+    print("[11/13] Running Pass 2 (P2-01 to P2-06) verification suite...")
     test_datalake_offline.test_pass_2_audit_suite()
     print("  -> PASSED")
 
-    print("[12/12] Running storage layout & cloud sync unit test suites...")
+    print("[12/13] Running Pass 3 (P3-01 to P3-05) verification suite...")
+    test_datalake_offline.test_pass_3_audit_suite()
+    print("  -> PASSED")
+
+    print("[13/13] Running storage layout, engine & cloud sync unit test suites...")
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
+    suite.addTests(loader.loadTestsFromName("test_engine"))
     suite.addTests(loader.loadTestsFromName("test_remote"))
     suite.addTests(loader.loadTestsFromName("test_sync"))
     runner = unittest.TextTestRunner(stream=sys.stdout, verbosity=2)

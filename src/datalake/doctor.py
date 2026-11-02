@@ -60,13 +60,13 @@ class LakeDoctor:
                     conn.close()
 
         state = StateStore(self.cfg.state_db_path)
-        valid_dates_on_disk: dict[str, set[str]] = {
-            "equity_eod_nse": set(),
-            "equity_eod_bse": set(),
-            "fo_eod_nse": set(),
-            "fo_eod_bse": set(),
-            "indices_daily_all": set(),
-            "nse_participant_oi": set(),
+        valid_dates_on_disk: dict[str, dict[str, int]] = {
+            "equity_eod_nse": {},
+            "equity_eod_bse": {},
+            "fo_eod_nse": {},
+            "fo_eod_bse": {},
+            "indices_daily_all": {},
+            "nse_participant_oi": {},
         }
 
         # Auto-migrate legacy monthly F&O files (nse_fo_YYYY_MM.parquet -> nse_fo_YYYY.parquet)
@@ -159,8 +159,8 @@ class LakeDoctor:
                     else:
                         write_parquet_atomic(clean_df, pq_path)
                     stats["truncated_days_purged"] += len(bad_dates)
-                good_dates = set(counts[counts >= min_rows_for_full_day].index)
-                valid_dates_on_disk[ds_name].update(good_dates)
+                for dt_key, cnt in counts[counts >= min_rows_for_full_day].items():
+                    valid_dates_on_disk[ds_name][str(dt_key)] = int(cnt)
 
         now_str = datetime.now(IST).isoformat()
         with state._session() as conn:
@@ -175,7 +175,8 @@ class LakeDoctor:
                     (ds_bound, min_key),
                 )
 
-            for ds_name, disk_dates in valid_dates_on_disk.items():
+            for ds_name, disk_date_counts in valid_dates_on_disk.items():
+                disk_dates = set(disk_date_counts.keys())
                 rows = conn.execute(
                     "SELECT partition_key FROM ingestion_log WHERE dataset = ? AND status = 'OK'",
                     (ds_name,),
@@ -199,11 +200,11 @@ class LakeDoctor:
                     conn.executemany(
                         """
                         INSERT INTO ingestion_log (dataset, partition_key, status, row_count, updated_at)
-                        VALUES (?, ?, 'OK', 1, ?)
+                        VALUES (?, ?, 'OK', ?, ?)
                         ON CONFLICT(dataset, partition_key) DO UPDATE SET
-                            status = 'OK', updated_at = excluded.updated_at
+                            status = 'OK', row_count = excluded.row_count, updated_at = excluded.updated_at
                         """,
-                        [(ds_name, k, now_str) for k in unrecorded_on_disk],
+                        [(ds_name, k, disk_date_counts[k], now_str) for k in unrecorded_on_disk],
                     )
                     stats["watermarks_rebuilt_from_disk"] += len(unrecorded_on_disk)
 

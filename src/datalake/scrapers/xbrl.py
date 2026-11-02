@@ -293,12 +293,22 @@ class XBRLScraper:
         instant_bs_by_end: dict[str, dict] = {}
 
         for tag, col_name in XBRL_FIN_TAGS.items():
-            for elem in root.xpath(f"//*[local-name()='{tag}']"):
+            xpath = (
+                f"//*[local-name()='{tag}'] | "
+                f"//*[local-name()='nonFraction'][contains(@name, ':{tag}')]"
+            )
+            for elem in root.xpath(xpath):
                 cref = elem.get("contextRef")
-                if cref not in contexts or not elem.text:
+                val_txt = "".join(elem.itertext()).strip()
+                if cref not in contexts or not val_txt:
                     continue
                 try:
-                    val = float(elem.text.strip())
+                    val = float(val_txt.replace(",", ""))
+                    if elem.get("sign") == "-":
+                        val = -val
+                    scale_attr = elem.get("scale")
+                    if scale_attr is not None:
+                        val *= 10 ** int(scale_attr)
                 except ValueError:
                     continue
                 scaled = val if tag in UNSCALED_TAGS else round(val / 1e7, 4)
@@ -513,7 +523,7 @@ class XBRLScraper:
         for ctx in root.xpath("//*[local-name()='context']"):
             cid = ctx.get("id")
             members = ctx.xpath(".//*[local-name()='explicitMember']/text()")
-            typed = ctx.xpath(".//*[local-name()='typedMember']//*[text()]/text()")
+            typed = [t.strip() for t in ctx.xpath(".//*[local-name()='typedMember']//text()") if t.strip()]
             if cid and members:
                 m_clean = members[-1].split(":")[-1].strip()
                 if typed:
@@ -538,16 +548,19 @@ class XBRLScraper:
             )
             for elem in root.xpath(xpath):
                 cref = elem.get("contextRef")
-                if cref not in ctx_to_member or not elem.text:
+                val_txt = "".join(elem.itertext()).strip()
+                if cref not in ctx_to_member or not val_txt:
                     continue
                 m_key, is_typed = ctx_to_member[cref]
-                val_txt = elem.text.strip()
                 entry = by_member.setdefault(m_key, {"_is_typed": is_typed, "CategoryMember": m_key.split(":")[0]})
                 if key in ("HolderName", "PAN"):
                     entry[key] = val_txt
                 else:
                     try:
-                        entry[key] = float(val_txt.replace(",", ""))
+                        fval = float(val_txt.replace(",", ""))
+                        if elem.get("sign") == "-":
+                            fval = -fval
+                        entry[key] = fval
                     except ValueError:
                         pass
 

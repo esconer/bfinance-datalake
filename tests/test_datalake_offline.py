@@ -488,6 +488,59 @@ def test_pass_2_audit_suite():
     assert df_amfi.iloc[0]["SchemeCode"] == 100122
 
 
+def test_pass_3_audit_suite():
+    # 1. Verify P3-01: iXBRL HTML with nested <span> tags inside ix:nonNumeric / ix:nonFraction
+    ixbrl_html = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <html xmlns:ix="http://www.xbrl.org/2013/inlineXBRL"
+          xmlns:xbrli="http://www.xbrl.org/2003/instance"
+          xmlns:xbrldi="http://xbrl.org/2006/xbrldi"
+          xmlns:in-bse-shp="http://www.bseindia.com/xbrl/shp/2018-03-31/in-bse-shp">
+      <xbrli:context id="c_promo">
+        <xbrli:entity>
+          <xbrli:identifier scheme="http://www.bseindia.com/ScripCode">500325</xbrli:identifier>
+          <xbrli:segment>
+            <xbrldi:explicitMember dimension="in-bse-shp:ShareholdingPatternAxis">in-bse-shp:ShareholdingOfPromoterAndPromoterGroupMember</xbrldi:explicitMember>
+          </xbrli:segment>
+        </xbrli:entity>
+        <xbrli:period><xbrli:instant>2026-09-30</xbrli:instant></xbrli:period>
+      </xbrli:context>
+      <xbrli:context id="c_holder">
+        <xbrli:entity>
+          <xbrli:identifier scheme="http://www.bseindia.com/ScripCode">500325</xbrli:identifier>
+          <xbrli:segment>
+            <xbrldi:explicitMember dimension="in-bse-shp:ShareholdingPatternAxis">in-bse-shp:InsuranceCompaniesMember</xbrldi:explicitMember>
+            <xbrldi:typedMember dimension="in-bse-shp:DetailsOfSharesHeldByInstitutionsAxis">
+              <in-bse-shp:DetailsOfSharesHeldByInstitutionsDomain><span>Inst_1</span></in-bse-shp:DetailsOfSharesHeldByInstitutionsDomain>
+            </xbrldi:typedMember>
+          </xbrli:segment>
+        </xbrli:entity>
+        <xbrli:period><xbrli:instant>2026-09-30</xbrli:instant></xbrli:period>
+      </xbrli:context>
+      <ix:nonFraction name="in-bse-shp:ShareholdingAsAPercentageOfTotalNumberOfShares" contextRef="c_promo"><span>50.31</span></ix:nonFraction>
+      <ix:nonNumeric name="in-bse-shp:NameOfTheShareHolders" contextRef="c_holder"><span>LIC OF INDIA</span></ix:nonNumeric>
+      <ix:nonFraction name="in-bse-shp:ShareholdingAsAPercentageOfTotalNumberOfShares" contextRef="c_holder"><span>6.38</span></ix:nonFraction>
+    </html>
+    """
+    parsed = XBRLScraper.parse_full_shp_xbrl(ixbrl_html)
+    assert parsed["summary"]["PromoterPct"] == 50.31
+    assert len(parsed["named_holders"]) == 1
+    assert parsed["named_holders"][0]["HolderName"] == "LIC OF INDIA"
+
+    # 2. Verify P3-02: LakeDoctor restores exact row_count (250, not 1) into state.db
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = LakeConfig(root_dir=Path(tmpdir))
+        cfg.ensure_dirs()
+        df_good = pd.DataFrame({
+            "Date": [pd.Timestamp("2024-10-29")] * 250,
+            "Symbol": [f"S{i}" for i in range(250)],
+            "Close": [100.0] * 250,
+        })
+        write_parquet_atomic(df_good, cfg.root_dir / "equities" / "nse_cm_2024.parquet")
+        LakeDoctor(cfg).run_full_check_and_repair()
+        summary = {r["dataset"]: r for r in StateStore(cfg.state_db_path).summary()}
+        assert summary["equity_eod_nse"]["total_rows"] == 250, f"Expected 250 rows, got {summary['equity_eod_nse']['total_rows']}"
+
+
 if __name__ == "__main__":
     test_corporate_action_regex_parser()
     test_repair_ohlc_and_bse_debt_filter()
@@ -500,4 +553,5 @@ if __name__ == "__main__":
     test_bug_fix_2_audit_suite()
     test_pass_1_audit_suite()
     test_pass_2_audit_suite()
+    test_pass_3_audit_suite()
     print("ALL OFFLINE UNIT & INTEGRATION TESTS PASSED!")

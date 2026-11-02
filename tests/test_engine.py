@@ -8,8 +8,32 @@ from datalake.engine import LakeTicker, SecurityIdentity, UnifiedLakeEngine
 
 
 class TestUnifiedLakeEngine(unittest.TestCase):
+    _tmp_dir = None
+
+    @classmethod
+    def setUpClass(cls):
+        smoke = Path("smoke_data")
+        if (smoke / "universe" / "nse_equity_master.parquet").exists():
+            cls.data_path = smoke
+        else:
+            cls._tmp_dir = tempfile.TemporaryDirectory()
+            cls.data_path = Path(cls._tmp_dir.name)
+            for sub in ("universe", "equities", "derivatives", "indices", "mutual_funds", "actions"):
+                (cls.data_path / sub).mkdir(parents=True, exist_ok=True)
+            pd.DataFrame([{"SYMBOL": "RELIANCE", "NAME OF COMPANY": "Reliance Industries", "SERIES": "EQ", "ISIN NUMBER": "INE002A01018"}]).to_parquet(cls.data_path / "universe" / "nse_equity_master.parquet")
+            pd.DataFrame([{"SCRIP_CD": "500325", "Scrip_Name": "Reliance Industries", "ISIN_NUMBER": "INE002A01018", "scrip_id": "RELIANCE"}]).to_parquet(cls.data_path / "universe" / "bse_scrip_master.parquet")
+            pd.DataFrame([{"Date": pd.Timestamp("2026-01-02"), "Exchange": "NSE", "InstrumentId": "RELIANCE", "Symbol": "RELIANCE", "Series": "EQ", "Open": 1300.0, "High": 1310.0, "Low": 1290.0, "Close": 1305.0, "Volume": 1000}]).to_parquet(cls.data_path / "equities" / "nse_cm_2026.parquet")
+            pd.DataFrame([{"Date": pd.Timestamp("2026-01-02"), "Exchange": "NSE", "InstrumentType": "OPTIDX", "Symbol": "NIFTY", "ExpiryDate": pd.Timestamp("2026-01-29"), "StrikePrice": 24000.0, "OptionType": "CE", "Open": 200.0, "High": 220.0, "Low": 190.0, "Close": 210.0, "SettlePrice": 210.0, "Contracts": 100.0, "OpenInterest": 5000.0, "ChangeInOI": 100.0}]).to_parquet(cls.data_path / "derivatives" / "nse_fo_2026.parquet")
+            pd.DataFrame([{"Date": pd.Timestamp("2026-01-02"), "IndexName": "NIFTY 50", "Open": 24000.0, "High": 24100.0, "Low": 23950.0, "Close": 24050.0}]).to_parquet(cls.data_path / "indices" / "nifty_30y_ohlc_tri_pe.parquet")
+            pd.DataFrame([{"Date": pd.Timestamp("2026-01-02"), "SchemeCode": 100122, "SchemeName": "HDFC Fund", "NAV": 150.5}]).to_parquet(cls.data_path / "mutual_funds" / "amfi_nav_2026.parquet")
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._tmp_dir is not None:
+            cls._tmp_dir.cleanup()
+
     def setUp(self):
-        self.lake = UnifiedLakeEngine("smoke_data")
+        self.lake = UnifiedLakeEngine(self.data_path)
 
     def test_crosswalk_resolution(self):
         # Resolve by NSE symbol

@@ -149,6 +149,14 @@ async def pull_from_github_release(
                     continue
             to_download.append((rel_path, meta))
 
+        if pattern is None and files_map:
+            valid_rel_paths = set(files_map.keys())
+            for existing_pq in list(target_root.rglob("*.parquet")):
+                rel_existing = existing_pq.relative_to(target_root).as_posix()
+                if rel_existing not in valid_rel_paths:
+                    logger.info("[Lake Pull] Removing retired local partition: %s", rel_existing)
+                    existing_pq.unlink(missing_ok=True)
+
         logger.info(
             "[Lake Pull] %d files up-to-date locally, %d changed/new files to download from %s...",
             skipped, len(to_download), repo,
@@ -162,7 +170,7 @@ async def pull_from_github_release(
             asset_url = f"{base_url}/{meta['asset_name']}"
             local_path = target_root / rel_path
             local_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = local_path.with_name(f"{local_path.name}.dl_tmp")
+            tmp_path = local_path.with_name(f"{local_path.name}.dl.tmp")
             
             for dl_attempt in range(4):
                 try:
