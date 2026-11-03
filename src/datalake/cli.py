@@ -17,7 +17,11 @@ from datalake.scrapers.indices import IndicesScraper
 from datalake.scrapers.universe_actions import UniverseAndActionsScraper
 from datalake.scrapers.xbrl import XBRLScraper
 from datalake.state import StateStore
-from datalake.sync import prepare_release_staging, pull_from_github_release
+from datalake.sync import (
+    prepare_release_staging,
+    prune_retired_release_assets,
+    pull_from_github_release,
+)
 
 logging.basicConfig(
     level=logging.INFO,

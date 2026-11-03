@@ -54,24 +54,43 @@ def prepare_release_staging(
     data_dir: Path,
     staging_dir: Path,
     previous_manifest_path: Path | None = None,
+    tag: str = "datalake-latest",
 ) -> dict:
     """
     Run by GitHub Actions before `gh release upload`:
       1. Clusters Equity Parquet files by `(Symbol, Date)` for sub-5ms predicate pushdown.
       2. Generates `manifest.json`.
       3. Copies `manifest.json`, `state.db`, and all `folder__file.parquet` assets into `staging_dir`
-         (staging only new/modified files if previous_manifest_path is provided).
+         (staging only new/modified/missing-on-release files if previous_manifest_path is provided).
     """
+    import subprocess
+
     data_dir = data_dir.resolve()
     staging_dir = staging_dir.resolve()
 
     old_shas: dict[str, str] = {}
+    remote_sizes: dict[str, int] | None = None
     if previous_manifest_path and previous_manifest_path.exists():
         try:
             old_m = json.loads(previous_manifest_path.read_text(encoding="utf-8"))
             old_shas = {k: v.get("sha256", "") for k, v in old_m.get("files", {}).items()}
         except Exception:
             pass
+        if os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"):
+            try:
+                out = subprocess.check_output(
+                    ["gh", "release", "view", tag, "--json", "assets"],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                )
+                assets = json.loads(out).get("assets", [])
+                remote_sizes = {
+                    a["name"]: int(a.get("size", -1))
+                    for a in assets
+                    if isinstance(a, dict) and a.get("name")
+                }
+            except Exception:
+                remote_sizes = None
 
     UnifiedLakeEngine(data_dir).optimize_layout()
     manifest = build_manifest(data_dir)
@@ -85,18 +104,23 @@ def prepare_release_staging(
         shutil.copy2(data_dir / "state.db", staging_dir / "state.db")
 
     staged_count = 0
+    skipped_count = 0
     for rel_path, meta in manifest["files"].items():
-        if old_shas.get(rel_path) == meta["sha256"]:
+        asset_name = meta["asset_name"]
+        same_sha = old_shas.get(rel_path) == meta["sha256"]
+        on_remote = remote_sizes is None or remote_sizes.get(asset_name) == meta["size_bytes"]
+        if same_sha and on_remote:
+            skipped_count += 1
             continue
         src = data_dir / rel_path
-        dst = staging_dir / meta["asset_name"]
+        dst = staging_dir / asset_name
         if src.exists() and meta["size_bytes"] < 1_950_000_000:
             shutil.copy2(src, dst)
             staged_count += 1
 
     logger.info(
-        "[Release Stage] Staged %d changed/new Parquet assets (out of %d total) in %s",
-        staged_count, len(manifest["files"]), staging_dir,
+        "[Release Stage] Staged %d changed/new Parquet assets (%d unchanged skipped, %d total) in %s",
+        staged_count, skipped_count, len(manifest["files"]), staging_dir,
     )
     return manifest
 

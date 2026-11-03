@@ -8,6 +8,10 @@ ROOT_DIR = Path(__file__).resolve().parent
 SRC_DIR = ROOT_DIR / "src"
 TESTS_DIR = ROOT_DIR / "tests"
 
+for venv_site in sorted((ROOT_DIR / ".venv" / "lib").glob("python*/site-packages")):
+    if str(venv_site) not in sys.path:
+        sys.path.insert(0, str(venv_site))
+
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 if str(TESTS_DIR) not in sys.path:

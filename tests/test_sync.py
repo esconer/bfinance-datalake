@@ -79,6 +79,22 @@ class TestSyncEngine(unittest.TestCase):
                 self.assertEqual(set(deleted), {"datalake_store.tar.zst.part-00", "retired__old_file.parquet"})
                 self.assertEqual(mock_run.call_count, 2)
 
+                # Also verify CLI entry point executes prune-release and stage-release without NameError
+                from datalake.cli import main as cli_main
+                with patch(
+                    "sys.argv",
+                    ["datalake", "--data-dir", str(src), "prune-release", "--tag", "datalake-latest", "--staging-dir", str(stg)],
+                ):
+                    cli_main()
+
+                prev_m = src / "prev_manifest.json"
+                prev_m.write_text((src / "manifest.json").read_text(encoding="utf-8"), encoding="utf-8")
+                with patch(
+                    "sys.argv",
+                    ["datalake", "--data-dir", str(src), "stage-release", "--staging-dir", str(stg), "--prev-manifest", str(prev_m)],
+                ):
+                    cli_main()
+
     def test_pull_delta_skipping(self):
         with tempfile.TemporaryDirectory() as target_dir:
             target = Path(target_dir)
