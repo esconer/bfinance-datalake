@@ -167,6 +167,91 @@ class TestUnifiedLakeEngine(unittest.TestCase):
             self.assertEqual(row_2021["Sales_Cr"], 150.0)
             self.assertEqual(row_2021["NatureOfReport"], "Consolidated")
 
+    def test_equity_series_dedup_and_priority(self):
+        df = pd.DataFrame([
+            {"Date": pd.Timestamp("2024-01-01"), "Series": "BE", "Close": 100.0},
+            {"Date": pd.Timestamp("2024-01-02"), "Series": "BE", "Close": 102.0},
+            {"Date": pd.Timestamp("2024-01-02"), "Series": "EQ", "Close": 103.0},
+            {"Date": pd.Timestamp("2024-01-03"), "Series": "SM", "Close": 50.0},
+        ])
+        out = UnifiedLakeEngine._dedup_nse_equity_series(df)
+        self.assertEqual(len(out), 3)
+        # 2024-01-01 has only BE -> preserved
+        self.assertEqual(out.loc[0, "Series"], "BE")
+        # 2024-01-02 has EQ and BE -> EQ prioritized
+        self.assertEqual(out.loc[1, "Series"], "EQ")
+        self.assertEqual(out.loc[1, "Close"], 103.0)
+        # 2024-01-03 has SM -> preserved
+        self.assertEqual(out.loc[2, "Series"], "SM")
+
+    def test_parse_action_purpose_face_value_noise(self):
+        from datalake.scrapers.universe_actions import parse_action_purpose
+        p1 = parse_action_purpose("Interim Dividend 50% on Face Value of Rs 2")
+        self.assertIsNone(p1["DividendPerShareRs"])
+        self.assertEqual(p1["ActionType"], "OTHER")
+
+        p2 = parse_action_purpose("Dividend @ 150% (Face Value Rs. 10/-)")
+        self.assertIsNone(p2["DividendPerShareRs"])
+        self.assertEqual(p2["ActionType"], "OTHER")
+
+        p3 = parse_action_purpose("Final Dividend - Rs 5 Per Share (Face Value Rs 10)")
+        self.assertEqual(p3["DividendPerShareRs"], 5.0)
+        self.assertEqual(p3["ActionType"], "DIVIDEND")
+
+    def test_auto_adjust_dividend_scaling(self):
+        from datalake.adjuster import OHLCVAdjuster
+        adj = OHLCVAdjuster(self.lake.root)
+        df = pd.DataFrame([
+            {"Date": pd.Timestamp("2020-01-01"), "Open": 100.0, "High": 105.0, "Low": 95.0, "Close": 100.0, "Volume": 1000},
+            {"Date": pd.Timestamp("2020-01-02"), "Open": 50.0, "High": 55.0, "Low": 45.0, "Close": 50.0, "Volume": 2000},
+        ])
+        actions = pd.DataFrame([
+            {"ExDate": pd.Timestamp("2020-01-01"), "ActionType": "DIVIDEND", "DividendPerShareRs": 10.0, "ShareMultiplier": 1.0},
+            {"ExDate": pd.Timestamp("2020-01-02"), "ActionType": "SPLIT", "DividendPerShareRs": 0.0, "ShareMultiplier": 2.0},
+        ])
+        from unittest.mock import patch
+        with patch.object(adj, "get_symbol_actions", return_value=actions):
+            out_raw = adj.apply_adjustments(df.copy(), "TEST", auto_adjust=False)
+            self.assertEqual(out_raw.loc[0, "Dividends"], 10.0)
+
+            out_adj = adj.apply_adjustments(df.copy(), "TEST", auto_adjust=True)
+            # cum_split_factor on day 0 is 0.5 (due to 2:1 split on day 1), so Dividend is scaled to 5.0
+            self.assertEqual(out_adj.loc[0, "Dividends"], 5.0)
+
+    def test_crosswalk_delisted_and_sme_resolution(self):
+        sme_p = self.lake.root / "universe" / "nse_sme_master.parquet"
+        sme_df = pd.DataFrame([
+            {"SYMBOL": "SMETEST", "ISIN": "INE123SME456", "NAME": "SME Test Co", "FACE VALUE": 10}
+        ])
+        sme_p.parent.mkdir(parents=True, exist_ok=True)
+        sme_df.to_parquet(sme_p)
+        self.lake._crosswalk_loaded = False
+        ident = self.lake.resolve("SMETEST")
+        self.assertEqual(ident.symbol, "SMETEST")
+        self.assertEqual(ident.company_name, "SME Test Co")
+
+    def test_shareholding_date_normalization_dedup(self):
+        import datetime
+        from unittest.mock import patch
+        nse_df = pd.DataFrame([
+            {"Symbol": "DEMO", "QuarterEnd": "30-SEP-2026", "PromoterPct": 50.0, "MutualFundsPct": 15.0}
+        ])
+        bse_df = pd.DataFrame([
+            {"ScripCode": "500001", "QuarterEnd": "September 2026", "PromoterPct": 50.0, "MutualFundsPct": None}
+        ])
+        def fake_read(p, filters=None):
+            if "nse_shareholding" in str(p):
+                return nse_df
+            elif "bse_shareholding" in str(p):
+                return bse_df
+            return pd.DataFrame()
+
+        with patch.object(self.lake, "_read_filtered_parquet", side_effect=fake_read):
+            res = self.lake.shareholding("DEMO")
+            self.assertEqual(len(res), 1)
+            self.assertEqual(res.iloc[0]["QuarterEnd"], datetime.date(2026, 9, 30))
+            self.assertEqual(res.iloc[0]["MutualFundsPct"], 15.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -113,38 +113,51 @@ class UnifiedLakeEngine:
                 if isin and isin not in ("", "NA", "NAN", "NONE") and sc:
                     isin_to_bse[isin] = (sc, name, ind)
 
-        if nse_path.exists():
-            ndf = read_table_safe(nse_path)
-            isin_col = next((c for c in ndf.columns if "ISIN" in c.upper()), "ISIN NUMBER")
-            name_col = next((c for c in ndf.columns if "NAME" in c.upper()), "NAME OF COMPANY")
-            fv_col = next((c for c in ndf.columns if "FACE" in c.upper()), "FACE VALUE")
-            list_col = next((c for c in ndf.columns if "LISTING" in c.upper()), "DATE OF LISTING")
+        for nse_file in (
+            "nse_equity_master.parquet",
+            "nse_sme_master.parquet",
+            "nse_etf_master.parquet",
+            "nse_delisted_master.parquet",
+        ):
+            nse_p = self.root / "universe" / nse_file
+            if not nse_p.exists():
+                continue
+            ndf = read_table_safe(nse_p)
+            if ndf.empty:
+                continue
+            isin_col = next((c for c in ndf.columns if "ISIN" in c.upper()), None)
+            name_col = next((c for c in ndf.columns if "NAME" in c.upper()), None)
+            fv_col = next((c for c in ndf.columns if "FACE" in c.upper()), None)
+            list_col = next((c for c in ndf.columns if "LISTING" in c.upper() or "DATE" in c.upper()), None)
+            sym_col = next((c for c in ndf.columns if c.strip().upper() in ("SYMBOL", "SECURITY", "SECURITY SYMBOL")), "SYMBOL")
             for r in ndf.to_dict("records"):
-                sym = str(r.get("SYMBOL") or "").strip().upper()
+                sym = str(r.get(sym_col) or "").strip().upper()
                 if not sym:
                     continue
-                isin = str(r.get(isin_col) or "").strip().upper()
+                isin = str(r.get(isin_col) or "").strip().upper() if isin_col else None
                 if isin in ("", "NA", "NAN", "NONE"):
                     isin = None
-                name = str(r.get(name_col) or sym).strip()
+                name = str(r.get(name_col) or sym).strip() if name_col else sym
                 bse_info = isin_to_bse.get(isin, (None, None, None)) if isin else (None, None, None)
-                fv_raw = pd.to_numeric(r.get(fv_col), errors="coerce")
+                fv_raw = pd.to_numeric(r.get(fv_col), errors="coerce") if fv_col else None
                 aliases = tuple(self.resolver.all_aliases(sym))
+                canon = aliases[0]
                 ident = SecurityIdentity(
-                    symbol=aliases[0],
+                    symbol=canon,
                     bse_code=bse_info[0],
                     isin=isin,
                     company_name=name,
                     aliases=aliases,
                     face_value=float(fv_raw) if pd.notna(fv_raw) else None,
-                    industry=sym_to_industry.get(aliases[0]) or bse_info[2],
-                    listing_date=str(r.get(list_col) or "").strip() or None,
+                    industry=sym_to_industry.get(canon) or bse_info[2],
+                    listing_date=str(r.get(list_col) or "").strip() or None if list_col else None,
                 )
                 for al in aliases:
-                    self._by_symbol[al] = ident
-                if bse_info[0]:
+                    if al not in self._by_symbol:
+                        self._by_symbol[al] = ident
+                if bse_info[0] and bse_info[0] not in self._by_bse:
                     self._by_bse[bse_info[0]] = ident
-                if isin:
+                if isin and isin not in self._by_isin:
                     self._by_isin[isin] = ident
 
         for r in bse_records:
@@ -232,6 +245,25 @@ class UnifiedLakeEngine:
                     df = df[df[col].astype(str).str.strip().isin({str(v) for v in val})]
         return df
 
+    _EQUITY_SERIES_PRIORITY = {"EQ": 0, "BE": 1, "BZ": 2, "SM": 3, "ST": 4, "BL": 5}
+
+    @classmethod
+    def _dedup_nse_equity_series(cls, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty or "Series" not in df.columns:
+            return df
+        ser = df["Series"].astype(str).str.strip().str.upper()
+        eq_mask = ser.isin(cls._EQUITY_SERIES_PRIORITY)
+        out = df[eq_mask].copy() if eq_mask.any() else df.copy()
+        out["_ser_prio"] = out["Series"].astype(str).str.strip().str.upper().map(
+            lambda s: cls._EQUITY_SERIES_PRIORITY.get(s, 99)
+        )
+        return (
+            out.sort_values(["Date", "_ser_prio"])
+            .drop_duplicates(subset=["Date"], keep="first")
+            .drop(columns=["_ser_prio"])
+            .reset_index(drop=True)
+        )
+
     @lru_cache(maxsize=256)
     def _cached_raw_equity(self, query_key: str, exchange: str, start_yr: int, end_yr: int) -> pd.DataFrame:
         ident = self.resolve(query_key)
@@ -259,8 +291,8 @@ class UnifiedLakeEngine:
         if not frames:
             return pd.DataFrame()
         out = pd.concat(frames, ignore_index=True)
-        if exch == "NSE" and "Series" in out.columns and "EQ" in set(out["Series"].astype(str).str.strip()):
-            out = out[out["Series"].astype(str).str.strip() == "EQ"].copy()
+        if exch == "NSE":
+            out = self._dedup_nse_equity_series(out)
         return out.sort_values("Date").drop_duplicates(subset=["Date"], keep="last").reset_index(drop=True)
 
     def history(
@@ -278,10 +310,11 @@ class UnifiedLakeEngine:
         s_dt = pd.Timestamp(start) if start else pd.Timestamp("1994-01-01")
         e_dt = pd.Timestamp(end) if end else pd.Timestamp.now().normalize()
         ident = self.resolve(query)
+        load_end_yr = max(e_dt.year, pd.Timestamp.now().year)
 
-        raw = self._cached_raw_equity(ident.symbol, exchange.upper(), s_dt.year, e_dt.year)
+        raw = self._cached_raw_equity(ident.symbol, exchange.upper(), s_dt.year, load_end_yr)
         if raw.empty and exchange.upper() == "NSE" and ident.bse_code:
-            raw = self._cached_raw_equity(ident.bse_code, "BSE", s_dt.year, e_dt.year)
+            raw = self._cached_raw_equity(ident.bse_code, "BSE", s_dt.year, load_end_yr)
             exchange = "BSE"
 
         if raw.empty:
@@ -329,9 +362,10 @@ class UnifiedLakeEngine:
         combined["_CanonSymbol"] = combined["Symbol"].astype(str).str.strip().str.upper().map(alias_to_canon)
         out_map: dict[str, pd.DataFrame] = {}
         for canon_sym, grp in combined.groupby("_CanonSymbol"):
-            if exch == "NSE" and "Series" in grp.columns and "EQ" in set(grp["Series"].astype(str).str.strip()):
-                grp = grp[grp["Series"].astype(str).str.strip() == "EQ"]
-            grp = grp.drop(columns=["_CanonSymbol"]).sort_values("Date").drop_duplicates(subset=["Date"], keep="last")
+            grp = grp.drop(columns=["_CanonSymbol"])
+            if exch == "NSE":
+                grp = self._dedup_nse_equity_series(grp)
+            grp = grp.sort_values("Date").drop_duplicates(subset=["Date"], keep="last")
             adj = self.adjuster.apply_adjustments(grp, str(canon_sym), exchange=exch, auto_adjust=auto_adjust, include_future_splits=True)
             out_map[str(canon_sym)] = adj[(adj["Date"] >= s_dt) & (adj["Date"] <= e_dt)].reset_index(drop=True)
         return out_map
@@ -374,9 +408,30 @@ class UnifiedLakeEngine:
             if ident.bse_code
             else pd.DataFrame()
         )
-        if not nse_df.empty and not bse_df.empty:
-            return pd.concat([bse_df, nse_df], ignore_index=True)
-        return nse_df if not nse_df.empty else bse_df
+        frames = []
+        if not nse_df.empty:
+            ndf = nse_df.copy()
+            ndf["_source_prio"] = 0
+            frames.append(ndf)
+        if not bse_df.empty:
+            bdf = bse_df.copy()
+            bdf["_source_prio"] = 1
+            frames.append(bdf)
+
+        if not frames:
+            return pd.DataFrame()
+
+        comb = pd.concat(frames, ignore_index=True)
+        if "QuarterEnd" in comb.columns:
+            norm_q = pd.to_datetime(comb["QuarterEnd"], format="mixed", errors="coerce").dt.to_period("Q").dt.end_time.dt.date
+            comb["QuarterEnd"] = norm_q
+            comb["_has_xbrl"] = comb["MutualFundsPct"].notna() if "MutualFundsPct" in comb.columns else False
+            comb = comb.sort_values(["QuarterEnd", "_has_xbrl", "_source_prio"], ascending=[True, False, True])
+            comb = comb.drop_duplicates(subset=["QuarterEnd"], keep="first")
+            comb = comb.drop(columns=["_source_prio", "_has_xbrl"], errors="ignore")
+            return comb.sort_values("QuarterEnd").reset_index(drop=True)
+
+        return comb
 
     def named_holders(self, query: str | int) -> pd.DataFrame:
         """Return named institutional and >1% individual shareholders from XBRL filings."""
@@ -764,7 +819,7 @@ class UnifiedLakeEngine:
                     self._duck.execute(
                         f"CREATE OR REPLACE VIEW {view_name} AS SELECT * FROM read_parquet('{full_glob}', union_by_name=true);"
                     )
-        return self._duck.execute(query).df()
+        return self._duck.cursor().execute(query).df()
 
 
 class LakeTicker:

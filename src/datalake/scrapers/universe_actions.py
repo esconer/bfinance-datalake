@@ -26,6 +26,10 @@ _RS_DASH_GAP_RE = re.compile(r"((?:rs|re|inr|₹)\.?)[\s]*-[\s]*(?=\d)", re.I)
 _NON_EQUITY_ISSUE_RE = re.compile(
     r"\b(?:debenture|ncd|ccd|ccps|preference|ncrps|dvr|warrant|bond)\b", re.I
 )
+_FV_NOISE_RE = re.compile(
+    r"(?:\b(?:on|of)\s+)?\b(?:face\s*value|fv|f\.v\.)\b\s*(?:of\s+)?(?:rs\.?|re\.?|₹|inr)?\s*[-:]?\s*\d+(?:\.\d+)?(?:\s*/-)?(?:\s*(?:each|per\s+share))?",
+    re.I,
+)
 _DIV_RE = re.compile(
     r"\b(?:dividend|div|interest|income\s+distribution|dist)\b.*?(?:rs\.?|re\.?|₹|inr)\s*[-:]?\s*(\d+(?:\.\d+)?)",
     re.I,
@@ -58,7 +62,8 @@ def parse_action_purpose(text: str) -> dict:
     for clause in clauses:
         if re.search(r"buy\s*back|\brights?\b|split|sub[-\s]*division", clause, re.I):
             continue
-        for m_div in _DIV_RE.finditer(clause):
+        clean_clause = _FV_NOISE_RE.sub(" ", clause)
+        for m_div in _DIV_RE.finditer(clean_clause):
             val = float(m_div.group(1))
             out["DividendPerShareRs"] = (out["DividendPerShareRs"] or 0.0) + val
             out["ActionType"] = "DIVIDEND"

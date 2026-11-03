@@ -157,8 +157,10 @@ class EquityEODScraper:
 
     async def fetch_nse_day(self, day: date) -> tuple[pd.DataFrame | None, bytes | None, str]:
         if day >= self.NSE_UDIFF_CUTOVER:
-            full_df, raw_full, url_full = await self._fetch_nse_sec_bhavdata_full(day)
-            udiff_df, raw_udiff, url_udiff = await self._fetch_nse_udiff(day)
+            (full_df, raw_full, url_full), (udiff_df, raw_udiff, url_udiff) = await asyncio.gather(
+                self._fetch_nse_sec_bhavdata_full(day),
+                self._fetch_nse_udiff(day),
+            )
             if udiff_df is None and full_df is None:
                 return None, None, url_udiff
             if udiff_df is not None and full_df is not None:
@@ -173,8 +175,10 @@ class EquityEODScraper:
             return repair_ohlc(res_df), (raw_udiff or raw_full), (url_udiff if udiff_df is not None else url_full)
 
         if day >= self.NSE_FULL_BHAV_CUTOVER:
-            full_df, raw_full, url_full = await self._fetch_nse_sec_bhavdata_full(day)
-            leg_df, raw_leg, url_leg = await self._fetch_nse_legacy_cm(day)
+            (full_df, raw_full, url_full), (leg_df, raw_leg, url_leg) = await asyncio.gather(
+                self._fetch_nse_sec_bhavdata_full(day),
+                self._fetch_nse_legacy_cm(day),
+            )
             if full_df is not None:
                 if leg_df is not None and "ISIN" in leg_df.columns:
                     isin_map = leg_df[["Symbol", "Series", "ISIN"]].drop_duplicates(subset=["Symbol", "Series"])

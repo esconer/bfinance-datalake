@@ -365,7 +365,7 @@ class RemoteLakeClient:
                 if end_year >= current_yr:
                     cur_urls = self._equity_urls_for_range(exch, current_yr, end_year)
                     cur_sql = ", ".join(f"'{u}'" for u in cur_urls)
-                    cur_df = self.con.execute(
+                    cur_df = self.con.cursor().execute(
                         f"SELECT {sel} FROM read_parquet([{cur_sql}]) WHERE Symbol = ? ORDER BY Date ASC",
                         [sym],
                     ).df()
@@ -383,7 +383,7 @@ class RemoteLakeClient:
               AND EXTRACT(YEAR FROM CAST(Date AS DATE)) BETWEEN ? AND ?
             ORDER BY Date ASC
         """
-        df = self.con.execute(query, [sym, start_year, end_year]).df()
+        df = self.con.cursor().execute(query, [sym, start_year, end_year]).df()
 
         if self.cache_dir and not df.empty and start_year < current_yr and columns is None:
             hist_end = min(end_year, current_yr - 1)
@@ -414,7 +414,7 @@ class RemoteLakeClient:
         url_list_sql = ", ".join(f"'{u}'" for u in urls)
         placeholders = ", ".join(["?"] * len(clean_syms))
         sel = self._select_clause(columns)
-        return self.con.execute(
+        return self.con.cursor().execute(
             f"""
             SELECT {sel}
             FROM read_parquet([{url_list_sql}])
@@ -429,7 +429,7 @@ class RemoteLakeClient:
         """Stream a company's Ind-AS XBRL Financials over HTTPS in ~250ms."""
         self._ensure_httpfs()
         url = self._resolve_cdn_url(self._asset_url("fundamentals", "xbrl_financials.parquet"))
-        return self.con.execute(
+        return self.con.cursor().execute(
             f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ? AND PeriodType = ? ORDER BY PeriodEnd ASC",
             [self._clean_sym(symbol), period_type],
         ).df()
@@ -438,7 +438,7 @@ class RemoteLakeClient:
         """Stream a company's Shareholding & Promoter Pledge history over HTTPS in ~250ms."""
         self._ensure_httpfs()
         url = self._resolve_cdn_url(self._asset_url("shareholding", "nse_shareholding_summary.parquet"))
-        return self.con.execute(
+        return self.con.cursor().execute(
             f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ? ORDER BY QuarterEnd ASC",
             [self._clean_sym(symbol)],
         ).df()
@@ -447,7 +447,7 @@ class RemoteLakeClient:
         """Stream >1% institutional and named shareholders over HTTPS."""
         self._ensure_httpfs()
         url = self._resolve_cdn_url(self._asset_url("shareholding", "named_shareholders.parquet"))
-        return self.con.execute(
+        return self.con.cursor().execute(
             f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ? ORDER BY QuarterEnd DESC, PctOfTotal DESC",
             [self._clean_sym(symbol)],
         ).df()
@@ -456,7 +456,7 @@ class RemoteLakeClient:
         """Stream parsed corporate actions (splits, bonuses, dividends) over HTTPS."""
         self._ensure_httpfs()
         url = self._resolve_cdn_url(self._asset_url("actions", "nse_corporate_actions.parquet"))
-        df = self.con.execute(
+        df = self.con.cursor().execute(
             f"SELECT * FROM read_parquet('{url}') WHERE symbol = ? ORDER BY exDate ASC",
             [self._clean_sym(symbol)],
         ).df()
@@ -470,7 +470,7 @@ class RemoteLakeClient:
         """Stream 30-year Nifty index OHLC, TRI, P/E, P/B, and DivYield over HTTPS."""
         self._ensure_httpfs()
         url = self._resolve_cdn_url(self._asset_url("indices", "nifty_30y_ohlc_tri_pe.parquet"))
-        return self.con.execute(
+        return self.con.cursor().execute(
             f"SELECT * FROM read_parquet('{url}') WHERE UPPER(IndexName) = ? ORDER BY Date ASC",
             [index_name.strip().upper()],
         ).df()
@@ -479,7 +479,7 @@ class RemoteLakeClient:
         """Stream Bulk & Block deals for a symbol over HTTPS."""
         self._ensure_httpfs()
         url = self._resolve_cdn_url(self._asset_url("deals", "bulk_block_deals.parquet"))
-        return self.con.execute(
+        return self.con.cursor().execute(
             f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ? ORDER BY Date DESC",
             [self._clean_sym(symbol)],
         ).df()
@@ -488,7 +488,7 @@ class RemoteLakeClient:
         """Stream SEBI PIT insider trading disclosures for a symbol over HTTPS."""
         self._ensure_httpfs()
         url = self._resolve_cdn_url(self._asset_url("deals", "insider_trading_pit.parquet"))
-        return self.con.execute(
+        return self.con.cursor().execute(
             f"SELECT * FROM read_parquet('{url}') WHERE symbol = ? ORDER BY date DESC",
             [self._clean_sym(symbol)],
         ).df()
@@ -497,7 +497,7 @@ class RemoteLakeClient:
         """Stream 20-year Annual Report PDF links over HTTPS."""
         self._ensure_httpfs()
         url = self._resolve_cdn_url(self._asset_url("documents", "annual_reports.parquet"))
-        return self.con.execute(
+        return self.con.cursor().execute(
             f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ? ORDER BY Year DESC",
             [self._clean_sym(symbol)],
         ).df()
@@ -508,11 +508,11 @@ class RemoteLakeClient:
         url = self._resolve_cdn_url(self._asset_url("documents", "concalls_and_filings.parquet"))
         q = str(scrip_code_or_symbol).strip()
         if q.isdigit():
-            return self.con.execute(
+            return self.con.cursor().execute(
                 f"SELECT * FROM read_parquet('{url}') WHERE ScripCode = ? ORDER BY FilingTimestamp DESC",
                 [q],
             ).df()
-        return self.con.execute(
+        return self.con.cursor().execute(
             f"SELECT * FROM read_parquet('{url}') WHERE UPPER(CompanyName) LIKE ? ORDER BY FilingTimestamp DESC",
             [f"%{self._clean_sym(q)}%"],
         ).df()
@@ -546,7 +546,7 @@ class RemoteLakeClient:
         self._ensure_httpfs()
         url = self._resolve_cdn_url(f"{self.base_url}/snapshots__market_screener_latest.parquet")
         where = f"WHERE {sql_filter}" if sql_filter else ""
-        return self.con.execute(f"SELECT * FROM read_parquet('{url}') {where}").df()
+        return self.con.cursor().execute(f"SELECT * FROM read_parquet('{url}') {where}").df()
 
     def option_chain(
         self,
@@ -562,7 +562,7 @@ class RemoteLakeClient:
         yr = year or pd.Timestamp.now().year
         url = self._resolve_cdn_url(self._asset_url("derivatives", f"nse_fo_{yr}.parquet"))
         if trade_date:
-            return self.con.execute(
+            return self.con.cursor().execute(
                 f"""SELECT * FROM read_parquet('{url}')
                 WHERE Symbol = ?
                   AND Date >= CAST(? AS TIMESTAMP)
@@ -570,7 +570,7 @@ class RemoteLakeClient:
                 ORDER BY ExpiryDate, StrikePrice, OptionType""",
                 [symbol.strip().upper(), str(trade_date), str(trade_date)],
             ).df()
-        return self.con.execute(
+        return self.con.cursor().execute(
             f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ? ORDER BY Date, ExpiryDate, StrikePrice",
             [symbol.strip().upper()],
         ).df()
@@ -578,5 +578,5 @@ class RemoteLakeClient:
     def sql(self, query: str, params: list[Any] | None = None) -> pd.DataFrame:
         """Execute arbitrary analytical SQL over remote Parquet datasets via DuckDB."""
         if params:
-            return self.con.execute(query, params).df()
-        return self.con.execute(query).df()
+            return self.con.cursor().execute(query, params).df()
+        return self.con.cursor().execute(query).df()

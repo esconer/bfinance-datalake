@@ -173,5 +173,7 @@ class OHLCVAdjuster:
             for vcol in ("Volume", "DeliverableQty"):
                 if vcol in out.columns:
                     out[vcol] = (out[vcol] / cum_split_factor).round()
+            if "Dividends" in out.columns:
+                out["Dividends"] = np.round(out["Dividends"] * cum_split_factor, 4)
 
         return out

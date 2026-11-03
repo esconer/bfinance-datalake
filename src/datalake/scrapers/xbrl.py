@@ -217,6 +217,7 @@ class XBRLScraper:
                             pass
                     else:
                         already_completed_filings += 1
+                        continue
 
                 # JSON Fallback when `xbrl` is `.../corporate/xbrl/-` or XML download unavailable
                 fb_row = self._extract_json_financial_row(item, sym, period, filing_date=filing_dt)
@@ -410,6 +411,16 @@ class XBRLScraper:
             logger.debug("[NSE Shareholding %s] %s", sym, exc)
             return
 
+        nse_p = self.cfg.root_dir / "shareholding" / "nse_shareholding_summary.parquet"
+        existing_qtrs = set()
+        if nse_p.exists():
+            try:
+                ex_df = read_table_safe(nse_p)
+                if not ex_df.empty and "Symbol" in ex_df.columns and "QuarterEnd" in ex_df.columns:
+                    existing_qtrs = set(ex_df.loc[ex_df["Symbol"] == sym, "QuarterEnd"].astype(str))
+            except Exception:
+                pass
+
         summary_rows = []
         named_rows = []
         for item in items:
@@ -447,6 +458,8 @@ class XBRLScraper:
                             self.state.record("nse_shareholding_xbrl", key, "OK", 1, x_resp.content, xbrl_url)
                     except Exception:
                         pass
+                elif qtr_date in existing_qtrs:
+                    continue
             summary_rows.append(base_row)
 
         if summary_rows:
@@ -499,8 +512,18 @@ class XBRLScraper:
             self.state.record("bse_shareholding", scrip_str, "HOLIDAY", source_url=url)
             return
 
-        rows = []
-        named_rows = []
+        bse_hist_p = self.cfg.root_dir / "shareholding" / "bse_shareholding_history.parquet"
+        existing_qtrs = set()
+        if bse_hist_p.exists():
+            try:
+                ex_df = read_table_safe(bse_hist_p)
+                if not ex_df.empty and "ScripCode" in ex_df.columns and "QuarterId" in ex_df.columns:
+                    sc_mask = ex_df["ScripCode"].astype(str) == scrip_str
+                    existing_qtrs = set(ex_df.loc[sc_mask, "QuarterId"].astype(str))
+            except Exception:
+                pass
+
+        pending_items = []
         for item in table:
             qtr_id = str(item.get("qtrid", item.get("nqtrid", "")))
             qtr_name = item.get("QtrName") or item.get("sQtrName")
@@ -521,8 +544,28 @@ class XBRLScraper:
                 "InsurancePct": float("nan"),
                 "RetailPct": float("nan"),
             }
-            if xbrl_rel and str(xbrl_rel).startswith("/XBRLFILES/"):
-                xbrl_url = f"https://www.bseindia.com{xbrl_rel}"
+            pending_items.append((row_data, xbrl_rel, qtr_id, qtr_name, sym))
+
+        sem = asyncio.Semaphore(4)
+        xbrl_fetches = 0
+
+        async def _fetch_xbrl_entry(entry):
+            nonlocal xbrl_fetches
+            row_data, xbrl_rel, qtr_id, qtr_name, sym = entry
+            local_named = []
+            if not xbrl_rel or not str(xbrl_rel).startswith("/XBRLFILES/"):
+                return row_data, local_named
+
+            xbrl_key = f"{scrip_str}:{qtr_id}"
+            if self.state.is_completed("bse_shareholding_xbrl", xbrl_key) and qtr_id in existing_qtrs:
+                return None, local_named
+
+            if max_xbrl_quarters is not None and xbrl_fetches >= max_xbrl_quarters:
+                return row_data, local_named
+
+            xbrl_fetches += 1
+            xbrl_url = f"https://www.bseindia.com{xbrl_rel}"
+            async with sem:
                 try:
                     x_resp = await self.http.get(xbrl_url, headers=ARCHIVE_HEADERS, prime_bse=True)
                     if x_resp.status_code == 200 and b"<" in x_resp.content[:200]:
@@ -531,15 +574,20 @@ class XBRLScraper:
                             if v is not None:
                                 row_data[k] = v
                         for nh in parsed["named_holders"]:
-                            named_rows.append({
+                            local_named.append({
                                 "Symbol": sym,
                                 "ScripCode": str(scrip_code),
                                 "QuarterEnd": qtr_name,
                                 **nh,
                             })
+                        self.state.record("bse_shareholding_xbrl", xbrl_key, "OK", 1, x_resp.content, xbrl_url)
                 except Exception:
                     pass
-            rows.append(row_data)
+            return row_data, local_named
+
+        results = await asyncio.gather(*[_fetch_xbrl_entry(e) for e in pending_items])
+        rows = [r[0] for r in results if r[0] is not None]
+        named_rows = [nh for r in results for nh in r[1]]
 
         if rows:
             upsert_parquet_partition(
