@@ -74,6 +74,16 @@ class TestRemoteAndStorageLayout(unittest.TestCase):
         self.assertEqual(client._clean_sym("500325.BO"), "500325")
         self.assertEqual(client._clean_sym("TCS"), "TCS")
 
+    def test_remote_client_two_tier_compacted_routing(self):
+        client = RemoteLakeClient("user/bfinance-datalake", load_httpfs=False)
+        client._compacted_bounds_cache = {"compacted__nse_cm_hist.parquet": (1995, 2025)}
+
+        urls = client._equity_urls_for_range("NSE", 2004, 2026)
+        # Instead of 23 yearly URLs, it resolves to just 2 URLs: compacted hist + 2026!
+        self.assertEqual(len(urls), 2)
+        self.assertTrue(urls[0].endswith("compacted__nse_cm_hist.parquet"))
+        self.assertTrue(urls[1].endswith("equities__nse_cm_2026.parquet"))
+
 
 if __name__ == "__main__":
     unittest.main()

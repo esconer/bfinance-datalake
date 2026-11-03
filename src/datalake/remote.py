@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date
+import json
 import logging
 import os
+from pathlib import Path
 import time
-from datetime import date
 from typing import Any
 import urllib.request
 import pandas as pd
@@ -16,13 +18,20 @@ except ImportError:
     duckdb = None  # type: ignore
     HAS_DUCKDB = False
 
+try:
+    import httpx
+    HAS_HTTPX = True
+except ImportError:
+    httpx = None  # type: ignore
+    HAS_HTTPX = False
+
 logger = logging.getLogger("datalake.remote")
 
 
 class RemoteLakeClient:
     """
-    Zero-disk network client that queries your GitHub Release Parquet files directly over HTTPS
-    using DuckDB `httpfs` HTTP Byte-Range requests (transfers ~250 KB per query in ~300-550ms).
+    Zero-disk (or hybrid-cached) network client that queries GitHub Release Parquet files
+    directly over HTTPS using DuckDB `httpfs` HTTP Byte-Range requests.
     """
 
     def __init__(
@@ -31,6 +40,7 @@ class RemoteLakeClient:
         tag: str = "datalake-latest",
         token: str | None = None,
         load_httpfs: bool = True,
+        cache_dir: Path | str | None = None,
     ):
         if not HAS_DUCKDB:
             raise RuntimeError("Install duckdb (`uv add duckdb`) for zero-disk HTTP Range Parquet queries.")
@@ -39,11 +49,50 @@ class RemoteLakeClient:
         self.token = token or os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
         self.base_url = f"https://github.com/{self.repo}/releases/download/{tag}"
         self.con = duckdb.connect(":memory:")
+        self.cache_dir = Path(cache_dir).expanduser().resolve() if cache_dir else None
+        if self.cache_dir:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+
         self._httpfs_loaded = False
         self._cdn_url_cache: dict[str, tuple[float, str]] = {}
+        self._compacted_bounds_cache: dict[str, tuple[int, int] | None] | None = None
+
+        headers = {"User-Agent": "bfinance-datalake/0.2.0"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        self._http_pool = (
+            httpx.Client(
+                headers=headers,
+                follow_redirects=False,
+                timeout=5.0,
+                limits=httpx.Limits(max_keepalive_connections=16, max_connections=24),
+            )
+            if HAS_HTTPX
+            else None
+        )
 
         if load_httpfs:
             self._ensure_httpfs()
+
+    def close(self) -> None:
+        """Close pooled HTTP connections and DuckDB in-memory handle."""
+        if self._http_pool is not None:
+            try:
+                self._http_pool.close()
+            except Exception:
+                pass
+            self._http_pool = None
+        if self.con is not None:
+            try:
+                self.con.close()
+            except Exception:
+                pass
+
+    def __enter__(self) -> RemoteLakeClient:
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
 
     def _ensure_httpfs(self) -> None:
         if self._httpfs_loaded:
@@ -57,12 +106,17 @@ class RemoteLakeClient:
             except Exception as exc:
                 logger.warning("Could not load DuckDB httpfs extension: %s", exc)
 
-        try:
-            # Cache Parquet footers and HTTP Range chunks in RAM so repeat queries take ~120ms
-            self.con.execute("SET enable_http_metadata_cache=true;")
-            self.con.execute("SET http_keep_alive=true;")
-        except Exception:
-            pass
+        for stmt in (
+            "SET enable_http_metadata_cache=true;",
+            "SET parquet_metadata_cache=true;",
+            "SET http_keep_alive=true;",
+            "SET http_retries=3;",
+        ):
+            try:
+                self.con.execute(stmt)
+            except Exception:
+                pass
+
         if self.token:
             try:
                 self.con.execute(
@@ -76,11 +130,23 @@ class RemoteLakeClient:
         return f"{self.base_url}/{folder}__{filename}"
 
     def _resolve_cdn_url(self, gh_url: str) -> str:
-        """Resolve GitHub Release 302 redirect to direct CDN URL (cached for 10 minutes)."""
+        """Resolve GitHub Release 302 redirect to direct CDN URL using a pooled connection (cached 10 min)."""
         now = time.monotonic()
         cached = self._cdn_url_cache.get(gh_url)
         if cached and (now - cached[0]) < 600.0:
             return cached[1]
+
+        if self._http_pool is not None:
+            try:
+                resp = self._http_pool.head(gh_url)
+                if resp.status_code in (301, 302, 303, 307, 308):
+                    cdn_url = resp.headers.get("Location") or resp.headers.get("location")
+                    if cdn_url:
+                        self._cdn_url_cache[gh_url] = (now, cdn_url)
+                        return cdn_url
+            except Exception:
+                pass
+            return gh_url
 
         class _NoRedirect(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -108,10 +174,70 @@ class RemoteLakeClient:
         with ThreadPoolExecutor(max_workers=min(12, len(gh_urls))) as pool:
             return list(pool.map(self._resolve_cdn_url, gh_urls))
 
+    def _get_compacted_bounds(self, exchange: str) -> tuple[int, int] | None:
+        """Check manifest.json once per session to see if compacted__{exch}_cm_hist.parquet is published."""
+        if self._compacted_bounds_cache is None:
+            self._compacted_bounds_cache = {}
+            manifest_url = f"{self.base_url}/manifest.json"
+            try:
+                cdn_m_url = self._resolve_cdn_url(manifest_url)
+                if self._http_pool is not None:
+                    r = self._http_pool.get(cdn_m_url, follow_redirects=True)
+                    if r.status_code == 200:
+                        comp = r.json().get("compacted_files", {})
+                        for k, meta in comp.items():
+                            self._compacted_bounds_cache[k] = (int(meta["min_year"]), int(meta["max_year"]))
+                else:
+                    req = urllib.request.Request(cdn_m_url)
+                    if self.token:
+                        req.add_header("Authorization", f"Bearer {self.token}")
+                    with urllib.request.urlopen(req, timeout=5.0) as resp:
+                        if resp.status == 200:
+                            data = json.loads(resp.read().decode("utf-8"))
+                            comp = data.get("compacted_files", {})
+                            for k, meta in comp.items():
+                                self._compacted_bounds_cache[k] = (int(meta["min_year"]), int(meta["max_year"]))
+            except Exception:
+                pass
+        asset_name = f"compacted__{exchange.lower()}_cm_hist.parquet"
+        return self._compacted_bounds_cache.get(asset_name)
+
+    def _equity_urls_for_range(self, exchange: str, start_year: int, end_year: int) -> list[str]:
+        """
+        Return minimal set of Parquet URLs for [start_year..end_year].
+        If compacted history bundle exists and >1 historical year is requested, uses
+        `compacted__{exch}_cm_hist.parquet` + `equities__{exch}_cm_{current_year}.parquet` (2 files instead of 32).
+        """
+        exch = exchange.lower()
+        prefix = f"{exch}_cm_"
+        bounds = self._get_compacted_bounds(exch)
+        if bounds is not None:
+            c_min, c_max = bounds
+            hist_years_requested = min(end_year, c_max) - max(start_year, c_min) + 1
+            if hist_years_requested >= 2:
+                raw_urls = [
+                    self._asset_url("equities", f"{prefix}{yr}.parquet")
+                    for yr in range(start_year, min(end_year + 1, c_min))
+                ]
+                raw_urls.append(self._asset_url("compacted", f"{prefix}hist.parquet"))
+                for yr in range(max(start_year, c_max + 1), end_year + 1):
+                    raw_urls.append(self._asset_url("equities", f"{prefix}{yr}.parquet"))
+                return self._resolve_cdn_urls_parallel(raw_urls)
+
+        raw_urls = [self._asset_url("equities", f"{prefix}{yr}.parquet") for yr in range(start_year, end_year + 1)]
+        return self._resolve_cdn_urls_parallel(raw_urls)
+
     @staticmethod
     def _clean_sym(symbol: str) -> str:
         s = str(symbol).strip().upper()
         return s[:-3] if s.endswith((".NS", ".BO")) else s
+
+    @staticmethod
+    def _select_clause(columns: list[str] | None) -> str:
+        if not columns:
+            return "*"
+        safe_cols = [f'"{c.replace(chr(34), "")}"' for c in columns]
+        return ", ".join(safe_cols)
 
     def history(
         self,
@@ -119,27 +245,58 @@ class RemoteLakeClient:
         start_year: int = 2024,
         end_year: int = 2026,
         exchange: str = "NSE",
+        columns: list[str] | None = None,
     ) -> pd.DataFrame:
         """
-        Stream a single stock's OHLCV + Delivery directly over HTTPS via HTTP Range requests
-        without downloading the full Parquet files to disk.
+        Stream a single stock's OHLCV + Delivery directly over HTTPS via HTTP Range requests.
+        Automatically uses the 2-file compacted layout (`hist` + `current_year`) when spanning multiple years.
         """
         self._ensure_httpfs()
         sym = self._clean_sym(symbol)
         if start_year > end_year:
             start_year, end_year = end_year, start_year
-        prefix = "nse_cm_" if exchange.upper() == "NSE" else "bse_cm_"
-        raw_urls = [self._asset_url("equities", f"{prefix}{yr}.parquet") for yr in range(start_year, end_year + 1)]
-        urls = self._resolve_cdn_urls_parallel(raw_urls)
+
+        exch = exchange.upper()
+        sel = self._select_clause(columns)
+        current_yr = pd.Timestamp.now().year
+
+        # Optional local immutable slice cache for historical years (< current_yr)
+        if self.cache_dir and start_year < current_yr and columns is None:
+            cache_file = self.cache_dir / f"{exch}_{sym}_{start_year}_{min(end_year, current_yr - 1)}.parquet"
+            if cache_file.exists():
+                hist_df = pd.read_parquet(cache_file)
+                if end_year >= current_yr:
+                    cur_urls = self._equity_urls_for_range(exch, current_yr, end_year)
+                    cur_sql = ", ".join(f"'{u}'" for u in cur_urls)
+                    cur_df = self.con.execute(
+                        f"SELECT {sel} FROM read_parquet([{cur_sql}]) WHERE Symbol = ? ORDER BY Date ASC",
+                        [sym],
+                    ).df()
+                    return pd.concat([hist_df, cur_df], ignore_index=True).sort_values("Date").reset_index(drop=True)
+                return hist_df
+
+        urls = self._equity_urls_for_range(exch, start_year, end_year)
         url_list_sql = ", ".join(f"'{u}'" for u in urls)
 
+        id_col = "InstrumentId" if exch == "BSE" and sym.isdigit() else "Symbol"
         query = f"""
-            SELECT *
+            SELECT {sel}
             FROM read_parquet([{url_list_sql}])
-            WHERE Symbol = ?
+            WHERE {id_col} = ?
+              AND EXTRACT(YEAR FROM CAST(Date AS DATE)) BETWEEN ? AND ?
             ORDER BY Date ASC
         """
-        return self.con.execute(query, [sym]).df()
+        df = self.con.execute(query, [sym, start_year, end_year]).df()
+
+        if self.cache_dir and not df.empty and start_year < current_yr and columns is None:
+            hist_end = min(end_year, current_yr - 1)
+            cache_file = self.cache_dir / f"{exch}_{sym}_{start_year}_{hist_end}.parquet"
+            if not cache_file.exists():
+                hist_slice = df[pd.to_datetime(df["Date"]).dt.year <= hist_end]
+                if not hist_slice.empty:
+                    hist_slice.to_parquet(cache_file, compression="zstd", index=False)
+
+        return df
 
     def download(
         self,
@@ -147,6 +304,7 @@ class RemoteLakeClient:
         start_year: int = 2024,
         end_year: int = 2026,
         exchange: str = "NSE",
+        columns: list[str] | None = None,
     ) -> pd.DataFrame:
         """Stream multiple symbols in a single vectorized HTTP Range query."""
         self._ensure_httpfs()
@@ -155,14 +313,19 @@ class RemoteLakeClient:
         if start_year > end_year:
             start_year, end_year = end_year, start_year
         clean_syms = [self._clean_sym(s) for s in symbols]
-        prefix = "nse_cm_" if exchange.upper() == "NSE" else "bse_cm_"
-        raw_urls = [self._asset_url("equities", f"{prefix}{yr}.parquet") for yr in range(start_year, end_year + 1)]
-        urls = self._resolve_cdn_urls_parallel(raw_urls)
+        urls = self._equity_urls_for_range(exchange.upper(), start_year, end_year)
         url_list_sql = ", ".join(f"'{u}'" for u in urls)
         placeholders = ", ".join(["?"] * len(clean_syms))
+        sel = self._select_clause(columns)
         return self.con.execute(
-            f"SELECT * FROM read_parquet([{url_list_sql}]) WHERE Symbol IN ({placeholders}) ORDER BY Symbol, Date ASC",
-            clean_syms,
+            f"""
+            SELECT {sel}
+            FROM read_parquet([{url_list_sql}])
+            WHERE Symbol IN ({placeholders})
+              AND EXTRACT(YEAR FROM CAST(Date AS DATE)) BETWEEN ? AND ?
+            ORDER BY Symbol, Date ASC
+            """,
+            [*clean_syms, start_year, end_year],
         ).df()
 
     def financials(self, symbol: str, period_type: str = "Quarterly") -> pd.DataFrame:

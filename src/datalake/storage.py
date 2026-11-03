@@ -167,6 +167,8 @@ def write_parquet_atomic(
                 compression="zstd",
                 index=False,
                 row_group_size=row_group_size,
+                write_page_index=True,
+                data_page_size=64 * 1024,
             )
         else:
             clean_df.to_pickle(tmp_path)

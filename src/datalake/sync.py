@@ -9,10 +9,12 @@ import os
 import shutil
 import time
 from pathlib import Path
+import pandas as pd
 
-from datalake.config import now_ist
+from datalake.config import now_ist, today_ist
 from datalake.engine import UnifiedLakeEngine
 from datalake.http_client import ARCHIVE_HEADERS, ResilientHTTPClient
+from datalake.storage import read_table_safe, write_parquet_atomic
 
 logger = logging.getLogger("datalake.sync")
 
@@ -50,6 +52,93 @@ def build_manifest(data_dir: Path) -> dict:
     return manifest
 
 
+def build_compacted_equity_bundles(
+    data_dir: Path,
+    staging_dir: Path,
+    manifest: dict,
+    old_manifest: dict | None = None,
+    remote_sizes: dict[str, int] | None = None,
+) -> dict[str, dict]:
+    """
+    Compacts all completed historical years (< current_year) into a single
+    `(Symbol, Date)`-sorted Parquet bundle per exchange (`compacted__nse_cm_hist.parquet`
+    and `compacted__bse_cm_hist.parquet`) so multi-decade RemoteLakeClient queries
+    only read 2 files (hist + current_year) instead of 32 files.
+    """
+    eq_dir = data_dir / "equities"
+    if not eq_dir.exists():
+        return {}
+
+    current_year = today_ist().year
+    compacted_meta: dict[str, dict] = {}
+    old_files = (old_manifest or {}).get("files", {})
+    old_compacted = (old_manifest or {}).get("compacted_files", {})
+
+    for exch in ("nse", "bse"):
+        hist_files = []
+        for pq in sorted(eq_dir.glob(f"{exch}_cm_*.parquet")):
+            yr_str = pq.stem.split("_")[-1]
+            if yr_str.isdigit() and int(yr_str) < current_year:
+                hist_files.append((int(yr_str), pq))
+
+        if not hist_files:
+            continue
+
+        asset_name = f"compacted__{exch}_cm_hist.parquet"
+        min_yr, max_yr = hist_files[0][0], hist_files[-1][0]
+
+        # Check if all underlying historical yearly files are unchanged since previous manifest
+        hist_unchanged = bool(old_compacted.get(asset_name)) and all(
+            old_files.get(p.relative_to(data_dir).as_posix(), {}).get("sha256")
+            == manifest["files"].get(p.relative_to(data_dir).as_posix(), {}).get("sha256")
+            for _, p in hist_files
+        )
+        prev_meta = old_compacted.get(asset_name, {})
+        on_remote = (
+            remote_sizes is not None
+            and prev_meta.get("size_bytes") is not None
+            and remote_sizes.get(asset_name) == prev_meta.get("size_bytes")
+        )
+
+        if hist_unchanged and on_remote:
+            compacted_meta[asset_name] = prev_meta
+            logger.info("[Release Stage] %s unchanged on remote (%d..%d); skipping rebuild.", asset_name, min_yr, max_yr)
+            continue
+
+        logger.info("[Release Stage] Building %s (%d..%d across %d files)...", asset_name, min_yr, max_yr, len(hist_files))
+        frames = [read_table_safe(p) for _, p in hist_files]
+        frames = [f for f in frames if not f.empty]
+        if not frames:
+            continue
+
+        combined = pd.concat(frames, ignore_index=True)
+        del frames
+        sort_cols = ["Symbol", "Date"] if exch == "nse" else ["InstrumentId", "Date"]
+        valid_sort = [c for c in sort_cols if c in combined.columns]
+        if valid_sort:
+            combined = combined.sort_values(valid_sort).reset_index(drop=True)
+
+        dst = staging_dir / asset_name
+        write_parquet_atomic(combined, dst, row_group_size=5_000, already_sanitized=True)
+        del combined
+        gc.collect()
+
+        sz = dst.stat().st_size
+        if sz >= 1_950_000_000:
+            dst.unlink(missing_ok=True)
+            continue
+
+        compacted_meta[asset_name] = {
+            "asset_name": asset_name,
+            "min_year": min_yr,
+            "max_year": max_yr,
+            "size_bytes": sz,
+            "sha256": compute_sha256(dst),
+        }
+
+    return compacted_meta
+
+
 def prepare_release_staging(
     data_dir: Path,
     staging_dir: Path,
@@ -68,6 +157,7 @@ def prepare_release_staging(
     data_dir = data_dir.resolve()
     staging_dir = staging_dir.resolve()
 
+    old_m: dict = {}
     old_shas: dict[str, str] = {}
     remote_sizes: dict[str, int] | None = None
     if previous_manifest_path and previous_manifest_path.exists():
@@ -98,6 +188,13 @@ def prepare_release_staging(
     if staging_dir.exists():
         shutil.rmtree(staging_dir)
     staging_dir.mkdir(parents=True, exist_ok=True)
+
+    compacted_meta = build_compacted_equity_bundles(
+        data_dir, staging_dir, manifest, old_manifest=old_m, remote_sizes=remote_sizes
+    )
+    if compacted_meta:
+        manifest["compacted_files"] = compacted_meta
+        (data_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     shutil.copy2(data_dir / "manifest.json", staging_dir / "manifest.json")
     if (data_dir / "state.db").exists():
@@ -144,6 +241,9 @@ def prune_retired_release_assets(
     try:
         manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
         valid = {m["asset_name"] for m in manifest_data.get("files", {}).values() if "asset_name" in m}
+        valid.update(
+            {m["asset_name"] for m in manifest_data.get("compacted_files", {}).values() if "asset_name" in m}
+        )
         valid.update({"manifest.json", "state.db"})
 
         if staging_dir and Path(staging_dir).exists():
