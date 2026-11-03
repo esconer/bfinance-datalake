@@ -164,6 +164,37 @@ class TestSyncEngine(unittest.TestCase):
             self.assertEqual(len(comp_df), 4)
             self.assertEqual(comp_df["Symbol"].tolist(), ["INFY", "INFY", "TCS", "TCS"])
 
+    def test_by_ticker_packs_generation(self):
+        with tempfile.TemporaryDirectory() as src_dir, tempfile.TemporaryDirectory() as stg_dir:
+            src = Path(src_dir)
+            stg = Path(stg_dir)
+            eq_dir = src / "equities"
+            eq_dir.mkdir(parents=True)
+
+            for yr in (2025, 2026):
+                df = pd.DataFrame({
+                    "Symbol": ["TCS", "INFY"],
+                    "Date": pd.to_datetime([f"{yr}-01-02", f"{yr}-01-02"]),
+                    "Close": [3500.0 + yr, 1500.0 + yr],
+                })
+                df.to_parquet(eq_dir / f"nse_cm_{yr}.parquet")
+
+            manifest = prepare_release_staging(src, stg)
+            self.assertIn("by_ticker_packs", manifest)
+            self.assertIn("by_ticker__nse_hist.pack", manifest["by_ticker_packs"])
+            self.assertIn("by_ticker__nse_curr.pack", manifest["by_ticker_packs"])
+            self.assertIn("by_ticker__nse_index.json", manifest["by_ticker_packs"])
+
+            self.assertTrue((stg / "by_ticker__nse_hist.pack").exists())
+            self.assertTrue((stg / "by_ticker__nse_curr.pack").exists())
+            self.assertTrue((stg / "by_ticker__nse_index.json").exists())
+
+            idx = json.loads((stg / "by_ticker__nse_index.json").read_text(encoding="utf-8"))
+            self.assertIn("TCS", idx["tickers"])
+            self.assertIn("INFY", idx["tickers"])
+            self.assertIn("hist", idx["tickers"]["TCS"])
+            self.assertIn("curr", idx["tickers"]["TCS"])
+
 
 if __name__ == "__main__":
     unittest.main()

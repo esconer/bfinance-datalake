@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
+import io
 import json
 import logging
 import os
@@ -239,6 +240,45 @@ class RemoteLakeClient:
         safe_cols = [f'"{c.replace(chr(34), "")}"' for c in columns]
         return ", ".join(safe_cols)
 
+    def _load_ticker_index(self) -> dict | None:
+        """Fetch and cache `by_ticker__nse_index.json` once per client session."""
+        if getattr(self, "_ticker_index_loaded", False):
+            return self._ticker_index
+        self._ticker_index_loaded = True
+        self._ticker_index: dict | None = None
+
+        idx_url = self._resolve_cdn_url(f"{self.base_url}/by_ticker__nse_index.json")
+        try:
+            if self._http_pool is not None:
+                resp = self._http_pool.get(idx_url, follow_redirects=True)
+                if resp.status_code == 200:
+                    self._ticker_index = resp.json()
+            else:
+                headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
+                req = urllib.request.Request(idx_url, headers=headers)
+                with urllib.request.urlopen(req, timeout=5.0) as resp:
+                    if resp.status == 200:
+                        self._ticker_index = json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            logger.debug("Per-ticker index not available, falling back to DuckDB httpfs: %s", exc)
+        return self._ticker_index
+
+    def _fetch_pack_slice(self, pack_filename: str, offset: int, length: int) -> pd.DataFrame:
+        """Fetch a single ticker's exact byte range (`Range: bytes=start-end`) and parse as Parquet."""
+        cdn_url = self._resolve_cdn_url(f"{self.base_url}/{pack_filename}")
+        end_byte = offset + length - 1
+        headers = {"Range": f"bytes={offset}-{end_byte}"}
+        if self._http_pool is not None:
+            resp = self._http_pool.get(cdn_url, headers=headers, follow_redirects=True)
+            raw_bytes = resp.content
+        else:
+            if self.token:
+                headers["Authorization"] = f"Bearer {self.token}"
+            req = urllib.request.Request(cdn_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15.0) as resp:
+                raw_bytes = resp.read()
+        return pd.read_parquet(io.BytesIO(raw_bytes))
+
     def history(
         self,
         symbol: str,
@@ -248,9 +288,49 @@ class RemoteLakeClient:
         columns: list[str] | None = None,
     ) -> pd.DataFrame:
         """
-        Stream a single stock's OHLCV + Delivery directly over HTTPS via HTTP Range requests.
-        Automatically uses the 2-file compacted layout (`hist` + `current_year`) when spanning multiple years.
+        Stream a single stock's OHLCV + Delivery over HTTPS.
+        - Fast Path (~120 ms): Uses `by_ticker__nse_index.json` + direct HTTP Range slice from packfile.
+        - Fallback Path: Uses two-tier compacted or yearly partitions via DuckDB `httpfs`.
         """
+        sym = self._clean_sym(symbol)
+        if start_year > end_year:
+            start_year, end_year = end_year, start_year
+
+        exch = exchange.upper()
+        if exch == "NSE":
+            idx_data = self._load_ticker_index()
+            if idx_data is not None:
+                aliases = idx_data.get("aliases", {})
+                canon_sym = aliases.get(sym, sym)
+                entry = idx_data.get("tickers", {}).get(canon_sym)
+                if entry is not None:
+                    cur_yr = int(idx_data.get("current_year", pd.Timestamp.now().year))
+                    tasks: list[tuple[str, int, int]] = []
+                    if start_year < cur_yr and "hist" in entry:
+                        tasks.append(("by_ticker__nse_hist.pack", entry["hist"][0], entry["hist"][1]))
+                    if end_year >= cur_yr and "curr" in entry:
+                        tasks.append(("by_ticker__nse_curr.pack", entry["curr"][0], entry["curr"][1]))
+
+                    if tasks:
+                        if len(tasks) == 1:
+                            frames = [self._fetch_pack_slice(*tasks[0])]
+                        else:
+                            with ThreadPoolExecutor(max_workers=2) as pool:
+                                frames = list(pool.map(lambda t: self._fetch_pack_slice(*t), tasks))
+                        df = pd.concat(frames, ignore_index=True)
+                        years = pd.to_datetime(df["Date"]).dt.year
+                        out = (
+                            df[(years >= start_year) & (years <= end_year)]
+                            .sort_values("Date")
+                            .reset_index(drop=True)
+                        )
+                        if columns:
+                            valid_cols = [c for c in columns if c in out.columns]
+                            if valid_cols:
+                                out = out[valid_cols]
+                        return out
+                    return pd.DataFrame()
+
         self._ensure_httpfs()
         sym = self._clean_sym(symbol)
         if start_year > end_year:

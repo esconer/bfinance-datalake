@@ -84,6 +84,40 @@ class TestRemoteAndStorageLayout(unittest.TestCase):
         self.assertTrue(urls[0].endswith("compacted__nse_cm_hist.parquet"))
         self.assertTrue(urls[1].endswith("equities__nse_cm_2026.parquet"))
 
+    def test_remote_client_pack_slice_history(self):
+        client = RemoteLakeClient("user/bfinance-datalake", load_httpfs=False)
+        client._ticker_index_loaded = True
+        client._ticker_index = {
+            "version": 1,
+            "current_year": 2026,
+            "aliases": {},
+            "tickers": {
+                "TCS": {
+                    "hist": [0, 100],
+                    "curr": [100, 50],
+                }
+            },
+        }
+
+        df_hist = pd.DataFrame({"Symbol": ["TCS"], "Date": pd.to_datetime(["2025-05-01"]), "Close": [3800.0]})
+        df_curr = pd.DataFrame({"Symbol": ["TCS"], "Date": pd.to_datetime(["2026-01-02"]), "Close": [3900.0]})
+
+        def mock_fetch(pack_fn, offset, length):
+            if "hist" in pack_fn:
+                return df_hist
+            return df_curr
+
+        client._fetch_pack_slice = mock_fetch
+
+        res = client.history("TCS", start_year=2024, end_year=2026, exchange="NSE")
+        self.assertEqual(len(res), 2)
+        self.assertEqual(res["Close"].tolist(), [3800.0, 3900.0])
+
+        res_filtered = client.history("TCS", start_year=2026, end_year=2026, exchange="NSE", columns=["Date", "Close"])
+        self.assertEqual(len(res_filtered), 1)
+        self.assertEqual(list(res_filtered.columns), ["Date", "Close"])
+        self.assertEqual(res_filtered["Close"].iloc[0], 3900.0)
+
 
 if __name__ == "__main__":
     unittest.main()

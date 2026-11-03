@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import gc
 import hashlib
+import io
 import json
 import logging
 import os
@@ -14,7 +16,8 @@ import pandas as pd
 from datalake.config import now_ist, today_ist
 from datalake.engine import UnifiedLakeEngine
 from datalake.http_client import ARCHIVE_HEADERS, ResilientHTTPClient
-from datalake.storage import read_table_safe, write_parquet_atomic
+from datalake.storage import read_table_safe, sanitize_for_parquet, write_parquet_atomic
+from datalake.symbols import SymbolRenameResolver
 
 logger = logging.getLogger("datalake.sync")
 
@@ -139,6 +142,197 @@ def build_compacted_equity_bundles(
     return compacted_meta
 
 
+def _serialize_ticker_parquet(df: pd.DataFrame) -> bytes:
+    """Serialize a single ticker's DataFrame into a compact Zstd Parquet byte slice."""
+    buf = io.BytesIO()
+    df.to_parquet(buf, compression="zstd", index=False)
+    return buf.getvalue()
+
+
+def _pack_frames_by_symbol(
+    frames: list[pd.DataFrame],
+    alias_to_canon: dict[str, str],
+    target_pack_path: Path,
+) -> dict[str, list[int]]:
+    """
+    Concatenates `frames`, maps historical renamed symbols to their canonical symbol,
+    serializes each symbol into an independent Parquet byte slice in parallel,
+    writes `target_pack_path`, and returns `{symbol: [byte_offset, byte_length]}`.
+    """
+    if not frames:
+        return {}
+
+    combined = sanitize_for_parquet(pd.concat(frames, ignore_index=True))
+    del frames
+    if combined.empty or "Symbol" not in combined.columns:
+        return {}
+
+    raw_sym = combined["Symbol"].astype(str).str.strip().str.upper()
+    combined["_CanonSym"] = raw_sym.map(lambda s: alias_to_canon.get(s, s))
+
+    if "Series" in combined.columns:
+        series_clean = combined["Series"].astype(str).str.strip().str.upper()
+        priority_map = {"EQ": 0, "BE": 1, "BZ": 1, "SM": 2}
+        combined["_SeriesPriority"] = series_clean.map(lambda s: priority_map.get(s, 9))
+        combined = (
+            combined.sort_values(["_CanonSym", "Date", "_SeriesPriority"])
+            .drop_duplicates(subset=["_CanonSym", "Date"], keep="first")
+            .drop(columns=["_SeriesPriority"])
+            .reset_index(drop=True)
+        )
+    else:
+        combined = (
+            combined.sort_values(["_CanonSym", "Date"])
+            .drop_duplicates(subset=["_CanonSym", "Date"], keep="last")
+            .reset_index(drop=True)
+        )
+
+    grouped: list[tuple[str, pd.DataFrame]] = [
+        (str(sym), grp.drop(columns=["_CanonSym"]).reset_index(drop=True))
+        for sym, grp in combined.groupby("_CanonSym", sort=True)
+    ]
+    del combined
+
+    with ThreadPoolExecutor(max_workers=min(8, (os.cpu_count() or 4))) as pool:
+        blobs = list(pool.map(lambda item: _serialize_ticker_parquet(item[1]), grouped))
+
+    offsets: dict[str, list[int]] = {}
+    cursor = 0
+    target_pack_path.parent.mkdir(parents=True, exist_ok=True)
+    with target_pack_path.open("wb") as f:
+        for (sym, _), blob in zip(grouped, blobs):
+            size = len(blob)
+            f.write(blob)
+            offsets[sym] = [cursor, size]
+            cursor += size
+
+    return offsets
+
+
+def build_by_ticker_packs(
+    data_dir: Path,
+    staging_dir: Path,
+    manifest: dict,
+    old_manifest: dict | None = None,
+    remote_sizes: dict[str, int] | None = None,
+) -> dict[str, dict]:
+    """
+    Builds Two-Tier Per-Ticker Packfiles (`by_ticker__nse_hist.pack`, `by_ticker__nse_curr.pack`,
+    and `by_ticker__nse_index.json`) at release staging time.
+    - `hist.pack` (< current_year) is only rebuilt if historical yearly partitions changed.
+    - `curr.pack` (== current_year) is rebuilt daily in ~1.5s.
+    """
+    eq_dir = data_dir / "equities"
+    if not eq_dir.exists():
+        return {}
+
+    current_year = today_ist().year
+    resolver = SymbolRenameResolver.from_lake(data_dir)
+
+    alias_to_canon: dict[str, str] = {}
+    for sym in list(resolver._back_edges.keys()) + list(resolver._fwd_edges.keys()):
+        chain = resolver.all_aliases(sym)
+        for al in chain:
+            alias_to_canon[al] = chain[0]
+
+    hist_files: list[Path] = []
+    curr_files: list[Path] = []
+    for pq in sorted(eq_dir.glob("nse_cm_*.parquet")):
+        yr_str = pq.stem.split("_")[-1]
+        if not yr_str.isdigit():
+            continue
+        if int(yr_str) < current_year:
+            hist_files.append(pq)
+        else:
+            curr_files.append(pq)
+
+    if not hist_files and not curr_files:
+        return {}
+
+    old_files = (old_manifest or {}).get("files", {})
+    old_packs = (old_manifest or {}).get("by_ticker_packs", {})
+
+    hist_pack_name = "by_ticker__nse_hist.pack"
+    curr_pack_name = "by_ticker__nse_curr.pack"
+    index_name = "by_ticker__nse_index.json"
+
+    hist_unchanged = (
+        bool(old_packs.get(hist_pack_name))
+        and bool(old_packs.get("hist_offsets"))
+        and all(
+            old_files.get(p.relative_to(data_dir).as_posix(), {}).get("sha256")
+            == manifest["files"].get(p.relative_to(data_dir).as_posix(), {}).get("sha256")
+            for p in hist_files
+        )
+    )
+    prev_hist_meta = old_packs.get(hist_pack_name, {})
+    hist_on_remote = (
+        remote_sizes is not None
+        and prev_hist_meta.get("size_bytes") is not None
+        and remote_sizes.get(hist_pack_name) == prev_hist_meta.get("size_bytes")
+    )
+
+    packs_meta: dict[str, dict] = {}
+    if hist_unchanged and hist_on_remote:
+        logger.info("[By-Ticker Pack] %s unchanged on remote; reusing cached offsets.", hist_pack_name)
+        hist_offsets: dict[str, list[int]] = old_packs["hist_offsets"]
+        packs_meta[hist_pack_name] = prev_hist_meta
+    elif hist_files:
+        logger.info("[By-Ticker Pack] Building %s across %d historical years...", hist_pack_name, len(hist_files))
+        hist_dst = staging_dir / hist_pack_name
+        hist_offsets = _pack_frames_by_symbol(
+            [read_table_safe(p) for p in hist_files], alias_to_canon, hist_dst
+        )
+        if hist_dst.exists():
+            packs_meta[hist_pack_name] = {
+                "asset_name": hist_pack_name,
+                "size_bytes": hist_dst.stat().st_size,
+                "sha256": compute_sha256(hist_dst),
+            }
+    else:
+        hist_offsets = {}
+
+    curr_offsets: dict[str, list[int]] = {}
+    if curr_files:
+        logger.info("[By-Ticker Pack] Building %s for current year %d...", curr_pack_name, current_year)
+        curr_dst = staging_dir / curr_pack_name
+        curr_offsets = _pack_frames_by_symbol(
+            [read_table_safe(p) for p in curr_files], alias_to_canon, curr_dst
+        )
+        if curr_dst.exists():
+            packs_meta[curr_pack_name] = {
+                "asset_name": curr_pack_name,
+                "size_bytes": curr_dst.stat().st_size,
+                "sha256": compute_sha256(curr_dst),
+            }
+
+    all_syms = sorted(set(hist_offsets.keys()) | set(curr_offsets.keys()))
+    tickers_index: dict[str, dict[str, list[int]]] = {}
+    for sym in all_syms:
+        entry: dict[str, list[int]] = {}
+        if sym in hist_offsets:
+            entry["hist"] = hist_offsets[sym]
+        if sym in curr_offsets:
+            entry["curr"] = curr_offsets[sym]
+        tickers_index[sym] = entry
+
+    index_payload = {
+        "version": 1,
+        "current_year": current_year,
+        "aliases": alias_to_canon,
+        "tickers": tickers_index,
+    }
+    index_dst = staging_dir / index_name
+    index_dst.write_text(json.dumps(index_payload, separators=(",", ":")), encoding="utf-8")
+    packs_meta[index_name] = {
+        "asset_name": index_name,
+        "size_bytes": index_dst.stat().st_size,
+        "sha256": compute_sha256(index_dst),
+    }
+    packs_meta["hist_offsets"] = hist_offsets
+    return packs_meta
+
+
 def prepare_release_staging(
     data_dir: Path,
     staging_dir: Path,
@@ -194,6 +388,14 @@ def prepare_release_staging(
     )
     if compacted_meta:
         manifest["compacted_files"] = compacted_meta
+
+    packs_meta = build_by_ticker_packs(
+        data_dir, staging_dir, manifest, old_manifest=old_m, remote_sizes=remote_sizes
+    )
+    if packs_meta:
+        manifest["by_ticker_packs"] = packs_meta
+
+    if compacted_meta or packs_meta:
         (data_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     shutil.copy2(data_dir / "manifest.json", staging_dir / "manifest.json")
@@ -243,6 +445,13 @@ def prune_retired_release_assets(
         valid = {m["asset_name"] for m in manifest_data.get("files", {}).values() if "asset_name" in m}
         valid.update(
             {m["asset_name"] for m in manifest_data.get("compacted_files", {}).values() if "asset_name" in m}
+        )
+        valid.update(
+            {
+                v["asset_name"]
+                for v in manifest_data.get("by_ticker_packs", {}).values()
+                if isinstance(v, dict) and "asset_name" in v
+            }
         )
         valid.update({"manifest.json", "state.db"})
 
