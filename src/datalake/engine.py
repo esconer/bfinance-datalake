@@ -350,11 +350,14 @@ class UnifiedLakeEngine:
             return df
         if period_type:
             df = df[df["PeriodType"].astype(str).str.lower() == period_type.lower()].copy()
-        if "NatureOfReport" in df.columns:
-            target_nat = "consolidated" if consolidated else "standalone"
-            sub = df[df["NatureOfReport"].astype(str).str.lower().str.contains(target_nat)]
-            if not sub.empty:
-                df = sub.copy()
+        if "NatureOfReport" in df.columns and not df.empty:
+            is_cons = df["NatureOfReport"].astype(str).str.lower().str.contains("consolidated")
+            df["_nat_prio"] = is_cons if consolidated else ~is_cons
+            df = (
+                df.sort_values(["PeriodEnd", "PeriodType", "_nat_prio"])
+                .drop_duplicates(subset=["PeriodType", "PeriodEnd"], keep="last")
+                .drop(columns=["_nat_prio"])
+            )
         return df.sort_values("PeriodEnd").reset_index(drop=True)
 
     financials = fundamentals
@@ -437,6 +440,27 @@ class UnifiedLakeEngine:
             df = df[dt_norm == dt_norm.max()]
         if expiry:
             df = df[pd.to_datetime(df["ExpiryDate"]).dt.normalize() == pd.Timestamp(expiry).normalize()]
+
+        if "UnderlyingPrice" in df.columns and df["UnderlyingPrice"].isna().all() and not df.empty:
+            try:
+                if sym in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"):
+                    idx_name = "NIFTY 50" if sym == "NIFTY" else ("NIFTY BANK" if sym == "BANKNIFTY" else sym)
+                    spot_df = self.index_history(idx_name)
+                    if not spot_df.empty and "Close" in spot_df.columns:
+                        spot_df["_dt"] = pd.to_datetime(spot_df["Date"]).dt.normalize()
+                        df_dt = pd.to_datetime(df["Date"]).dt.normalize()
+                        spot_map = dict(zip(spot_df["_dt"], spot_df["Close"]))
+                        df["UnderlyingPrice"] = df_dt.map(spot_map)
+                else:
+                    eq_df = self.history(sym, auto_adjust=False)
+                    if not eq_df.empty and "Close" in eq_df.columns:
+                        eq_df["_dt"] = pd.to_datetime(eq_df["Date"]).dt.normalize()
+                        df_dt = pd.to_datetime(df["Date"]).dt.normalize()
+                        eq_map = dict(zip(eq_df["_dt"], eq_df["Close"]))
+                        df["UnderlyingPrice"] = df_dt.map(eq_map)
+            except Exception:
+                pass
+
         return df.sort_values(["ExpiryDate", "StrikePrice", "OptionType"]).reset_index(drop=True)
 
     def index_history(
@@ -502,6 +526,84 @@ class UnifiedLakeEngine:
         if snap_path.exists():
             return self.sql(f"SELECT * FROM read_parquet('{snap_path.as_posix()}') {where}")
         return self.sql(f"SELECT * FROM equities_nse {where}")
+
+    def panel(
+        self,
+        queries_or_index: list[str | int] | str = "NIFTY 50",
+        field: str = "Adj Close",
+        start: str | date | None = None,
+        end: str | date | None = None,
+        auto_adjust: bool = True,
+    ) -> pd.DataFrame:
+        """
+        Returns a clean, date-aligned 2D (Date x Symbol) wide DataFrame for a list of symbols
+        or a named index ('NIFTY 50', 'NIFTY 100', 'NIFTY 500') in a single vectorized pass.
+        """
+        if isinstance(queries_or_index, str):
+            pit_path = self.root / "universe" / "nifty_constituents_pit.parquet"
+            if pit_path.exists():
+                pdf = read_table_safe(pit_path)
+                sub = pdf[pdf["IndexName"].astype(str).str.upper() == queries_or_index.strip().upper()]
+                symbols = sub["Symbol"].dropna().unique().tolist() if not sub.empty else [queries_or_index]
+            else:
+                symbols = [queries_or_index]
+        else:
+            symbols = list(queries_or_index)
+
+        dl = self.download(symbols, start=start, end=end, auto_adjust=auto_adjust)
+        if not dl:
+            return pd.DataFrame()
+
+        series_map = {}
+        for sym, df in dl.items():
+            col = field if field in df.columns else "Close"
+            if not df.empty and col in df.columns:
+                series_map[sym] = df.set_index("Date")[col]
+
+        return pd.DataFrame(series_map).sort_index()
+
+    def continuous_futures(
+        self,
+        symbol: str = "NIFTY",
+        contract: int = 1,
+        start: str | date | None = None,
+        end: str | date | None = None,
+        exchange: str = "NSE",
+    ) -> pd.DataFrame:
+        """
+        Stitches active futures contracts (FUTIDX / FUTSTK / IDF / STF) into a continuous
+        time-series (1=Near Month, 2=Next Month) ordered by nearest unexpired ExpiryDate.
+        """
+        sym = symbol.strip().upper()
+        exch = exchange.lower()
+        fo_dir = self.root / "derivatives"
+        if not fo_dir.exists():
+            return pd.DataFrame()
+
+        s_dt = pd.Timestamp(start) if start else pd.Timestamp("2000-06-12")
+        e_dt = pd.Timestamp(end) if end else pd.Timestamp.now().normalize()
+
+        frames = []
+        for yr in range(s_dt.year, e_dt.year + 1):
+            p = fo_dir / f"{exch}_fo_{yr}.parquet"
+            if p.exists():
+                sub = self._read_filtered_parquet(p, filters=[("Symbol", "==", sym), ("OptionType", "==", "XX")])
+                if not sub.empty:
+                    frames.append(sub)
+        if not frames:
+            return pd.DataFrame()
+
+        df = pd.concat(frames, ignore_index=True)
+        df["Date"] = pd.to_datetime(df["Date"]).dt.normalize()
+        df["ExpiryDate"] = pd.to_datetime(df["ExpiryDate"]).dt.normalize()
+        df = df[(df["Date"] >= s_dt) & (df["Date"] <= e_dt) & (df["ExpiryDate"] >= df["Date"])].copy()
+        if df.empty:
+            return df
+
+        df = df.sort_values(["Date", "ExpiryDate"])
+        df["_ContractRank"] = df.groupby("Date").cumcount() + 1
+        out = df[df["_ContractRank"] == contract].drop(columns=["_ContractRank"]).reset_index(drop=True)
+        return out
 
     def mutual_fund(self, scheme_code: int | str, start: str | date | None = None, end: str | date | None = None) -> pd.DataFrame:
         """Return historical NAV series for a Mutual Fund scheme code across 2006..2026."""
@@ -728,3 +830,29 @@ class LakeTicker:
     @property
     def insider_trades(self) -> pd.DataFrame:
         return self.engine.insider_trades(self.identity.symbol)
+
+    @property
+    def ttm_financials(self) -> pd.DataFrame:
+        """Compute Trailing 12-Month (4-quarter rolling sum) P&L metrics and margins."""
+        qdf = self.quarterly_financials.copy()
+        if qdf.empty:
+            return qdf
+        qdf["PeriodEnd_dt"] = pd.to_datetime(qdf["PeriodEnd"], format="mixed", dayfirst=True, errors="coerce")
+        qdf = qdf.sort_values("PeriodEnd_dt").reset_index(drop=True)
+
+        for c in ("PBT_Cr", "Interest_Cr", "Depreciation_Cr", "OtherIncome_Cr", "Sales_Cr", "NetProfit_Cr", "BasicEPS_Rs"):
+            if c not in qdf.columns:
+                qdf[c] = 0.0
+        qdf["EBITDA_Cr"] = (
+            qdf["PBT_Cr"].fillna(0.0)
+            + qdf["Interest_Cr"].fillna(0.0)
+            + qdf["Depreciation_Cr"].fillna(0.0)
+            - qdf["OtherIncome_Cr"].fillna(0.0)
+        ).round(4)
+
+        for col in ("Sales_Cr", "EBITDA_Cr", "PBT_Cr", "NetProfit_Cr", "BasicEPS_Rs"):
+            qdf[f"{col}_TTM"] = qdf[col].rolling(4, min_periods=4).sum().round(4)
+
+        qdf["OPM_Pct"] = ((qdf["EBITDA_Cr"] / qdf["Sales_Cr"].replace(0, float("nan"))) * 100.0).round(2)
+        qdf["NPM_Pct"] = ((qdf["NetProfit_Cr"] / qdf["Sales_Cr"].replace(0, float("nan"))) * 100.0).round(2)
+        return qdf

@@ -130,6 +130,12 @@ class OHLCVAdjuster:
             cum_split_factor[:-1] = 1.0 / rev_cum_splits[1:]
         cum_split_factor *= post_window_split_factor
 
+        # Detect Upstox-seeded historical rows (PrevClose and TurnoverValue are NaN)
+        # which are already split-adjusted at the exchange source
+        if "PrevClose" in out.columns and "TurnoverValue" in out.columns:
+            is_already_split_adj = out["PrevClose"].isna() & out["TurnoverValue"].isna()
+            cum_split_factor = np.where(is_already_split_adj.to_numpy(), 1.0, cum_split_factor)
+
         close_arr = out["Close"].to_numpy(dtype=float)
         div_arr = out["Dividends"].to_numpy(dtype=float)
         div_step = np.ones(len(out), dtype=float)
@@ -140,6 +146,22 @@ class OHLCVAdjuster:
             step = np.ones(len(out) - 1, dtype=float)
             step[valid] = 1.0 - (ex_divs[valid] / prev_close[valid])
             div_step[:-1] = np.cumprod(step[::-1])[::-1]
+
+            # Detect unparsed demergers or special corporate actions where exchange updated PrevClose
+            if "PrevClose" in out.columns:
+                prev_c_col = pd.to_numeric(out["PrevClose"], errors="coerce").to_numpy(dtype=float)[1:]
+                prior_close = close_arr[:-1]
+                unexplained_gap = (
+                    (split_mult[1:] == 1.0)
+                    & (div_arr[1:] == 0.0)
+                    & (prev_c_col > 0.0)
+                    & (prior_close > 0.0)
+                    & (np.abs(prev_c_col - prior_close) / prior_close > 0.015)
+                )
+                if unexplained_gap.any():
+                    demerger_step = np.ones(len(out) - 1, dtype=float)
+                    demerger_step[unexplained_gap] = prev_c_col[unexplained_gap] / prior_close[unexplained_gap]
+                    div_step[:-1] *= np.cumprod(demerger_step[::-1])[::-1]
 
         total_price_factor = cum_split_factor * div_step
         out["Adj Close"] = np.round(out["Close"] * total_price_factor, 4)

@@ -190,6 +190,13 @@ class XBRLScraper:
                 continue
 
             for item in filings:
+                filing_dt = (
+                    item.get("filingDate")
+                    or item.get("re_create_dt")
+                    or item.get("broadcastDate")
+                    or item.get("broadcast_dttm")
+                    or item.get("fromDate")
+                )
                 xbrl_url = item.get("xbrl")
                 if _is_valid_xbrl_url(xbrl_url):
                     filing_key = f"{sym}:{xbrl_url.split('/')[-1]}"
@@ -198,7 +205,7 @@ class XBRLScraper:
                             xml_resp = await self.http.get(xbrl_url, headers=ARCHIVE_HEADERS, prime_nse=True)
                             if xml_resp.status_code == 200 and b"<" in xml_resp.content[:200]:
                                 parsed_rows = self.parse_indas_xbrl(
-                                    xml_resp.content, default_symbol=sym, source_url=xbrl_url
+                                    xml_resp.content, default_symbol=sym, source_url=xbrl_url, filing_date=filing_dt
                                 )
                                 if parsed_rows:
                                     rows.extend(parsed_rows)
@@ -212,7 +219,7 @@ class XBRLScraper:
                         already_completed_filings += 1
 
                 # JSON Fallback when `xbrl` is `.../corporate/xbrl/-` or XML download unavailable
-                fb_row = self._extract_json_financial_row(item, sym, period)
+                fb_row = self._extract_json_financial_row(item, sym, period, filing_date=filing_dt)
                 if fb_row is not None:
                     rows.append(fb_row)
 
@@ -231,7 +238,12 @@ class XBRLScraper:
             self.state.record("xbrl_financials_symbol", sym, "HOLIDAY")
 
     @staticmethod
-    def _extract_json_financial_row(item: dict, default_symbol: str, default_period: str) -> dict | None:
+    def _extract_json_financial_row(
+        item: dict,
+        default_symbol: str,
+        default_period: str,
+        filing_date: str | None = None,
+    ) -> dict | None:
         to_dt = item.get("toDate") or item.get("periodEnd")
         from_dt = item.get("fromDate") or item.get("periodStart")
         if not to_dt:
@@ -259,6 +271,7 @@ class XBRLScraper:
             "PeriodType": default_period,
             "PeriodStart": str(from_dt).strip() if from_dt else None,
             "PeriodEnd": str(to_dt).strip(),
+            "FilingDate": str(filing_date).strip() if filing_date else None,
             "SourceURL": "https://www.nseindia.com/api/corporates-financial-results",
             "Sales_Cr": round(inc_lakhs / 100.0, 4) if inc_lakhs is not None else None,
             "PBT_Cr": round(pbt_lakhs / 100.0, 4) if pbt_lakhs is not None else None,
@@ -285,13 +298,22 @@ class XBRLScraper:
             return "Unknown"
 
     @classmethod
-    def parse_indas_xbrl(cls, xml_bytes: bytes, default_symbol: str, source_url: str) -> list[dict]:
+    def parse_indas_xbrl(
+        cls,
+        xml_bytes: bytes,
+        default_symbol: str,
+        source_url: str,
+        filing_date: str | None = None,
+    ) -> list[dict]:
         if not xml_bytes or not xml_bytes.strip():
             return []
         parser = etree.XMLParser(recover=True, huge_tree=True)
         root = etree.fromstring(xml_bytes, parser=parser)
         if root is None:
             return []
+
+        board_mtg = root.xpath("//*[local-name()='DateOfBoardMeetingWhenFinancialResultsWereApproved']/text()")
+        f_dt = board_mtg[0].strip() if board_mtg else filing_date
 
         contexts: dict[str, dict] = {}
         for ctx in root.xpath("//*[local-name()='context']"):
@@ -350,6 +372,7 @@ class XBRLScraper:
                             "PeriodType": cinfo["period_type"],
                             "PeriodStart": start_dt,
                             "PeriodEnd": end_dt,
+                            "FilingDate": f_dt,
                             "SourceURL": source_url,
                         },
                     )

@@ -128,6 +128,45 @@ class TestUnifiedLakeEngine(unittest.TestCase):
         scr = self.lake.screener()
         self.assertIsInstance(scr, pd.DataFrame)
 
+    def test_panel_and_continuous_futures(self):
+        pan = self.lake.panel(["RELIANCE"])
+        self.assertIsInstance(pan, pd.DataFrame)
+        cf = self.lake.continuous_futures("NIFTY")
+        self.assertIsInstance(cf, pd.DataFrame)
+
+    def test_ttm_financials(self):
+        t = self.lake.ticker("RELIANCE")
+        ttm = t.ttm_financials
+        self.assertIsInstance(ttm, pd.DataFrame)
+
+    def test_demerger_prevclose_adjustment(self):
+        from datalake.adjuster import OHLCVAdjuster
+        adj = OHLCVAdjuster(self.lake.root)
+        df = pd.DataFrame([
+            {"Date": pd.Timestamp("2023-07-19"), "Close": 2841.85, "PrevClose": 2800.0, "Open": 2800.0, "High": 2850.0, "Low": 2790.0, "Volume": 100},
+            {"Date": pd.Timestamp("2023-07-20"), "Close": 2600.00, "PrevClose": 2580.0, "Open": 2580.0, "High": 2610.0, "Low": 2570.0, "Volume": 100},
+        ])
+        res = adj.apply_adjustments(df, "RELIANCE", exchange="NSE")
+        self.assertAlmostEqual(res.loc[0, "Adj Close"], 2580.0, places=1)
+        self.assertAlmostEqual(res.loc[1, "Adj Close"], 2600.0, places=1)
+
+    def test_fundamentals_consolidated_standalone_fallback(self):
+        from unittest.mock import patch
+        df = pd.DataFrame([
+            {"Symbol": "TESTCO", "PeriodEnd": "2020-03-31", "PeriodType": "Quarterly", "NatureOfReport": "Standalone", "Sales_Cr": 100.0},
+            {"Symbol": "TESTCO", "PeriodEnd": "2021-03-31", "PeriodType": "Quarterly", "NatureOfReport": "Standalone", "Sales_Cr": 120.0},
+            {"Symbol": "TESTCO", "PeriodEnd": "2021-03-31", "PeriodType": "Quarterly", "NatureOfReport": "Consolidated", "Sales_Cr": 150.0},
+        ])
+        with patch.object(self.lake, "_read_filtered_parquet", return_value=df):
+            res = self.lake.fundamentals("TESTCO", consolidated=True)
+            self.assertEqual(len(res), 2)
+            row_2020 = res[res["PeriodEnd"] == "2020-03-31"].iloc[0]
+            self.assertEqual(row_2020["Sales_Cr"], 100.0)
+            self.assertEqual(row_2020["NatureOfReport"], "Standalone")
+            row_2021 = res[res["PeriodEnd"] == "2021-03-31"].iloc[0]
+            self.assertEqual(row_2021["Sales_Cr"], 150.0)
+            self.assertEqual(row_2021["NatureOfReport"], "Consolidated")
+
 
 if __name__ == "__main__":
     unittest.main()
