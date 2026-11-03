@@ -295,11 +295,43 @@ class UnifiedLakeEngine:
             out = self._dedup_nse_equity_series(out)
         return out.sort_values("Date").drop_duplicates(subset=["Date"], keep="last").reset_index(drop=True)
 
+    @staticmethod
+    def _resolve_period_start(period: str | None, end_dt: pd.Timestamp) -> pd.Timestamp:
+        if not period:
+            return pd.Timestamp("1994-01-01")
+        p = str(period).strip().lower()
+        if p == "max":
+            return pd.Timestamp("1994-01-01")
+        if p == "ytd":
+            return pd.Timestamp(year=end_dt.year, month=1, day=1)
+        offsets = {
+            "1d": pd.DateOffset(days=1),
+            "5d": pd.DateOffset(days=7),
+            "1mo": pd.DateOffset(months=1),
+            "3mo": pd.DateOffset(months=3),
+            "6mo": pd.DateOffset(months=6),
+            "1y": pd.DateOffset(years=1),
+            "2y": pd.DateOffset(years=2),
+            "3y": pd.DateOffset(years=3),
+            "5y": pd.DateOffset(years=5),
+            "10y": pd.DateOffset(years=10),
+        }
+        if p in offsets:
+            return (end_dt - offsets[p]).normalize()
+        if p.endswith("y") and p[:-1].isdigit():
+            return (end_dt - pd.DateOffset(years=int(p[:-1]))).normalize()
+        if p.endswith("mo") and p[:-2].isdigit():
+            return (end_dt - pd.DateOffset(months=int(p[:-2]))).normalize()
+        if p.endswith("d") and p[:-1].isdigit():
+            return (end_dt - pd.DateOffset(days=int(p[:-1]))).normalize()
+        return pd.Timestamp("1994-01-01")
+
     def history(
         self,
         query: str | int,
         start: str | date | None = None,
         end: str | date | None = None,
+        period: str | None = None,
         exchange: str = "NSE",
         auto_adjust: bool = False,
     ) -> pd.DataFrame:
@@ -307,8 +339,8 @@ class UnifiedLakeEngine:
         Fetch daily OHLCV + Delivery + Dividends + Stock Splits + Adj Close across 1995..2026
         in milliseconds (automatically stitching symbol renames like INFOSYSTCH -> INFY).
         """
-        s_dt = pd.Timestamp(start) if start else pd.Timestamp("1994-01-01")
-        e_dt = pd.Timestamp(end) if end else pd.Timestamp.now().normalize()
+        e_dt = pd.Timestamp(end).normalize() if end else pd.Timestamp.now().normalize()
+        s_dt = pd.Timestamp(start).normalize() if start else self._resolve_period_start(period, e_dt)
         ident = self.resolve(query)
         load_end_yr = max(e_dt.year, pd.Timestamp.now().year)
 
@@ -332,12 +364,14 @@ class UnifiedLakeEngine:
         queries: list[str | int],
         start: str | date | None = None,
         end: str | date | None = None,
+        period: str | None = None,
         exchange: str = "NSE",
         auto_adjust: bool = False,
     ) -> dict[str, pd.DataFrame]:
         """Vectorized multi-symbol OHLCV download reading each annual Parquet file only once."""
-        s_dt = pd.Timestamp(start) if start else pd.Timestamp("1994-01-01")
-        e_dt = pd.Timestamp(end) if end else pd.Timestamp.now().normalize()
+        e_dt = pd.Timestamp(end).normalize() if end else pd.Timestamp.now().normalize()
+        s_dt = pd.Timestamp(start).normalize() if start else self._resolve_period_start(period, e_dt)
+        load_end_yr = max(e_dt.year, pd.Timestamp.now().year)
         exch = exchange.upper()
         prefix = "nse_cm_" if exch == "NSE" else "bse_cm_"
         eq_dir = self.root / "equities"
@@ -349,7 +383,7 @@ class UnifiedLakeEngine:
         all_aliases = list(alias_to_canon.keys())
 
         frames = []
-        for yr in range(s_dt.year, e_dt.year + 1):
+        for yr in range(s_dt.year, load_end_yr + 1):
             p = eq_dir / f"{prefix}{yr}.parquet"
             if p.exists():
                 sub = self._read_filtered_parquet(p, filters=[("Symbol", "in", all_aliases)])
@@ -574,13 +608,122 @@ class UnifiedLakeEngine:
                 pass
         return res
 
+    def _compute_live_screener_df(self) -> pd.DataFrame:
+        eq_dir = self.root / "equities"
+        if not eq_dir.exists() or not list(eq_dir.glob("nse_cm_*.parquet")):
+            return pd.DataFrame()
+        has_fin = (self.root / "fundamentals" / "xbrl_financials.parquet").exists()
+        has_shp = (self.root / "shareholding" / "nse_shareholding_summary.parquet").exists()
+
+        fin_cte = """
+            , latest_fin AS (
+                SELECT Symbol, PeriodEnd AS FinQuarter, Sales_Cr, PBT_Cr, NetProfit_Cr, BasicEPS_Rs
+                FROM (
+                    SELECT *, ROW_NUMBER() OVER (PARTITION BY Symbol ORDER BY PeriodEnd DESC) AS rn
+                    FROM financials WHERE PeriodType = 'Quarterly'
+                ) WHERE rn = 1
+            )
+        """ if has_fin else ""
+        shp_cte = """
+            , latest_shp AS (
+                SELECT Symbol, QuarterEnd AS ShpQuarter, PromoterPct, PromoterPledgedPct, MutualFundsPct, FPI_Pct, RetailPct
+                FROM (
+                    SELECT *, ROW_NUMBER() OVER (PARTITION BY Symbol ORDER BY QuarterEnd DESC) AS rn
+                    FROM shareholding
+                ) WHERE rn = 1
+            )
+        """ if has_shp else ""
+
+        fin_cols = ", f.FinQuarter, f.Sales_Cr, f.PBT_Cr, f.NetProfit_Cr, f.BasicEPS_Rs" if has_fin else ""
+        shp_cols = ", s.ShpQuarter, s.PromoterPct, s.PromoterPledgedPct, s.MutualFundsPct, s.FPI_Pct, s.RetailPct" if has_shp else ""
+        fin_join = "LEFT JOIN latest_fin f USING (Symbol)" if has_fin else ""
+        shp_join = "LEFT JOIN latest_shp s USING (Symbol)" if has_shp else ""
+
+        return self.sql(f"""
+            WITH recent_eq AS (
+                SELECT
+                    Symbol, Date, Close, Volume,
+                    AVG(Close) OVER (PARTITION BY Symbol ORDER BY Date ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) AS SMA_50,
+                    AVG(Close) OVER (PARTITION BY Symbol ORDER BY Date ROWS BETWEEN 199 PRECEDING AND CURRENT ROW) AS SMA_200,
+                    MAX(Close) OVER (PARTITION BY Symbol ORDER BY Date ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS High_52W,
+                    MIN(Close) OVER (PARTITION BY Symbol ORDER BY Date ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS Low_52W,
+                    ROW_NUMBER() OVER (PARTITION BY Symbol ORDER BY Date DESC) AS rn
+                FROM equities_nse
+            ),
+            latest_eq AS (
+                SELECT * EXCLUDE (rn) FROM recent_eq WHERE rn = 1
+            )
+            {fin_cte}
+            {shp_cte}
+            SELECT e.* {fin_cols} {shp_cols}
+            FROM latest_eq e
+            {fin_join}
+            {shp_join}
+            ORDER BY e.Volume DESC NULLS LAST
+        """)
+
     def screener(self, sql_filter: str | None = None) -> pd.DataFrame:
-        """Query latest market screener snapshot locally or run cross-sectional analysis."""
+        """Query latest market screener snapshot locally or compute cross-sectional view on the fly."""
         snap_path = self.root / "snapshots" / "market_screener_latest.parquet"
         where = f"WHERE {sql_filter}" if sql_filter else ""
         if snap_path.exists():
             return self.sql(f"SELECT * FROM read_parquet('{snap_path.as_posix()}') {where}")
-        return self.sql(f"SELECT * FROM equities_nse {where}")
+        base_df = self._compute_live_screener_df()
+        if base_df.empty or not sql_filter:
+            return base_df
+        if HAS_DUCKDB and duckdb is not None:
+            con = duckdb.connect(":memory:")
+            con.register("_snap", base_df)
+            return con.execute(f"SELECT * FROM _snap {where}").df()
+        return base_df
+
+    def fii_dii_flows(self, start: str | date | None = None, end: str | date | None = None) -> pd.DataFrame:
+        """Return daily Cash Market FII/FPI and DII net inflows/outflows (in Rs Crores)."""
+        p = self.root / "flows" / "cash_fii_dii_flows.parquet"
+        if not p.exists():
+            return pd.DataFrame()
+        df = read_table_safe(p)
+        if df.empty or "Date" not in df.columns:
+            return df
+        df["Date"] = pd.to_datetime(df["Date"])
+        if start:
+            df = df[df["Date"] >= pd.Timestamp(start)]
+        if end:
+            df = df[df["Date"] <= pd.Timestamp(end)]
+        return df.sort_values(["Date", "category"]).reset_index(drop=True)
+
+    def participant_oi(
+        self,
+        start: str | date | None = None,
+        end: str | date | None = None,
+        client_type: str | None = None,
+    ) -> pd.DataFrame:
+        """Return NSE F&O Participant Open Interest breakdown (Client, DII, FII, Pro)."""
+        fl_dir = self.root / "flows"
+        if not fl_dir.exists():
+            return pd.DataFrame()
+        s_yr = pd.Timestamp(start).year if start else 2012
+        e_yr = pd.Timestamp(end).year if end else pd.Timestamp.now().year
+        frames = []
+        for yr in range(s_yr, e_yr + 1):
+            p = fl_dir / f"fao_participant_oi_{yr}.parquet"
+            if p.exists():
+                sub = (
+                    self._read_filtered_parquet(p, filters=[("Client Type", "==", client_type)])
+                    if client_type
+                    else read_table_safe(p)
+                )
+                if not sub.empty:
+                    frames.append(sub)
+        if not frames:
+            return pd.DataFrame()
+        df = pd.concat(frames, ignore_index=True)
+        df["Date"] = pd.to_datetime(df["Date"])
+        if start:
+            df = df[df["Date"] >= pd.Timestamp(start)]
+        if end:
+            df = df[df["Date"] <= pd.Timestamp(end)]
+        return df.sort_values(["Date", "Client Type"]).reset_index(drop=True)
 
     def panel(
         self,
@@ -845,10 +988,17 @@ class LakeTicker:
         self,
         start: str | date | None = None,
         end: str | date | None = None,
+        period: str | None = None,
         exchange: str = "NSE",
         auto_adjust: bool = False,
     ) -> pd.DataFrame:
-        return self.engine.history(self.identity.symbol, start=start, end=end, exchange=exchange, auto_adjust=auto_adjust)
+        return self.engine.history(
+            self.identity.symbol, start=start, end=end, period=period, exchange=exchange, auto_adjust=auto_adjust
+        )
+
+    @property
+    def dossier(self) -> dict[str, pd.DataFrame]:
+        return self.engine.dossier(self.identity.symbol)
 
     @property
     def financials(self) -> pd.DataFrame:

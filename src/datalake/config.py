@@ -46,5 +46,6 @@ class LakeConfig:
             "flows",
             "deals",
             "documents",
+            "snapshots",
         ):
             (self.root_dir / sub).mkdir(parents=True, exist_ok=True)

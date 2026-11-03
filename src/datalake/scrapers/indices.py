@@ -31,6 +31,7 @@ CORE_NIFTY_INDICES = (
     "NIFTY METAL",
     "NIFTY REALTY",
     "NIFTY ENERGY",
+    "NIFTY 1D RATE INDEX",
 )
 
 
@@ -328,12 +329,24 @@ class IndicesScraper:
                         ok_records.append((key, len(df), raw_bytes, url))
 
                 if frames:
+                    batch_df = pd.concat(frames, ignore_index=True)
                     target = self.cfg.root_dir / "indices" / f"ind_close_all_{year}.parquet"
                     upsert_parquet_partition(
-                        pd.concat(frames, ignore_index=True),
+                        batch_df,
                         target,
                         dedup_cols=["Date", "IndexName"],
                         sort_cols=["Date", "IndexName"],
                     )
+                    # Also upsert India VIX into nifty_30y_ohlc_tri_pe.parquet for finengine regime/GARCH models
+                    vix_rows = batch_df[batch_df["IndexName"].astype(str).str.upper() == "INDIA VIX"].copy()
+                    if not vix_rows.empty:
+                        vix_rows["IndexName"] = "INDIA VIX"
+                        keep_vix = [c for c in ("Date", "IndexName", "Open", "High", "Low", "Close") if c in vix_rows.columns]
+                        upsert_parquet_partition(
+                            vix_rows[keep_vix],
+                            self.cfg.root_dir / "indices" / "nifty_30y_ohlc_tri_pe.parquet",
+                            dedup_cols=["Date", "IndexName"],
+                            sort_cols=["IndexName", "Date"],
+                        )
                     for key, r_cnt, raw_b, s_url in ok_records:
                         self.state.record(dataset, key, "OK", row_count=r_cnt, raw_bytes=raw_b, source_url=s_url)

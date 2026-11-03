@@ -296,6 +296,82 @@ class RemoteLakeClient:
                 pass
         return df
 
+    def _resolve_remote_symbol(self, symbol_or_code: str) -> str:
+        """Resolve NSE symbol, old alias, BSE 6-digit code, or 12-char ISIN via `by_ticker__nse_index.json`."""
+        s = self._clean_sym(symbol_or_code)
+        idx_data = self._load_ticker_index()
+        if not idx_data:
+            return s
+        if s in idx_data.get("aliases", {}):
+            return idx_data["aliases"][s]
+        if s.isdigit() and s in idx_data.get("bse_to_symbol", {}):
+            return idx_data["bse_to_symbol"][s]
+        if len(s) == 12 and s.startswith(("INE", "INF")) and s in idx_data.get("isin_to_symbol", {}):
+            return idx_data["isin_to_symbol"][s]
+        return s
+
+    @staticmethod
+    def _apply_pack_actions(df: pd.DataFrame, actions_list: list[list], auto_adjust: bool = False) -> pd.DataFrame:
+        """Vectorized in-memory OHLCV adjustment using compact action tuples `[ex_date, div, split_mult]`."""
+        import numpy as np
+        if df.empty:
+            return df
+        out = df.sort_values("Date").reset_index(drop=True).copy()
+        out["Date"] = pd.to_datetime(out["Date"]).dt.normalize()
+        out["Dividends"] = 0.0
+        out["Stock Splits"] = 0.0
+
+        post_window_split = 1.0
+        if actions_list:
+            trading_dates = out["Date"].to_numpy()
+            min_dt, max_dt = trading_dates[0], trading_dates[-1]
+            for ex_str, div_val, split_val in actions_list:
+                ex_dt = pd.Timestamp(ex_str).normalize().to_datetime64()
+                if min_dt <= ex_dt <= max_dt:
+                    idx = int(np.searchsorted(trading_dates, ex_dt, side="left"))
+                    if 0 <= idx < len(out):
+                        if div_val > 0:
+                            out.loc[idx, "Dividends"] += float(div_val)
+                        if split_val != 1.0:
+                            cur_s = out.loc[idx, "Stock Splits"]
+                            out.loc[idx, "Stock Splits"] = float(split_val) if cur_s == 0.0 else cur_s * float(split_val)
+                elif ex_dt > max_dt and split_val != 1.0:
+                    post_window_split /= float(split_val)
+
+        split_mult = out["Stock Splits"].replace(0.0, 1.0).to_numpy(dtype=float)
+        rev_cum_splits = np.cumprod(split_mult[::-1])[::-1]
+        cum_split = np.ones(len(out), dtype=float)
+        if len(out) > 1:
+            cum_split[:-1] = 1.0 / rev_cum_splits[1:]
+        cum_split *= post_window_split
+
+        if "PrevClose" in out.columns and "TurnoverValue" in out.columns:
+            is_already_adj = out["PrevClose"].isna() & out["TurnoverValue"].isna()
+            cum_split = np.where(is_already_adj.to_numpy(), 1.0, cum_split)
+
+        close_arr = out["Close"].to_numpy(dtype=float)
+        div_arr = out["Dividends"].to_numpy(dtype=float)
+        div_step = np.ones(len(out), dtype=float)
+        if len(out) > 1:
+            prev_close = close_arr[:-1]
+            ex_divs = div_arr[1:]
+            valid = (ex_divs > 0.0) & (prev_close > 0.0) & (ex_divs < prev_close)
+            step = np.ones(len(out) - 1, dtype=float)
+            step[valid] = 1.0 - (ex_divs[valid] / prev_close[valid])
+            div_step[:-1] = np.cumprod(step[::-1])[::-1]
+
+        total_factor = cum_split * div_step
+        out["Adj Close"] = np.round(out["Close"] * total_factor, 4)
+        if auto_adjust:
+            for col in ("Open", "High", "Low", "Close"):
+                if col in out.columns:
+                    out[col] = np.round(out[col] * total_factor, 4)
+            for vcol in ("Volume", "DeliverableQty"):
+                if vcol in out.columns:
+                    out[vcol] = (out[vcol] / cum_split).round()
+            out["Dividends"] = np.round(out["Dividends"] * cum_split, 4)
+        return out
+
     def history(
         self,
         symbol: str,
@@ -303,6 +379,7 @@ class RemoteLakeClient:
         end_year: int = 2026,
         exchange: str = "NSE",
         columns: list[str] | None = None,
+        auto_adjust: bool = False,
     ) -> pd.DataFrame:
         """
         Stream a single stock's OHLCV + Delivery over HTTPS.
@@ -317,8 +394,7 @@ class RemoteLakeClient:
         if exch == "NSE":
             idx_data = self._load_ticker_index()
             if idx_data is not None:
-                aliases = idx_data.get("aliases", {})
-                canon_sym = aliases.get(sym, sym)
+                canon_sym = self._resolve_remote_symbol(sym)
                 entry = idx_data.get("tickers", {}).get(canon_sym)
                 if entry is not None:
                     cur_yr = int(idx_data.get("current_year", pd.Timestamp.now().year))
@@ -335,6 +411,8 @@ class RemoteLakeClient:
                             with ThreadPoolExecutor(max_workers=2) as pool:
                                 frames = list(pool.map(lambda t: self._fetch_pack_slice(*t), tasks))
                         df = pd.concat(frames, ignore_index=True)
+                        if "actions" in entry or auto_adjust:
+                            df = self._apply_pack_actions(df, entry.get("actions", []), auto_adjust=auto_adjust)
                         years = pd.to_datetime(df["Date"]).dt.year
                         out = (
                             df[(years >= start_year) & (years <= end_year)]
@@ -425,41 +503,57 @@ class RemoteLakeClient:
             [*clean_syms, start_year, end_year],
         ).df()
 
+    def _safe_query(self, query: str, params: list[Any] | None = None) -> pd.DataFrame:
+        """Execute a DuckDB SQL query, gracefully returning an empty DataFrame if remote asset is not found (HTTP 404)."""
+        try:
+            cursor = self.con.cursor()
+            if params:
+                return cursor.execute(query, params).df()
+            return cursor.execute(query).df()
+        except Exception as exc:
+            err_msg = str(exc)
+            if "404" in err_msg or "Not Found" in err_msg or "HTTP HEAD error" in err_msg:
+                logger.debug("Remote asset not found on %s: %s", self.tag, exc)
+                return pd.DataFrame()
+            raise
+
     def financials(self, symbol: str, period_type: str = "Quarterly") -> pd.DataFrame:
         """Stream a company's Ind-AS XBRL Financials over HTTPS in ~250ms."""
         self._ensure_httpfs()
         url = self._resolve_cdn_url(self._asset_url("fundamentals", "xbrl_financials.parquet"))
-        return self.con.cursor().execute(
+        return self._safe_query(
             f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ? AND PeriodType = ? ORDER BY PeriodEnd ASC",
             [self._clean_sym(symbol), period_type],
-        ).df()
+        )
 
     def shareholding(self, symbol: str) -> pd.DataFrame:
         """Stream a company's Shareholding & Promoter Pledge history over HTTPS in ~250ms."""
         self._ensure_httpfs()
         url = self._resolve_cdn_url(self._asset_url("shareholding", "nse_shareholding_summary.parquet"))
-        return self.con.cursor().execute(
+        return self._safe_query(
             f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ? ORDER BY QuarterEnd ASC",
             [self._clean_sym(symbol)],
-        ).df()
+        )
 
     def named_holders(self, symbol: str) -> pd.DataFrame:
         """Stream >1% institutional and named shareholders over HTTPS."""
         self._ensure_httpfs()
         url = self._resolve_cdn_url(self._asset_url("shareholding", "named_shareholders.parquet"))
-        return self.con.cursor().execute(
+        return self._safe_query(
             f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ? ORDER BY QuarterEnd DESC, PctOfTotal DESC",
             [self._clean_sym(symbol)],
-        ).df()
+        )
 
     def corporate_actions(self, symbol: str) -> pd.DataFrame:
         """Stream parsed corporate actions (splits, bonuses, dividends) over HTTPS."""
         self._ensure_httpfs()
         url = self._resolve_cdn_url(self._asset_url("actions", "nse_corporate_actions.parquet"))
-        df = self.con.cursor().execute(
+        df = self._safe_query(
             f"SELECT * FROM read_parquet('{url}') WHERE symbol = ? ORDER BY exDate ASC",
             [self._clean_sym(symbol)],
-        ).df()
+        )
+        if df.empty:
+            return df
         if "ExDate_1" in df.columns and "ExDate" not in df.columns:
             df["ExDate"] = pd.to_datetime(df["ExDate_1"], errors="coerce")
         elif "ExDate" not in df.columns and "exDate" in df.columns:
@@ -470,37 +564,37 @@ class RemoteLakeClient:
         """Stream 30-year Nifty index OHLC, TRI, P/E, P/B, and DivYield over HTTPS."""
         self._ensure_httpfs()
         url = self._resolve_cdn_url(self._asset_url("indices", "nifty_30y_ohlc_tri_pe.parquet"))
-        return self.con.cursor().execute(
+        return self._safe_query(
             f"SELECT * FROM read_parquet('{url}') WHERE UPPER(IndexName) = ? ORDER BY Date ASC",
             [index_name.strip().upper()],
-        ).df()
+        )
 
     def deals(self, symbol: str) -> pd.DataFrame:
         """Stream Bulk & Block deals for a symbol over HTTPS."""
         self._ensure_httpfs()
         url = self._resolve_cdn_url(self._asset_url("deals", "bulk_block_deals.parquet"))
-        return self.con.cursor().execute(
+        return self._safe_query(
             f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ? ORDER BY Date DESC",
             [self._clean_sym(symbol)],
-        ).df()
+        )
 
     def insider_trades(self, symbol: str) -> pd.DataFrame:
         """Stream SEBI PIT insider trading disclosures for a symbol over HTTPS."""
         self._ensure_httpfs()
         url = self._resolve_cdn_url(self._asset_url("deals", "insider_trading_pit.parquet"))
-        return self.con.cursor().execute(
+        return self._safe_query(
             f"SELECT * FROM read_parquet('{url}') WHERE symbol = ? ORDER BY date DESC",
             [self._clean_sym(symbol)],
-        ).df()
+        )
 
     def annual_reports(self, symbol: str) -> pd.DataFrame:
         """Stream 20-year Annual Report PDF links over HTTPS."""
         self._ensure_httpfs()
         url = self._resolve_cdn_url(self._asset_url("documents", "annual_reports.parquet"))
-        return self.con.cursor().execute(
+        return self._safe_query(
             f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ? ORDER BY Year DESC",
             [self._clean_sym(symbol)],
-        ).df()
+        )
 
     def concalls(self, scrip_code_or_symbol: str) -> pd.DataFrame:
         """Stream Concall Transcripts, Investor Presentations & Credit Ratings over HTTPS."""
@@ -508,20 +602,20 @@ class RemoteLakeClient:
         url = self._resolve_cdn_url(self._asset_url("documents", "concalls_and_filings.parquet"))
         q = str(scrip_code_or_symbol).strip()
         if q.isdigit():
-            return self.con.cursor().execute(
+            return self._safe_query(
                 f"SELECT * FROM read_parquet('{url}') WHERE ScripCode = ? ORDER BY FilingTimestamp DESC",
                 [q],
-            ).df()
-        return self.con.cursor().execute(
+            )
+        return self._safe_query(
             f"SELECT * FROM read_parquet('{url}') WHERE UPPER(CompanyName) LIKE ? ORDER BY FilingTimestamp DESC",
             [f"%{self._clean_sym(q)}%"],
-        ).df()
+        )
 
     def dossier(self, symbol: str) -> dict[str, pd.DataFrame]:
-        """Fetch Financials, Shareholding, Holders, Actions, Deals, Insider & Annual Reports in 1 HTTP Range call."""
+        """Fetch Financials, Shareholding, Holders, Actions, Deals, Insider, Concalls & Annual Reports in 1 HTTP Range call."""
         sym = self._clean_sym(symbol)
         idx_data = self._load_ticker_index() or {}
-        canon = idx_data.get("aliases", {}).get(sym, sym)
+        canon = self._resolve_remote_symbol(sym)
         loc = idx_data.get("tickers", {}).get(canon, {}).get("dossier")
         if not loc:
             return {}
@@ -541,12 +635,25 @@ class RemoteLakeClient:
         payload = json.loads(zlib.decompress(raw_bytes).decode("utf-8"))
         return {k: pd.DataFrame(v) for k, v in payload.items()}
 
+    def fii_dii_flows(self) -> pd.DataFrame:
+        """Stream Cash Market FII/FPI and DII net inflows/outflows over HTTPS."""
+        self._ensure_httpfs()
+        url = self._resolve_cdn_url(self._asset_url("flows", "cash_fii_dii_flows.parquet"))
+        return self._safe_query(f"SELECT * FROM read_parquet('{url}') ORDER BY Date DESC")
+
+    def participant_oi(self, year: int | None = None) -> pd.DataFrame:
+        """Stream NSE F&O Participant Open Interest breakdown over HTTPS."""
+        self._ensure_httpfs()
+        yr = year or pd.Timestamp.now().year
+        url = self._resolve_cdn_url(self._asset_url("flows", f"fao_participant_oi_{yr}.parquet"))
+        return self._safe_query(f"SELECT * FROM read_parquet('{url}') ORDER BY Date DESC, \"Client Type\"")
+
     def screener(self, sql_filter: str | None = None) -> pd.DataFrame:
         """Query the latest cross-sectional market screener snapshot (~400 KB) in ~120 ms."""
         self._ensure_httpfs()
         url = self._resolve_cdn_url(f"{self.base_url}/snapshots__market_screener_latest.parquet")
         where = f"WHERE {sql_filter}" if sql_filter else ""
-        return self.con.cursor().execute(f"SELECT * FROM read_parquet('{url}') {where}").df()
+        return self._safe_query(f"SELECT * FROM read_parquet('{url}') {where}")
 
     def option_chain(
         self,
@@ -562,21 +669,19 @@ class RemoteLakeClient:
         yr = year or pd.Timestamp.now().year
         url = self._resolve_cdn_url(self._asset_url("derivatives", f"nse_fo_{yr}.parquet"))
         if trade_date:
-            return self.con.cursor().execute(
+            return self._safe_query(
                 f"""SELECT * FROM read_parquet('{url}')
                 WHERE Symbol = ?
                   AND Date >= CAST(? AS TIMESTAMP)
                   AND Date < CAST(? AS TIMESTAMP) + INTERVAL 1 DAY
                 ORDER BY ExpiryDate, StrikePrice, OptionType""",
                 [symbol.strip().upper(), str(trade_date), str(trade_date)],
-            ).df()
-        return self.con.cursor().execute(
+            )
+        return self._safe_query(
             f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ? ORDER BY Date, ExpiryDate, StrikePrice",
             [symbol.strip().upper()],
-        ).df()
+        )
 
     def sql(self, query: str, params: list[Any] | None = None) -> pd.DataFrame:
         """Execute arbitrary analytical SQL over remote Parquet datasets via DuckDB."""
-        if params:
-            return self.con.cursor().execute(query, params).df()
-        return self.con.cursor().execute(query).df()
+        return self._safe_query(query, params)

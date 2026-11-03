@@ -213,6 +213,7 @@ def build_company_dossier_pack(
     data_dir: Path,
     staging_dir: Path,
     alias_to_canon: dict[str, str],
+    scrip_to_canon: dict[str, str] | None = None,
 ) -> dict[str, list[int]]:
     """
     Packs all 8 non-price datasets (Financials, Shareholding, >1% Holders, Corporate Actions,
@@ -221,28 +222,39 @@ def build_company_dossier_pack(
     """
     import zlib
 
+    scrip_map = scrip_to_canon or {}
     tables = {
-        "financials": ("fundamentals/xbrl_financials.parquet", "Symbol"),
-        "shareholding": ("shareholding/nse_shareholding_summary.parquet", "Symbol"),
-        "named_holders": ("shareholding/named_shareholders.parquet", "Symbol"),
-        "actions": ("actions/nse_corporate_actions.parquet", "symbol"),
-        "deals": ("deals/bulk_block_deals.parquet", "Symbol"),
-        "insider_trades": ("deals/insider_trading_pit.parquet", "symbol"),
-        "annual_reports": ("documents/annual_reports.parquet", "Symbol"),
-        "concalls": ("documents/concalls_and_filings.parquet", "CompanyName"),
+        "financials": ("fundamentals/xbrl_financials.parquet", "Symbol", None),
+        "shareholding": ("shareholding/nse_shareholding_summary.parquet", "Symbol", None),
+        "named_holders": ("shareholding/named_shareholders.parquet", "Symbol", None),
+        "actions": ("actions/nse_corporate_actions.parquet", "symbol", None),
+        "deals": ("deals/bulk_block_deals.parquet", "Symbol", None),
+        "insider_trades": ("deals/insider_trading_pit.parquet", "symbol", None),
+        "annual_reports": ("documents/annual_reports.parquet", "Symbol", "ScripCode"),
+        "concalls": ("documents/concalls_and_filings.parquet", "Symbol", "ScripCode"),
     }
 
     by_sym: dict[str, dict[str, list[dict]]] = {}
-    for key, (rel_path, sym_col) in tables.items():
+    for key, (rel_path, sym_col, scrip_col) in tables.items():
         p = data_dir / rel_path
         if not p.exists():
             continue
         df = read_table_safe(p)
-        if df.empty or sym_col not in df.columns:
+        if df.empty:
             continue
         for col in df.select_dtypes(include=["datetime64[ns]", "datetimetz"]).columns:
             df[col] = df[col].dt.strftime("%Y-%m-%d")
-        raw_s = df[sym_col].astype(str).str.strip().str.upper()
+
+        if sym_col in df.columns:
+            raw_s = df[sym_col].fillna("").astype(str).str.strip().str.upper()
+        else:
+            raw_s = pd.Series([""] * len(df), index=df.index)
+
+        if scrip_col and scrip_col in df.columns:
+            sc_s = df[scrip_col].fillna("").astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
+            mapped_sc = sc_s.map(lambda sc: scrip_map.get(sc, ""))
+            raw_s = raw_s.where(~raw_s.isin(["", "NAN", "NONE"]), mapped_sc)
+
         df["_CanonSym"] = raw_s.map(lambda s: alias_to_canon.get(s, s))
         for sym, grp in df.groupby("_CanonSym"):
             sym_str = str(sym).strip().upper()
@@ -269,48 +281,11 @@ def build_company_dossier_pack(
 def build_market_screener_snapshot(data_dir: Path, staging_dir: Path) -> dict | None:
     """
     Pre-joins latest EOD technicals with latest Quarterly Financials and Shareholding
-    into a single ~400 KB Parquet file.
+    into a single ~400 KB Parquet file (saved both to staging_dir and local data/snapshots/).
     """
     eng = UnifiedLakeEngine(data_dir)
     try:
-        df = eng.sql("""
-            WITH recent_eq AS (
-                SELECT
-                    Symbol, Date, Close, Volume, TurnoverValue, DeliveryPct,
-                    AVG(Close) OVER (PARTITION BY Symbol ORDER BY Date ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) AS SMA_50,
-                    AVG(Close) OVER (PARTITION BY Symbol ORDER BY Date ROWS BETWEEN 199 PRECEDING AND CURRENT ROW) AS SMA_200,
-                    MAX(Close) OVER (PARTITION BY Symbol ORDER BY Date ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS High_52W,
-                    MIN(Close) OVER (PARTITION BY Symbol ORDER BY Date ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS Low_52W,
-                    ROW_NUMBER() OVER (PARTITION BY Symbol ORDER BY Date DESC) AS rn
-                FROM equities_nse
-                WHERE Series = 'EQ' AND Date >= CURRENT_DATE - INTERVAL 400 DAY
-            ),
-            latest_eq AS (
-                SELECT * EXCLUDE (rn) FROM recent_eq WHERE rn = 1
-            ),
-            latest_fin AS (
-                SELECT Symbol, PeriodEnd AS FinQuarter, Sales_Cr, PBT_Cr, NetProfit_Cr, BasicEPS_Rs
-                FROM (
-                    SELECT *, ROW_NUMBER() OVER (PARTITION BY Symbol ORDER BY PeriodEnd DESC) AS rn
-                    FROM financials WHERE PeriodType = 'Quarterly'
-                ) WHERE rn = 1
-            ),
-            latest_shp AS (
-                SELECT Symbol, QuarterEnd AS ShpQuarter, PromoterPct, PromoterPledgedPct, MutualFundsPct, FPI_Pct, RetailPct
-                FROM (
-                    SELECT *, ROW_NUMBER() OVER (PARTITION BY Symbol ORDER BY QuarterEnd DESC) AS rn
-                    FROM shareholding
-                ) WHERE rn = 1
-            )
-            SELECT
-                e.*,
-                f.FinQuarter, f.Sales_Cr, f.PBT_Cr, f.NetProfit_Cr, f.BasicEPS_Rs,
-                s.ShpQuarter, s.PromoterPct, s.PromoterPledgedPct, s.MutualFundsPct, s.FPI_Pct, s.RetailPct
-            FROM latest_eq e
-            LEFT JOIN latest_fin f USING (Symbol)
-            LEFT JOIN latest_shp s USING (Symbol)
-            ORDER BY e.TurnoverValue DESC NULLS LAST
-        """)
+        df = eng._compute_live_screener_df()
     except Exception as exc:
         logger.debug("[Screener Snapshot] Note: %s", exc)
         return None
@@ -318,9 +293,12 @@ def build_market_screener_snapshot(data_dir: Path, staging_dir: Path) -> dict | 
     if df.empty:
         return None
 
+    local_snap = data_dir / "snapshots" / "market_screener_latest.parquet"
+    write_parquet_atomic(df, local_snap, row_group_size=5_000)
+
     asset_name = "snapshots__market_screener_latest.parquet"
     dst = staging_dir / asset_name
-    write_parquet_atomic(df, dst, row_group_size=5_000)
+    shutil.copy2(local_snap, dst)
     return {
         "asset_name": asset_name,
         "size_bytes": dst.stat().st_size,
@@ -337,22 +315,50 @@ def build_by_ticker_packs(
 ) -> dict[str, dict]:
     """
     Builds Two-Tier Per-Ticker Packfiles (`by_ticker__nse_hist.pack`, `by_ticker__nse_curr.pack`,
-    and `by_ticker__nse_index.json`) at release staging time.
-    - `hist.pack` (< current_year) is only rebuilt if historical yearly partitions changed.
-    - `curr.pack` (== current_year) is rebuilt daily in ~1.5s.
+    `by_ticker__nse_dossier.pack`, and `by_ticker__nse_index.json`) at release staging time.
     """
     eq_dir = data_dir / "equities"
     if not eq_dir.exists():
         return {}
 
     current_year = today_ist().year
-    resolver = SymbolRenameResolver.from_lake(data_dir)
+    eng = UnifiedLakeEngine(data_dir)
+    eng._ensure_crosswalk()
+    resolver = eng.resolver
 
     alias_to_canon: dict[str, str] = {}
     for sym in list(resolver._back_edges.keys()) + list(resolver._fwd_edges.keys()):
         chain = resolver.all_aliases(sym)
         for al in chain:
             alias_to_canon[al] = chain[0]
+    for al, ident in eng._by_symbol.items():
+        alias_to_canon[al] = ident.symbol
+
+    scrip_to_canon: dict[str, str] = {sc: ident.symbol for sc, ident in eng._by_bse.items()}
+    isin_to_canon: dict[str, str] = {isin: ident.symbol for isin, ident in eng._by_isin.items()}
+
+    # Pre-extract compact corporate action events per canonical symbol for instant remote Adj Close
+    compact_actions: dict[str, list[list]] = {}
+    act_df = eng.adjuster._load_actions("NSE")
+    if not act_df.empty and "symbol" in act_df.columns:
+        sub = act_df.copy()
+        if "ActionType" in sub.columns:
+            sub = sub[sub["ActionType"] != "SKIP_NON_EQUITY"].copy()
+        sub["ExDate"] = pd.to_datetime(sub["ExDate"], errors="coerce").dt.strftime("%Y-%m-%d")
+        sub["DividendPerShareRs"] = pd.to_numeric(sub["DividendPerShareRs"], errors="coerce").fillna(0.0)
+        sub["ShareMultiplier"] = pd.to_numeric(sub["ShareMultiplier"], errors="coerce").fillna(1.0)
+        sub = sub.dropna(subset=["ExDate"])
+        sub = sub[(sub["DividendPerShareRs"] > 0.0) | (sub["ShareMultiplier"] != 1.0)]
+        if not sub.empty:
+            sub["_Canon"] = sub["symbol"].astype(str).str.strip().str.upper().map(lambda s: alias_to_canon.get(s, s))
+            agg = sub.groupby(["_Canon", "ExDate"], as_index=False).agg(
+                {"DividendPerShareRs": "sum", "ShareMultiplier": "prod"}
+            ).sort_values(["_Canon", "ExDate"])
+            for c_sym, grp in agg.groupby("_Canon"):
+                compact_actions[str(c_sym)] = [
+                    [r["ExDate"], round(float(r["DividendPerShareRs"]), 4), round(float(r["ShareMultiplier"]), 6)]
+                    for r in grp.to_dict("records")
+                ]
 
     hist_files: list[Path] = []
     curr_files: list[Path] = []
@@ -426,7 +432,7 @@ def build_by_ticker_packs(
             }
 
     all_syms = sorted(set(hist_offsets.keys()) | set(curr_offsets.keys()))
-    dossier_offsets = build_company_dossier_pack(data_dir, staging_dir, alias_to_canon)
+    dossier_offsets = build_company_dossier_pack(data_dir, staging_dir, alias_to_canon, scrip_to_canon=scrip_to_canon)
     dossier_pack_name = "by_ticker__nse_dossier.pack"
     if dossier_offsets and (staging_dir / dossier_pack_name).exists():
         dst_dossier = staging_dir / dossier_pack_name
@@ -437,21 +443,25 @@ def build_by_ticker_packs(
         }
 
     all_syms = sorted(set(all_syms) | set(dossier_offsets.keys()))
-    tickers_index: dict[str, dict[str, list[int]]] = {}
+    tickers_index: dict[str, dict] = {}
     for sym in all_syms:
-        entry: dict[str, list[int]] = {}
+        entry: dict = {}
         if sym in hist_offsets:
             entry["hist"] = hist_offsets[sym]
         if sym in curr_offsets:
             entry["curr"] = curr_offsets[sym]
         if sym in dossier_offsets:
             entry["dossier"] = dossier_offsets[sym]
+        if sym in compact_actions:
+            entry["actions"] = compact_actions[sym]
         tickers_index[sym] = entry
 
     index_payload = {
         "version": 1,
         "current_year": current_year,
         "aliases": alias_to_canon,
+        "bse_to_symbol": scrip_to_canon,
+        "isin_to_symbol": isin_to_canon,
         "tickers": tickers_index,
     }
     index_dst = staging_dir / index_name

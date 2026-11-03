@@ -145,23 +145,35 @@ class OHLCVAdjuster:
             valid = (ex_divs > 0.0) & (prev_close > 0.0) & (ex_divs < prev_close)
             step = np.ones(len(out) - 1, dtype=float)
             step[valid] = 1.0 - (ex_divs[valid] / prev_close[valid])
-            div_step[:-1] = np.cumprod(step[::-1])[::-1]
 
-            # Detect unparsed demergers or special corporate actions where exchange updated PrevClose
+            # Detect demergers / special pre-open discovery where exchange lowered PrevClose on adjacent trading days
             if "PrevClose" in out.columns:
                 prev_c_col = pd.to_numeric(out["PrevClose"], errors="coerce").to_numpy(dtype=float)[1:]
                 prior_close = close_arr[:-1]
+                days_diff = out["Date"].diff().dt.days.to_numpy()[1:]
+                if "Series" in out.columns:
+                    s_arr = out["Series"].astype(str).str.strip().to_numpy()
+                    same_series = s_arr[1:] == s_arr[:-1]
+                else:
+                    same_series = np.ones(len(out) - 1, dtype=bool)
+
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    ratio = np.where(prior_close > 0.0, prev_c_col / prior_close, 1.0)
+
                 unexplained_gap = (
                     (split_mult[1:] == 1.0)
                     & (div_arr[1:] == 0.0)
                     & (prev_c_col > 0.0)
                     & (prior_close > 0.0)
-                    & (np.abs(prev_c_col - prior_close) / prior_close > 0.015)
+                    & (days_diff <= 7)
+                    & same_series
+                    & (ratio > 0.10)
+                    & (ratio < 0.985)
                 )
                 if unexplained_gap.any():
-                    demerger_step = np.ones(len(out) - 1, dtype=float)
-                    demerger_step[unexplained_gap] = prev_c_col[unexplained_gap] / prior_close[unexplained_gap]
-                    div_step[:-1] *= np.cumprod(demerger_step[::-1])[::-1]
+                    step[unexplained_gap] *= ratio[unexplained_gap]
+
+            div_step[:-1] = np.cumprod(step[::-1])[::-1]
 
         total_price_factor = cum_split_factor * div_step
         out["Adj Close"] = np.round(out["Close"] * total_price_factor, 4)

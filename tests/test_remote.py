@@ -152,6 +152,48 @@ class TestRemoteAndStorageLayout(unittest.TestCase):
             self.assertIn("financials", res)
             self.assertEqual(res["financials"].iloc[0]["Sales_Cr"], 200000.0)
 
+    def test_remote_symbol_crosswalk_resolution(self):
+        client = RemoteLakeClient("user/bfinance-datalake", load_httpfs=False)
+        client._ticker_index_loaded = True
+        client._ticker_index = {
+            "version": 1,
+            "aliases": {"INFOSYSTCH": "INFY"},
+            "bse_to_symbol": {"500325": "RELIANCE"},
+            "isin_to_symbol": {"INE002A01018": "RELIANCE"},
+            "tickers": {"RELIANCE": {}, "INFY": {}},
+        }
+        self.assertEqual(client._resolve_remote_symbol("500325"), "RELIANCE")
+        self.assertEqual(client._resolve_remote_symbol("INE002A01018"), "RELIANCE")
+        self.assertEqual(client._resolve_remote_symbol("INFOSYSTCH"), "INFY")
+        self.assertEqual(client._resolve_remote_symbol("TCS"), "TCS")
+
+    def test_remote_apply_pack_actions(self):
+        df = pd.DataFrame({
+            "Date": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]),
+            "Open": [100.0, 50.0, 52.0],
+            "High": [105.0, 55.0, 54.0],
+            "Low": [95.0, 48.0, 50.0],
+            "Close": [100.0, 50.0, 52.0],
+            "Volume": [1000.0, 2000.0, 1500.0],
+        })
+        # Split 2:1 on 2024-01-02, Div 5.0 on 2024-01-03
+        actions = [
+            ["2024-01-02", 0.0, 2.0],
+            ["2024-01-03", 5.0, 1.0],
+        ]
+        # Unadjusted: Adj Close has split and div factor applied, but Open/High/Low/Close untouched
+        out_raw = RemoteLakeClient._apply_pack_actions(df.copy(), actions, auto_adjust=False)
+        self.assertEqual(out_raw.loc[0, "Close"], 100.0)
+        self.assertAlmostEqual(out_raw.loc[0, "Adj Close"], 45.0, places=2)
+        self.assertEqual(out_raw.loc[1, "Stock Splits"], 2.0)
+        self.assertEqual(out_raw.loc[2, "Dividends"], 5.0)
+
+        # auto_adjust=True: Open/High/Low/Close replaced by adjusted prices
+        out_adj = RemoteLakeClient._apply_pack_actions(df.copy(), actions, auto_adjust=True)
+        self.assertAlmostEqual(out_adj.loc[0, "Close"], 45.0, places=2)
+        # Volume on day 0 adjusted for 2:1 split (1000 / 0.5 = 2000)
+        self.assertEqual(out_adj.loc[0, "Volume"], 2000.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -252,6 +252,92 @@ class TestUnifiedLakeEngine(unittest.TestCase):
             self.assertEqual(res.iloc[0]["QuarterEnd"], datetime.date(2026, 9, 30))
             self.assertEqual(res.iloc[0]["MutualFundsPct"], 15.0)
 
+    def test_period_resolution_and_ticker(self):
+        end = pd.Timestamp("2026-06-30")
+        s_1mo = UnifiedLakeEngine._resolve_period_start("1mo", end)
+        self.assertEqual(s_1mo, pd.Timestamp("2026-05-30"))
+
+        s_1y = UnifiedLakeEngine._resolve_period_start("1y", end)
+        self.assertEqual(s_1y, pd.Timestamp("2025-06-30"))
+
+        s_ytd = UnifiedLakeEngine._resolve_period_start("ytd", end)
+        self.assertEqual(s_ytd, pd.Timestamp("2026-01-01"))
+
+        s_max = UnifiedLakeEngine._resolve_period_start("max", end)
+        self.assertEqual(s_max, pd.Timestamp("1994-01-01"))
+
+        ticker = self.lake.ticker("RELIANCE")
+        h = ticker.history(period="1mo")
+        self.assertFalse(h.empty)
+
+        # Test ticker.dossier
+        d = ticker.dossier
+        self.assertIsInstance(d, dict)
+
+    def test_fii_dii_flows_and_participant_oi(self):
+        flows_dir = self.lake.root / "flows"
+        flows_dir.mkdir(parents=True, exist_ok=True)
+        f_df = pd.DataFrame([
+            {"Date": pd.Timestamp("2026-01-02"), "category": "FII/FPI", "buy_cr": 1000.0, "sell_cr": 800.0, "net_cr": 200.0},
+            {"Date": pd.Timestamp("2026-01-02"), "category": "DII", "buy_cr": 800.0, "sell_cr": 900.0, "net_cr": -100.0},
+        ])
+        f_df.to_parquet(flows_dir / "cash_fii_dii_flows.parquet")
+
+        oi_df = pd.DataFrame([
+            {"Date": pd.Timestamp("2026-01-02"), "Client Type": "Client", "Future Index Long": 10000},
+            {"Date": pd.Timestamp("2026-01-02"), "Client Type": "FII", "Future Index Long": 20000},
+        ])
+        oi_df.to_parquet(flows_dir / "fao_participant_oi_2026.parquet")
+
+        flows = self.lake.fii_dii_flows(start="2026-01-01")
+        self.assertEqual(len(flows), 2)
+
+        oi = self.lake.participant_oi(start="2026-01-01", client_type="FII")
+        self.assertEqual(len(oi), 1)
+        self.assertEqual(oi.iloc[0]["Client Type"], "FII")
+
+    def test_hardened_demerger_guard(self):
+        from datalake.adjuster import OHLCVAdjuster
+        adj = OHLCVAdjuster(self.lake.root)
+
+        # Case 1: Genuine demerger on consecutive trading days, same series, ratio ~ 0.85
+        df_demerger = pd.DataFrame({
+            "Date": pd.to_datetime(["2024-01-01", "2024-01-02"]),
+            "Series": ["EQ", "EQ"],
+            "Close": [1000.0, 850.0],
+            "PrevClose": [1000.0, 850.0],  # Exchange lowered PrevClose from 1000 to 850 (ratio 0.85)
+            "Dividends": [0.0, 0.0],
+            "Stock Splits": [0.0, 0.0],
+        })
+        out1 = adj.apply_adjustments(df_demerger.copy(), "TEST_DEMERGER", auto_adjust=False)
+        # Prior day Adj Close adjusted by 0.85 -> 850.0
+        self.assertAlmostEqual(out1.loc[0, "Adj Close"], 850.0, places=1)
+
+        # Case 2: Series change BE -> EQ with huge gap should NOT trigger demerger factor
+        df_series_switch = pd.DataFrame({
+            "Date": pd.to_datetime(["2024-01-01", "2024-01-02"]),
+            "Series": ["BE", "EQ"],
+            "Close": [1000.0, 850.0],
+            "PrevClose": [1000.0, 850.0],
+            "Dividends": [0.0, 0.0],
+            "Stock Splits": [0.0, 0.0],
+        })
+        out2 = adj.apply_adjustments(df_series_switch.copy(), "TEST_SERIES", auto_adjust=False)
+        # Different series -> demerger adjustment suppressed -> Adj Close is 1000.0
+        self.assertEqual(out2.loc[0, "Adj Close"], 1000.0)
+
+        # Case 3: Date gap > 7 days (e.g. multi-month suspension) should NOT trigger demerger
+        df_date_gap = pd.DataFrame({
+            "Date": pd.to_datetime(["2024-01-01", "2024-02-15"]),
+            "Series": ["EQ", "EQ"],
+            "Close": [1000.0, 850.0],
+            "PrevClose": [1000.0, 850.0],
+            "Dividends": [0.0, 0.0],
+            "Stock Splits": [0.0, 0.0],
+        })
+        out3 = adj.apply_adjustments(df_date_gap.copy(), "TEST_GAP", auto_adjust=False)
+        self.assertEqual(out3.loc[0, "Adj Close"], 1000.0)
+
 
 if __name__ == "__main__":
     unittest.main()
