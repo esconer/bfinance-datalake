@@ -31,6 +31,7 @@ CORE_NIFTY_INDICES = (
     "NIFTY METAL",
     "NIFTY REALTY",
     "NIFTY ENERGY",
+    "INDIA VIX",
     "NIFTY 1D RATE INDEX",
 )
 
@@ -350,3 +351,32 @@ class IndicesScraper:
                         )
                     for key, r_cnt, raw_b, s_url in ok_records:
                         self.state.record(dataset, key, "OK", row_count=r_cnt, raw_bytes=raw_b, source_url=s_url)
+
+        self.sync_vix_and_1d_rate_from_snapshots()
+
+    def sync_vix_and_1d_rate_from_snapshots(self) -> int:
+        """Extract INDIA VIX and NIFTY 1D RATE INDEX from ind_close_all_*.parquet into nifty_30y_ohlc_tri_pe.parquet."""
+        idx_dir = self.cfg.root_dir / "indices"
+        if not idx_dir.exists():
+            return 0
+        target_names = {"INDIA VIX": "INDIA VIX", "NIFTY 1D RATE INDEX": "NIFTY 1D RATE INDEX"}
+        extracted: list[pd.DataFrame] = []
+        for f in sorted(idx_dir.glob("ind_close_all_*.parquet")):
+            df = read_table_safe(f)
+            if df.empty or "IndexName" not in df.columns:
+                continue
+            upper_names = df["IndexName"].astype(str).str.strip().str.upper()
+            sub = df[upper_names.isin(target_names)].copy()
+            if not sub.empty:
+                sub["IndexName"] = upper_names[upper_names.isin(target_names)].map(target_names)
+                keep = [c for c in ("Date", "IndexName", "Open", "High", "Low", "Close", "PE", "PB", "DivYield") if c in sub.columns]
+                extracted.append(sub[keep])
+        if not extracted:
+            return 0
+        merged = pd.concat(extracted, ignore_index=True)
+        return upsert_parquet_partition(
+            merged,
+            idx_dir / "nifty_30y_ohlc_tri_pe.parquet",
+            dedup_cols=["Date", "IndexName"],
+            sort_cols=["IndexName", "Date"],
+        )

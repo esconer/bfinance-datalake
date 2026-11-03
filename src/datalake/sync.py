@@ -34,21 +34,38 @@ def compute_sha256(path: Path) -> str:
 def build_manifest(data_dir: Path) -> dict:
     """
     Build `data/manifest.json` mapping each relative path (e.g. 'equities/nse_cm_2026.parquet')
-    to its release asset filename ('equities__nse_cm_2026.parquet'), size_bytes, and sha256.
+    to its release asset filename ('equities__nse_cm_2026.parquet'), size_bytes, sha256, and latest_date watermark.
     """
     files_meta: dict[str, dict] = {}
+    latest_dates: dict[str, str] = {}
     for pq in sorted(data_dir.rglob("*.parquet")):
         rel = pq.relative_to(data_dir).as_posix()
         asset_name = rel.replace("/", "__")
-        files_meta[rel] = {
+        max_dt_str = None
+        try:
+            import pyarrow.parquet as pq_mod
+            pf = pq_mod.ParquetFile(pq)
+            if "Date" in pf.schema.names and pf.num_row_groups > 0:
+                d_df = pd.read_parquet(pq, columns=["Date"])
+                if not d_df.empty:
+                    max_dt_str = pd.to_datetime(d_df["Date"], errors="coerce").max().strftime("%Y-%m-%d")
+        except Exception:
+            pass
+        entry = {
             "asset_name": asset_name,
             "size_bytes": pq.stat().st_size,
             "sha256": compute_sha256(pq),
         }
+        if max_dt_str:
+            entry["latest_date"] = max_dt_str
+            latest_dates[rel] = max_dt_str
+        files_meta[rel] = entry
+
     manifest = {
         "version": 1,
         "generated_at": now_ist().isoformat(),
         "file_count": len(files_meta),
+        "latest_dates": latest_dates,
         "files": files_meta,
     }
     (data_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -153,9 +170,11 @@ def _pack_frames_by_symbol(
     frames: list[pd.DataFrame],
     alias_to_canon: dict[str, str],
     target_pack_path: Path,
+    adjuster: Any = None,
 ) -> dict[str, list[int]]:
     """
     Concatenates `frames`, maps historical renamed symbols to their canonical symbol,
+    deduplicates equity series, applies adjustments (Adj Close, Splits, Dividends),
     serializes each symbol into an independent Parquet byte slice in parallel,
     writes `target_pack_path`, and returns `{symbol: [byte_offset, byte_length]}`.
     """
@@ -170,27 +189,14 @@ def _pack_frames_by_symbol(
     raw_sym = combined["Symbol"].astype(str).str.strip().str.upper()
     combined["_CanonSym"] = raw_sym.map(lambda s: alias_to_canon.get(s, s))
 
-    if "Series" in combined.columns:
-        series_clean = combined["Series"].astype(str).str.strip().str.upper()
-        priority_map = {"EQ": 0, "BE": 1, "BZ": 1, "SM": 2}
-        combined["_SeriesPriority"] = series_clean.map(lambda s: priority_map.get(s, 9))
-        combined = (
-            combined.sort_values(["_CanonSym", "Date", "_SeriesPriority"])
-            .drop_duplicates(subset=["_CanonSym", "Date"], keep="first")
-            .drop(columns=["_SeriesPriority"])
-            .reset_index(drop=True)
-        )
-    else:
-        combined = (
-            combined.sort_values(["_CanonSym", "Date"])
-            .drop_duplicates(subset=["_CanonSym", "Date"], keep="last")
-            .reset_index(drop=True)
-        )
-
-    grouped: list[tuple[str, pd.DataFrame]] = [
-        (str(sym), grp.drop(columns=["_CanonSym"]).reset_index(drop=True))
-        for sym, grp in combined.groupby("_CanonSym", sort=True)
-    ]
+    grouped: list[tuple[str, pd.DataFrame]] = []
+    for sym, grp in combined.groupby("_CanonSym", sort=True):
+        clean_grp = UnifiedLakeEngine._dedup_nse_equity_series(grp.drop(columns=["_CanonSym"]))
+        if adjuster is not None:
+            clean_grp = adjuster.apply_adjustments(
+                clean_grp, str(sym), exchange="NSE", auto_adjust=False, include_future_splits=True
+            )
+        grouped.append((str(sym), clean_grp.reset_index(drop=True)))
     del combined
 
     with ThreadPoolExecutor(max_workers=min(8, (os.cpu_count() or 4))) as pool:
@@ -205,7 +211,6 @@ def _pack_frames_by_symbol(
             f.write(blob)
             offsets[sym] = [cursor, size]
             cursor += size
-
     return offsets
 
 
@@ -406,7 +411,7 @@ def build_by_ticker_packs(
         logger.info("[By-Ticker Pack] Building %s across %d historical years...", hist_pack_name, len(hist_files))
         hist_dst = staging_dir / hist_pack_name
         hist_offsets = _pack_frames_by_symbol(
-            [read_table_safe(p) for p in hist_files], alias_to_canon, hist_dst
+            [read_table_safe(p) for p in hist_files], alias_to_canon, hist_dst, adjuster=eng.adjuster
         )
         if hist_dst.exists():
             packs_meta[hist_pack_name] = {
@@ -422,7 +427,7 @@ def build_by_ticker_packs(
         logger.info("[By-Ticker Pack] Building %s for current year %d...", curr_pack_name, current_year)
         curr_dst = staging_dir / curr_pack_name
         curr_offsets = _pack_frames_by_symbol(
-            [read_table_safe(p) for p in curr_files], alias_to_canon, curr_dst
+            [read_table_safe(p) for p in curr_files], alias_to_canon, curr_dst, adjuster=eng.adjuster
         )
         if curr_dst.exists():
             packs_meta[curr_pack_name] = {
@@ -454,6 +459,15 @@ def build_by_ticker_packs(
             entry["dossier"] = dossier_offsets[sym]
         if sym in compact_actions:
             entry["actions"] = compact_actions[sym]
+        ident = eng._by_symbol.get(sym)
+        if ident is not None:
+            entry["meta"] = {
+                "bse_code": ident.bse_code,
+                "isin": ident.isin,
+                "company_name": ident.company_name,
+                "industry": ident.industry,
+                "face_value": ident.face_value,
+            }
         tickers_index[sym] = entry
 
     index_payload = {

@@ -26,8 +26,16 @@ _RS_DASH_GAP_RE = re.compile(r"((?:rs|re|inr|₹)\.?)[\s]*-[\s]*(?=\d)", re.I)
 _NON_EQUITY_ISSUE_RE = re.compile(
     r"\b(?:debenture|ncd|ccd|ccps|preference|ncrps|dvr|warrant|bond)\b", re.I
 )
+_FV_EXTRACT_RE = re.compile(
+    r"\b(?:face\s*value|fv|f\.v\.)\b\s*(?:of\s+)?(?:rs\.?|re\.?|₹|inr)?\s*[-:]?\s*(\d+(?:\.\d+)?)",
+    re.I,
+)
 _FV_NOISE_RE = re.compile(
-    r"(?:\b(?:on|of)\s+)?\b(?:face\s*value|fv|f\.v\.)\b\s*(?:of\s+)?(?:rs\.?|re\.?|₹|inr)?\s*[-:]?\s*\d+(?:\.\d+)?(?:\s*/-)?(?:\s*(?:each|per\s+share))?",
+    r"\(?[,\s]*(?:\b(?:on|of)\s+)?\b(?:face\s*value|fv|f\.v\.)\b\s*(?:of\s+)?(?:rs\.?|re\.?|₹|inr)?\s*[-:]?\s*\d+(?:\.\d+)?(?:\s*/-)?(?:\s*(?:each|per\s+share))?\s*\)?",
+    re.I,
+)
+_PCT_DIV_RE = re.compile(
+    r"\b(?:dividend|div)\b[^₹\d]*?(?:@\s*)?(\d+(?:\.\d+)?)\s*%",
     re.I,
 )
 _DIV_RE = re.compile(
@@ -42,7 +50,7 @@ _SPLIT_RE = re.compile(
 _RIGHTS_RE = re.compile(r"\brights?\b.*?(\d+)\s*:\s*(\d+)", re.I)
 
 
-def parse_action_purpose(text: str) -> dict:
+def parse_action_purpose(text: str, face_value: float | None = None) -> dict:
     """Parse raw NSE/BSE corporate action subject into structured numerical fields."""
     s = _RS_DASH_GAP_RE.sub(r"\1 ", str(text or "").strip())
     out = {
@@ -58,15 +66,25 @@ def parse_action_purpose(text: str) -> dict:
         out["ActionType"] = "SKIP_NON_EQUITY"
         return out
 
+    fv_match = _FV_EXTRACT_RE.search(s)
+    detected_fv = float(fv_match.group(1)) if fv_match else face_value
+
     clauses = re.split(r"[/;]|(?:\band\b)", s, flags=re.I)
     for clause in clauses:
         if re.search(r"buy\s*back|\brights?\b|split|sub[-\s]*division", clause, re.I):
             continue
         clean_clause = _FV_NOISE_RE.sub(" ", clause)
+        found_rs_div = False
         for m_div in _DIV_RE.finditer(clean_clause):
             val = float(m_div.group(1))
             out["DividendPerShareRs"] = (out["DividendPerShareRs"] or 0.0) + val
             out["ActionType"] = "DIVIDEND"
+            found_rs_div = True
+        if not found_rs_div and detected_fv and detected_fv > 0:
+            for m_pct in _PCT_DIV_RE.finditer(clean_clause):
+                pct = float(m_pct.group(1))
+                out["DividendPerShareRs"] = round((out["DividendPerShareRs"] or 0.0) + (pct / 100.0) * detected_fv, 4)
+                out["ActionType"] = "DIVIDEND"
 
     m_bon = _BONUS_RE.search(s)
     if m_bon:

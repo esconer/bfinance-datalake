@@ -7,6 +7,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import threading
 import time
 from typing import Any
 import urllib.request
@@ -51,6 +52,7 @@ class RemoteLakeClient:
         self.token = token or os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
         self.base_url = f"https://github.com/{self.repo}/releases/download/{tag}"
         self.con = duckdb.connect(":memory:")
+        self._lock = threading.Lock()
         self.cache_dir = Path(cache_dir).expanduser().resolve() if cache_dir else None
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -97,36 +99,37 @@ class RemoteLakeClient:
         self.close()
 
     def _ensure_httpfs(self) -> None:
-        if self._httpfs_loaded:
-            return
-        self._httpfs_loaded = True
-        try:
-            self.con.execute("LOAD httpfs;")
-        except Exception:
+        with self._lock:
+            if self._httpfs_loaded:
+                return
+            self._httpfs_loaded = True
             try:
-                self.con.execute("INSTALL httpfs; LOAD httpfs;")
-            except Exception as exc:
-                logger.warning("Could not load DuckDB httpfs extension: %s", exc)
-
-        for stmt in (
-            "SET enable_http_metadata_cache=true;",
-            "SET parquet_metadata_cache=true;",
-            "SET http_keep_alive=true;",
-            "SET http_retries=3;",
-        ):
-            try:
-                self.con.execute(stmt)
+                self.con.execute("LOAD httpfs;")
             except Exception:
-                pass
+                try:
+                    self.con.execute("INSTALL httpfs; LOAD httpfs;")
+                except Exception as exc:
+                    logger.warning("Could not load DuckDB httpfs extension: %s", exc)
 
-        if self.token:
-            try:
-                self.con.execute(
-                    "CREATE OR REPLACE SECRET gh_token (TYPE HTTP, EXTRA_HTTP_HEADERS MAP {'Authorization': ?});",
-                    [f"Bearer {self.token}"],
-                )
-            except Exception:
-                pass
+            for stmt in (
+                "SET enable_http_metadata_cache=true;",
+                "SET parquet_metadata_cache=true;",
+                "SET http_keep_alive=true;",
+                "SET http_retries=3;",
+            ):
+                try:
+                    self.con.execute(stmt)
+                except Exception:
+                    pass
+
+            if self.token:
+                try:
+                    self.con.execute(
+                        "CREATE OR REPLACE SECRET gh_token (TYPE HTTP, EXTRA_HTTP_HEADERS MAP {'Authorization': ?});",
+                        [f"Bearer {self.token}"],
+                    )
+                except Exception:
+                    pass
 
     def _asset_url(self, folder: str, filename: str) -> str:
         return f"{self.base_url}/{folder}__{filename}"
@@ -243,26 +246,27 @@ class RemoteLakeClient:
 
     def _load_ticker_index(self) -> dict | None:
         """Fetch and cache `by_ticker__nse_index.json` once per client session."""
-        if getattr(self, "_ticker_index_loaded", False):
-            return self._ticker_index
-        self._ticker_index_loaded = True
-        self._ticker_index: dict | None = None
+        with self._lock:
+            if getattr(self, "_ticker_index_loaded", False):
+                return self._ticker_index
+            self._ticker_index_loaded = True
+            self._ticker_index: dict | None = None
 
-        idx_url = self._resolve_cdn_url(f"{self.base_url}/by_ticker__nse_index.json")
-        try:
-            if self._http_pool is not None:
-                resp = self._http_pool.get(idx_url, follow_redirects=True)
-                if resp.status_code == 200:
-                    self._ticker_index = resp.json()
-            else:
-                headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
-                req = urllib.request.Request(idx_url, headers=headers)
-                with urllib.request.urlopen(req, timeout=5.0) as resp:
-                    if resp.status == 200:
-                        self._ticker_index = json.loads(resp.read().decode("utf-8"))
-        except Exception as exc:
-            logger.debug("Per-ticker index not available, falling back to DuckDB httpfs: %s", exc)
-        return self._ticker_index
+            idx_url = self._resolve_cdn_url(f"{self.base_url}/by_ticker__nse_index.json")
+            try:
+                if self._http_pool is not None:
+                    resp = self._http_pool.get(idx_url, follow_redirects=True)
+                    if resp.status_code == 200:
+                        self._ticker_index = resp.json()
+                else:
+                    headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
+                    req = urllib.request.Request(idx_url, headers=headers)
+                    with urllib.request.urlopen(req, timeout=5.0) as resp:
+                        if resp.status == 200:
+                            self._ticker_index = json.loads(resp.read().decode("utf-8"))
+            except Exception as exc:
+                logger.debug("Per-ticker index not available, falling back to DuckDB httpfs: %s", exc)
+            return self._ticker_index
 
     def _fetch_pack_slice(self, pack_filename: str, offset: int, length: int) -> pd.DataFrame:
         """Fetch a single ticker's exact byte range (`Range: bytes=start-end`) and parse as Parquet."""
@@ -411,8 +415,13 @@ class RemoteLakeClient:
                             with ThreadPoolExecutor(max_workers=2) as pool:
                                 frames = list(pool.map(lambda t: self._fetch_pack_slice(*t), tasks))
                         df = pd.concat(frames, ignore_index=True)
-                        if "actions" in entry or auto_adjust:
+                        if "actions" in entry and ("Adj Close" not in df.columns or df["Adj Close"].isna().all()):
                             df = self._apply_pack_actions(df, entry.get("actions", []), auto_adjust=auto_adjust)
+                        elif auto_adjust and "Adj Close" in df.columns and "Close" in df.columns:
+                            ratio = (df["Adj Close"] / df["Close"].replace(0, float("nan"))).fillna(1.0)
+                            for c in ("Open", "High", "Low", "Close"):
+                                if c in df.columns:
+                                    df[c] = (df[c] * ratio).round(4)
                         years = pd.to_datetime(df["Date"]).dt.year
                         out = (
                             df[(years >= start_year) & (years <= end_year)]
@@ -680,6 +689,47 @@ class RemoteLakeClient:
         return self._safe_query(
             f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ? ORDER BY Date, ExpiryDate, StrikePrice",
             [symbol.strip().upper()],
+        )
+
+    def panel(
+        self,
+        symbols: list[str],
+        field: str = "Adj Close",
+        start_year: int = 2024,
+        end_year: int = 2026,
+        exchange: str = "NSE",
+    ) -> pd.DataFrame:
+        """Stream a date-aligned 2D (Date x Symbol) matrix over HTTPS."""
+        df = self.download(symbols, start_year=start_year, end_year=end_year, exchange=exchange)
+        if df.empty:
+            return pd.DataFrame()
+        col = field if field in df.columns else "Close"
+        df["Date"] = pd.to_datetime(df["Date"]).dt.normalize()
+        return df.pivot_table(index="Date", columns="Symbol", values=col, aggfunc="last").sort_index()
+
+    def continuous_futures(
+        self,
+        symbol: str = "NIFTY",
+        contract: int = 1,
+        start_year: int = 2024,
+        end_year: int = 2026,
+    ) -> pd.DataFrame:
+        """Stream continuous front-month (1) or next-month (2) futures over HTTPS."""
+        self._ensure_httpfs()
+        raw_urls = [self._asset_url("derivatives", f"nse_fo_{yr}.parquet") for yr in range(start_year, end_year + 1)]
+        urls = self._resolve_cdn_urls_parallel(raw_urls)
+        url_sql = ", ".join(f"'{u}'" for u in urls)
+        return self._safe_query(
+            f"""
+            WITH active_fut AS (
+                SELECT *,
+                    ROW_NUMBER() OVER (PARTITION BY CAST(Date AS DATE) ORDER BY CAST(ExpiryDate AS DATE) ASC) AS rk
+                FROM read_parquet([{url_sql}])
+                WHERE Symbol = ? AND OptionType = 'XX' AND CAST(ExpiryDate AS DATE) >= CAST(Date AS DATE)
+            )
+            SELECT * EXCLUDE (rk) FROM active_fut WHERE rk = ? ORDER BY Date ASC
+            """,
+            [symbol.strip().upper(), contract],
         )
 
     def sql(self, query: str, params: list[Any] | None = None) -> pd.DataFrame:

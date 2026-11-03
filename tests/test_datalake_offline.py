@@ -558,6 +558,55 @@ def test_pass_3_audit_suite():
         assert st.is_completed("bse_shareholding", "599999") is True
 
 
+def test_after_fix_2_audit_suite():
+    # 1. Verify LakeDoctor OHLC & Shareholding domain invariants
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = LakeConfig(root_dir=Path(tmpdir))
+        cfg.ensure_dirs()
+        # Invalid OHLC: row 0 has Close <= 0 (should be dropped), row 1 has High < Low (should be swapped)
+        df_ohlc = pd.DataFrame({
+            "Date": [pd.Timestamp("2000-01-03"), pd.Timestamp("2000-01-04")],
+            "Symbol": ["A", "B"],
+            "Open": [10.0, 10.0],
+            "High": [12.0, 5.0],   # High < Low
+            "Low": [8.0, 15.0],
+            "Close": [0.0, 12.0],  # Close <= 0
+        })
+        write_parquet_atomic(df_ohlc, cfg.root_dir / "equities" / "nse_cm_2000.parquet")
+
+        # Invalid Shareholding: row 0 valid, row 1 invalid (>100.5%)
+        df_shp = pd.DataFrame({
+            "Symbol": ["A", "B"],
+            "QuarterEnd": ["2024-03-31", "2024-03-31"],
+            "PromoterPct": [50.0, 150.0],
+            "PublicPct": [45.0, 20.0],
+        })
+        write_parquet_atomic(df_shp, cfg.root_dir / "shareholding" / "nse_shareholding_summary.parquet")
+
+        doctor = LakeDoctor(cfg)
+        doctor.run_full_check_and_repair()
+
+        repaired_ohlc = read_table_safe(cfg.root_dir / "equities" / "nse_cm_2000.parquet")
+        assert len(repaired_ohlc) == 1, f"Expected 1 row after dropping Close<=0, got {len(repaired_ohlc)}"
+        assert repaired_ohlc.iloc[0]["High"] >= repaired_ohlc.iloc[0]["Low"], "High < Low was not repaired"
+
+        repaired_shp = read_table_safe(cfg.root_dir / "shareholding" / "nse_shareholding_summary.parquet")
+        assert len(repaired_shp) == 1, f"Expected 1 valid shareholding row, got {len(repaired_shp)}"
+        assert repaired_shp.iloc[0]["Symbol"] == "A"
+
+    # 2. Verify build_manifest produces latest_dates watermarks
+    from datalake.sync import build_manifest
+    with tempfile.TemporaryDirectory() as tmpdir:
+        t_path = Path(tmpdir)
+        eq_dir = t_path / "equities"
+        eq_dir.mkdir(parents=True)
+        df_m = pd.DataFrame({"Date": [pd.Timestamp("2026-02-15")], "Symbol": ["TEST"], "Close": [100.0]})
+        write_parquet_atomic(df_m, eq_dir / "nse_cm_2026.parquet")
+        manifest = build_manifest(t_path)
+        assert "latest_dates" in manifest
+        assert manifest["latest_dates"]["equities/nse_cm_2026.parquet"] == "2026-02-15"
+
+
 if __name__ == "__main__":
     test_corporate_action_regex_parser()
     test_repair_ohlc_and_bse_debt_filter()
@@ -571,4 +620,5 @@ if __name__ == "__main__":
     test_pass_1_audit_suite()
     test_pass_2_audit_suite()
     test_pass_3_audit_suite()
+    test_after_fix_2_audit_suite()
     print("ALL OFFLINE UNIT & INTEGRATION TESTS PASSED!")

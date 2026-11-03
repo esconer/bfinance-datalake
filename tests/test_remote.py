@@ -194,6 +194,21 @@ class TestRemoteAndStorageLayout(unittest.TestCase):
         # Volume on day 0 adjusted for 2:1 split (1000 / 0.5 = 2000)
         self.assertEqual(out_adj.loc[0, "Volume"], 2000.0)
 
+    def test_remote_panel(self):
+        client = RemoteLakeClient("user/bfinance-datalake", load_httpfs=False)
+        mock_dl = pd.DataFrame([
+            {"Date": "2024-01-01", "Symbol": "RELIANCE", "Adj Close": 1300.0, "Close": 1300.0},
+            {"Date": "2024-01-02", "Symbol": "RELIANCE", "Adj Close": 1310.0, "Close": 1310.0},
+            {"Date": "2024-01-01", "Symbol": "TCS", "Adj Close": 3800.0, "Close": 3800.0},
+            {"Date": "2024-01-02", "Symbol": "TCS", "Adj Close": 3850.0, "Close": 3850.0},
+        ])
+        client.download = lambda *args, **kwargs: mock_dl
+        p_df = client.panel(["RELIANCE", "TCS"])
+        self.assertEqual(list(p_df.columns), ["RELIANCE", "TCS"])
+        self.assertEqual(len(p_df), 2)
+        self.assertEqual(p_df.loc["2024-01-01", "RELIANCE"], 1300.0)
+        self.assertEqual(p_df.loc["2024-01-02", "TCS"], 3850.0)
+
 
 if __name__ == "__main__":
     unittest.main()

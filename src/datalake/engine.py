@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import date
 from functools import lru_cache
 from pathlib import Path
+import threading
 from typing import Any
 import pandas as pd
 
@@ -52,6 +53,7 @@ class UnifiedLakeEngine:
         self._by_isin: dict[str, SecurityIdentity] = {}
         self._crosswalk_loaded = False
         self._duck: Any = None
+        self._lock = threading.Lock()
 
     @classmethod
     def from_github(
@@ -128,7 +130,10 @@ class UnifiedLakeEngine:
             isin_col = next((c for c in ndf.columns if "ISIN" in c.upper()), None)
             name_col = next((c for c in ndf.columns if "NAME" in c.upper()), None)
             fv_col = next((c for c in ndf.columns if "FACE" in c.upper()), None)
-            list_col = next((c for c in ndf.columns if "LISTING" in c.upper() or "DATE" in c.upper()), None)
+            list_col = next(
+                (c for c in ndf.columns if "LISTING" in c.upper() and "DELIST" not in c.upper()),
+                None,
+            )
             sym_col = next((c for c in ndf.columns if c.strip().upper() in ("SYMBOL", "SECURITY", "SECURITY SYMBOL")), "SYMBOL")
             for r in ndf.to_dict("records"):
                 sym = str(r.get(sym_col) or "").strip().upper()
@@ -418,13 +423,25 @@ class UnifiedLakeEngine:
             return df
         if period_type:
             df = df[df["PeriodType"].astype(str).str.lower() == period_type.lower()].copy()
+        f_dt = (
+            pd.to_datetime(df["FilingDate"], format="mixed", dayfirst=True, errors="coerce")
+            if "FilingDate" in df.columns
+            else pd.Series(pd.NaT, index=df.index)
+        )
+        df["_f_dt"] = f_dt.fillna(pd.Timestamp("1900-01-01"))
         if "NatureOfReport" in df.columns and not df.empty:
             is_cons = df["NatureOfReport"].astype(str).str.lower().str.contains("consolidated")
             df["_nat_prio"] = is_cons if consolidated else ~is_cons
             df = (
-                df.sort_values(["PeriodEnd", "PeriodType", "_nat_prio"])
+                df.sort_values(["PeriodEnd", "PeriodType", "_nat_prio", "_f_dt"])
                 .drop_duplicates(subset=["PeriodType", "PeriodEnd"], keep="last")
-                .drop(columns=["_nat_prio"])
+                .drop(columns=["_nat_prio", "_f_dt"])
+            )
+        else:
+            df = (
+                df.sort_values(["PeriodEnd", "PeriodType", "_f_dt"])
+                .drop_duplicates(subset=["PeriodType", "PeriodEnd"], keep="last")
+                .drop(columns=["_f_dt"])
             )
         return df.sort_values("PeriodEnd").reset_index(drop=True)
 
@@ -530,7 +547,7 @@ class UnifiedLakeEngine:
         if expiry:
             df = df[pd.to_datetime(df["ExpiryDate"]).dt.normalize() == pd.Timestamp(expiry).normalize()]
 
-        if "UnderlyingPrice" in df.columns and df["UnderlyingPrice"].isna().all() and not df.empty:
+        if "UnderlyingPrice" in df.columns and df["UnderlyingPrice"].isna().any() and not df.empty:
             try:
                 if sym in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"):
                     idx_name = "NIFTY 50" if sym == "NIFTY" else ("NIFTY BANK" if sym == "BANKNIFTY" else sym)
@@ -539,14 +556,14 @@ class UnifiedLakeEngine:
                         spot_df["_dt"] = pd.to_datetime(spot_df["Date"]).dt.normalize()
                         df_dt = pd.to_datetime(df["Date"]).dt.normalize()
                         spot_map = dict(zip(spot_df["_dt"], spot_df["Close"]))
-                        df["UnderlyingPrice"] = df_dt.map(spot_map)
+                        df["UnderlyingPrice"] = df["UnderlyingPrice"].fillna(df_dt.map(spot_map))
                 else:
                     eq_df = self.history(sym, auto_adjust=False)
                     if not eq_df.empty and "Close" in eq_df.columns:
                         eq_df["_dt"] = pd.to_datetime(eq_df["Date"]).dt.normalize()
                         df_dt = pd.to_datetime(df["Date"]).dt.normalize()
                         eq_map = dict(zip(eq_df["_dt"], eq_df["Close"]))
-                        df["UnderlyingPrice"] = df_dt.map(eq_map)
+                        df["UnderlyingPrice"] = df["UnderlyingPrice"].fillna(df_dt.map(eq_map))
             except Exception:
                 pass
 
@@ -566,12 +583,15 @@ class UnifiedLakeEngine:
             idx_dir = self.root / "indices"
             if idx_dir.exists():
                 files = sorted(idx_dir.glob("ind_close_all_*.parquet"))
-                frames = [
-                    self._read_filtered_parquet(f, filters=[("IndexName", "==", clean_idx)])
-                    for f in files
-                    if f.exists()
-                ]
-                frames = [f for f in frames if not f.empty]
+                frames = []
+                for f in files:
+                    if not f.exists():
+                        continue
+                    idf = read_table_safe(f)
+                    if not idf.empty and "IndexName" in idf.columns:
+                        sub = idf[idf["IndexName"].astype(str).str.strip().str.upper() == clean_idx]
+                        if not sub.empty:
+                            frames.append(sub)
                 if frames:
                     df = pd.concat(frames, ignore_index=True)
         if df.empty:
@@ -616,13 +636,24 @@ class UnifiedLakeEngine:
         has_shp = (self.root / "shareholding" / "nse_shareholding_summary.parquet").exists()
 
         fin_cte = """
-            , latest_fin AS (
-                SELECT Symbol, PeriodEnd AS FinQuarter, Sales_Cr, PBT_Cr, NetProfit_Cr, BasicEPS_Rs
-                FROM (
-                    SELECT *, ROW_NUMBER() OVER (PARTITION BY Symbol ORDER BY PeriodEnd DESC) AS rn
-                    FROM financials WHERE PeriodType = 'Quarterly'
-                ) WHERE rn = 1
-            )
+            , dedup_fin AS (
+                SELECT Symbol, PeriodEnd, Sales_Cr, PBT_Cr, NetProfit_Cr, BasicEPS_Rs,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY Symbol, PeriodEnd
+                        ORDER BY CASE WHEN LOWER(CAST(NatureOfReport AS VARCHAR)) LIKE '%consolidated%' THEN 1 ELSE 0 END DESC
+                    ) AS fn_rn
+                FROM financials WHERE PeriodType = 'Quarterly'
+            ),
+            ttm_fin AS (
+                SELECT Symbol, PeriodEnd AS FinQuarter,
+                    SUM(Sales_Cr) OVER (PARTITION BY Symbol ORDER BY PeriodEnd ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS Sales_Cr,
+                    SUM(PBT_Cr) OVER (PARTITION BY Symbol ORDER BY PeriodEnd ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS PBT_Cr,
+                    SUM(NetProfit_Cr) OVER (PARTITION BY Symbol ORDER BY PeriodEnd ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS NetProfit_Cr,
+                    SUM(BasicEPS_Rs) OVER (PARTITION BY Symbol ORDER BY PeriodEnd ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS BasicEPS_Rs,
+                    ROW_NUMBER() OVER (PARTITION BY Symbol ORDER BY PeriodEnd DESC) AS rn
+                FROM dedup_fin WHERE fn_rn = 1
+            ),
+            latest_fin AS (SELECT * EXCLUDE (rn) FROM ttm_fin WHERE rn = 1)
         """ if has_fin else ""
         shp_cte = """
             , latest_shp AS (
@@ -640,19 +671,25 @@ class UnifiedLakeEngine:
         shp_join = "LEFT JOIN latest_shp s USING (Symbol)" if has_shp else ""
 
         return self.sql(f"""
-            WITH recent_eq AS (
+            WITH dedup_eq AS (
+                SELECT *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY Symbol, Date
+                        ORDER BY CASE Series WHEN 'EQ' THEN 0 WHEN 'BE' THEN 1 WHEN 'BZ' THEN 2 WHEN 'SM' THEN 3 WHEN 'ST' THEN 4 ELSE 9 END
+                    ) AS sr_rn
+                FROM equities_nse
+            ),
+            recent_eq AS (
                 SELECT
-                    Symbol, Date, Close, Volume,
+                    Symbol, Date, Series, Close, Volume,
                     AVG(Close) OVER (PARTITION BY Symbol ORDER BY Date ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) AS SMA_50,
                     AVG(Close) OVER (PARTITION BY Symbol ORDER BY Date ROWS BETWEEN 199 PRECEDING AND CURRENT ROW) AS SMA_200,
                     MAX(Close) OVER (PARTITION BY Symbol ORDER BY Date ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS High_52W,
                     MIN(Close) OVER (PARTITION BY Symbol ORDER BY Date ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS Low_52W,
                     ROW_NUMBER() OVER (PARTITION BY Symbol ORDER BY Date DESC) AS rn
-                FROM equities_nse
+                FROM dedup_eq WHERE sr_rn = 1
             ),
-            latest_eq AS (
-                SELECT * EXCLUDE (rn) FROM recent_eq WHERE rn = 1
-            )
+            latest_eq AS (SELECT * EXCLUDE (rn) FROM recent_eq WHERE rn = 1)
             {fin_cte}
             {shp_cte}
             SELECT e.* {fin_cols} {shp_cols}
@@ -742,6 +779,9 @@ class UnifiedLakeEngine:
             if pit_path.exists():
                 pdf = read_table_safe(pit_path)
                 sub = pdf[pdf["IndexName"].astype(str).str.upper() == queries_or_index.strip().upper()]
+                if not sub.empty and "SnapshotDate" in sub.columns:
+                    max_snap = pd.to_datetime(sub["SnapshotDate"]).max()
+                    sub = sub[pd.to_datetime(sub["SnapshotDate"]) == max_snap]
                 symbols = sub["Symbol"].dropna().unique().tolist() if not sub.empty else [queries_or_index]
             else:
                 symbols = [queries_or_index]
@@ -878,6 +918,15 @@ class UnifiedLakeEngine:
         ident = self.resolve(query)
         return self._read_filtered_parquet(p, filters=[("symbol", "in", list(ident.aliases))])
 
+    @staticmethod
+    def _has_page_index(pq_path: Path) -> bool:
+        try:
+            import pyarrow.parquet as pq_mod
+            pf = pq_mod.ParquetFile(pq_path)
+            return pf.num_row_groups == 0 or pf.metadata.row_group(0).column(0).has_offset_index
+        except Exception:
+            return True
+
     def optimize_layout(self) -> dict[str, int]:
         """
         Re-clusters all Equity Parquet files by `(Symbol, Date)` instead of `(Date, Symbol)`
@@ -893,7 +942,7 @@ class UnifiedLakeEngine:
                     continue
                 if not df.empty and "Symbol" in df.columns and "Date" in df.columns:
                     sorted_df = df.sort_values(["Symbol", "Date"])
-                    if not df.index.equals(sorted_df.index):
+                    if not df.index.equals(sorted_df.index) or not self._has_page_index(pq):
                         write_parquet_atomic(sorted_df.reset_index(drop=True), pq)
                         reclustered += 1
         fo_dir = self.root / "derivatives"
@@ -906,9 +955,20 @@ class UnifiedLakeEngine:
                 sort_cols = [c for c in ("Symbol", "Date", "ExpiryDate", "StrikePrice", "OptionType") if c in df.columns]
                 if not df.empty and len(sort_cols) >= 2:
                     sorted_df = df.sort_values(sort_cols)
-                    if not df.index.equals(sorted_df.index):
+                    if not df.index.equals(sorted_df.index) or not self._has_page_index(pq):
                         write_parquet_atomic(sorted_df.reset_index(drop=True), pq)
                         reclustered += 1
+        cc_path = self.root / "documents" / "concalls_and_filings.parquet"
+        if cc_path.exists():
+            try:
+                cc_df = read_table_safe(cc_path)
+                if not cc_df.empty and "ScripCode" in cc_df.columns and "FilingTimestamp" in cc_df.columns:
+                    sorted_cc = cc_df.sort_values(["ScripCode", "FilingTimestamp"])
+                    if not cc_df.index.equals(sorted_cc.index) or not self._has_page_index(cc_path):
+                        write_parquet_atomic(sorted_cc.reset_index(drop=True), cc_path)
+                        reclustered += 1
+            except Exception:
+                pass
         act_dir = self.root / "actions"
         if act_dir.exists():
             for pq in sorted(act_dir.glob("*.parquet")):
@@ -919,7 +979,7 @@ class UnifiedLakeEngine:
                 key_col = "symbol" if "symbol" in df.columns else ("scrip_code" if "scrip_code" in df.columns else None)
                 if not df.empty and key_col and "ExDate" in df.columns:
                     sorted_df = df.sort_values([key_col, "ExDate"])
-                    if not df.index.equals(sorted_df.index):
+                    if not df.index.equals(sorted_df.index) or not self._has_page_index(pq):
                         write_parquet_atomic(sorted_df.reset_index(drop=True), pq, row_group_size=2_000)
                         reclustered += 1
         self._cached_raw_equity.cache_clear()
@@ -933,35 +993,36 @@ class UnifiedLakeEngine:
         """
         if not HAS_DUCKDB:
             raise RuntimeError("Install duckdb (`uv add duckdb`) to run zero-copy SQL queries over Parquet.")
-        if self._duck is None:
-            self._duck = duckdb.connect(":memory:")
-            views = {
-                "equities_nse": "equities/nse_cm_*.parquet",
-                "equities_bse": "equities/bse_cm_*.parquet",
-                "fo_nse": "derivatives/nse_fo_*.parquet",
-                "indices": "indices/nifty_30y_ohlc_tri_pe.parquet",
-                "indices_daily": "indices/ind_close_all_*.parquet",
-                "financials": "fundamentals/xbrl_financials.parquet",
-                "shareholding": "shareholding/nse_shareholding_summary.parquet",
-                "shareholding_bse": "shareholding/bse_shareholding_history.parquet",
-                "named_holders": "shareholding/named_shareholders.parquet",
-                "actions_nse": "actions/nse_corporate_actions.parquet",
-                "actions_bse": "actions/bse_corporate_actions.parquet",
-                "mutual_funds": "mutual_funds/amfi_nav_*.parquet",
-                "deals": "deals/bulk_block_deals.parquet",
-                "insider_pit": "deals/insider_trading_pit.parquet",
-                "participant_oi": "flows/fao_participant_oi_*.parquet",
-                "fii_dii": "flows/cash_fii_dii_flows.parquet",
-                "annual_reports": "documents/annual_reports.parquet",
-                "concalls": "documents/concalls_and_filings.parquet",
-            }
-            for view_name, glob_pat in views.items():
-                matches = list(self.root.glob(glob_pat))
-                if matches:
-                    full_glob = str((self.root / glob_pat).as_posix())
-                    self._duck.execute(
-                        f"CREATE OR REPLACE VIEW {view_name} AS SELECT * FROM read_parquet('{full_glob}', union_by_name=true);"
-                    )
+        with self._lock:
+            if self._duck is None:
+                self._duck = duckdb.connect(":memory:")
+                views = {
+                    "equities_nse": "equities/nse_cm_*.parquet",
+                    "equities_bse": "equities/bse_cm_*.parquet",
+                    "fo_nse": "derivatives/nse_fo_*.parquet",
+                    "indices": "indices/nifty_30y_ohlc_tri_pe.parquet",
+                    "indices_daily": "indices/ind_close_all_*.parquet",
+                    "financials": "fundamentals/xbrl_financials.parquet",
+                    "shareholding": "shareholding/nse_shareholding_summary.parquet",
+                    "shareholding_bse": "shareholding/bse_shareholding_history.parquet",
+                    "named_holders": "shareholding/named_shareholders.parquet",
+                    "actions_nse": "actions/nse_corporate_actions.parquet",
+                    "actions_bse": "actions/bse_corporate_actions.parquet",
+                    "mutual_funds": "mutual_funds/amfi_nav_*.parquet",
+                    "deals": "deals/bulk_block_deals.parquet",
+                    "insider_pit": "deals/insider_trading_pit.parquet",
+                    "participant_oi": "flows/fao_participant_oi_*.parquet",
+                    "fii_dii": "flows/cash_fii_dii_flows.parquet",
+                    "annual_reports": "documents/annual_reports.parquet",
+                    "concalls": "documents/concalls_and_filings.parquet",
+                }
+                for view_name, glob_pat in views.items():
+                    matches = list(self.root.glob(glob_pat))
+                    if matches:
+                        full_glob = str((self.root / glob_pat).as_posix())
+                        self._duck.execute(
+                            f"CREATE OR REPLACE VIEW {view_name} AS SELECT * FROM read_parquet('{full_glob}', union_by_name=true);"
+                        )
         return self._duck.cursor().execute(query).df()
 
 

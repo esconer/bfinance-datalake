@@ -187,16 +187,20 @@ class TestUnifiedLakeEngine(unittest.TestCase):
     def test_parse_action_purpose_face_value_noise(self):
         from datalake.scrapers.universe_actions import parse_action_purpose
         p1 = parse_action_purpose("Interim Dividend 50% on Face Value of Rs 2")
-        self.assertIsNone(p1["DividendPerShareRs"])
-        self.assertEqual(p1["ActionType"], "OTHER")
+        self.assertEqual(p1["DividendPerShareRs"], 1.0)
+        self.assertEqual(p1["ActionType"], "DIVIDEND")
 
         p2 = parse_action_purpose("Dividend @ 150% (Face Value Rs. 10/-)")
-        self.assertIsNone(p2["DividendPerShareRs"])
-        self.assertEqual(p2["ActionType"], "OTHER")
+        self.assertEqual(p2["DividendPerShareRs"], 15.0)
+        self.assertEqual(p2["ActionType"], "DIVIDEND")
 
         p3 = parse_action_purpose("Final Dividend - Rs 5 Per Share (Face Value Rs 10)")
         self.assertEqual(p3["DividendPerShareRs"], 5.0)
         self.assertEqual(p3["ActionType"], "DIVIDEND")
+
+        p4 = parse_action_purpose("Dividend 50%")
+        self.assertIsNone(p4["DividendPerShareRs"])
+        self.assertEqual(p4["ActionType"], "OTHER")
 
     def test_auto_adjust_dividend_scaling(self):
         from datalake.adjuster import OHLCVAdjuster

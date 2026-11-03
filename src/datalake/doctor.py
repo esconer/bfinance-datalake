@@ -101,12 +101,39 @@ class LakeDoctor:
                 continue
 
             if not df.empty:
-                needs_schema_heal = any(
-                    col in df.columns and not pd.api.types.is_float_dtype(df[col])
-                    for col in NUMERIC_FLOAT_COLS
-                ) or df.columns.duplicated().any()
+                modified = False
+                # 1. Domain Invariant: OHLC Geometry & Positive Close on Equity/F&O/Index files
+                if all(c in df.columns for c in ("Open", "High", "Low", "Close")):
+                    bad_close = pd.to_numeric(df["Close"], errors="coerce") <= 0
+                    if bad_close.any():
+                        df = df[~bad_close].copy()
+                        modified = True
+                    if not df.empty:
+                        from datalake.scrapers.equity_eod import repair_ohlc
+                        repaired = repair_ohlc(df)
+                        if not repaired.equals(df):
+                            df = repaired
+                            modified = True
+
+                # 2. Domain Invariant: Shareholding percentage bounds (0..100%)
+                if "PromoterPct" in df.columns and "PublicPct" in df.columns:
+                    p_pct = pd.to_numeric(df["PromoterPct"], errors="coerce").fillna(0.0)
+                    pub_pct = pd.to_numeric(df["PublicPct"], errors="coerce").fillna(0.0)
+                    invalid_shp = (p_pct < 0) | (p_pct > 100.5) | (pub_pct < 0) | ((p_pct + pub_pct) > 101.0)
+                    if invalid_shp.any():
+                        df = df[~invalid_shp].copy()
+                        modified = True
+
+                needs_schema_heal = (
+                    modified
+                    or any(
+                        col in df.columns and not pd.api.types.is_float_dtype(df[col])
+                        for col in NUMERIC_FLOAT_COLS
+                    )
+                    or df.columns.duplicated().any()
+                )
                 if needs_schema_heal:
-                    logger.info("[Doctor] Normalizing numeric/action schema in %s", pq_path.name)
+                    logger.info("[Doctor] Healing schema/invariants in %s", pq_path.name)
                     write_parquet_atomic(df, pq_path)
 
             if df.empty or "Date" not in df.columns:

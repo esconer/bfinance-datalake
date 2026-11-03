@@ -195,7 +195,6 @@ class XBRLScraper:
                     or item.get("re_create_dt")
                     or item.get("broadcastDate")
                     or item.get("broadcast_dttm")
-                    or item.get("fromDate")
                 )
                 xbrl_url = item.get("xbrl")
                 if _is_valid_xbrl_url(xbrl_url):
@@ -230,7 +229,7 @@ class XBRLScraper:
                 pd.DataFrame(rows),
                 target,
                 dedup_cols=["Symbol", "NatureOfReport", "PeriodType", "PeriodStart", "PeriodEnd"],
-                sort_cols=["Symbol", "PeriodEnd", "PeriodType"],
+                sort_cols=["Symbol", "PeriodEnd", "PeriodType", "FilingDate"],
             )
             self.state.record("xbrl_financials_symbol", sym, "OK", len(rows))
         elif already_completed_filings > 0:
@@ -314,7 +313,7 @@ class XBRLScraper:
             return []
 
         board_mtg = root.xpath("//*[local-name()='DateOfBoardMeetingWhenFinancialResultsWereApproved']/text()")
-        f_dt = board_mtg[0].strip() if board_mtg else filing_date
+        f_dt = str(filing_date).strip() if filing_date else (board_mtg[0].strip() if board_mtg else None)
 
         contexts: dict[str, dict] = {}
         for ctx in root.xpath("//*[local-name()='context']"):
