@@ -10,6 +10,7 @@ from pathlib import Path
 import time
 from typing import Any
 import urllib.request
+import zlib
 import pandas as pd
 
 try:
@@ -265,6 +266,14 @@ class RemoteLakeClient:
 
     def _fetch_pack_slice(self, pack_filename: str, offset: int, length: int) -> pd.DataFrame:
         """Fetch a single ticker's exact byte range (`Range: bytes=start-end`) and parse as Parquet."""
+        if self.cache_dir:
+            cache_file = self.cache_dir / f"{pack_filename}_{offset}_{length}.parquet"
+            if cache_file.exists():
+                try:
+                    return pd.read_parquet(cache_file)
+                except Exception:
+                    pass
+
         cdn_url = self._resolve_cdn_url(f"{self.base_url}/{pack_filename}")
         end_byte = offset + length - 1
         headers = {"Range": f"bytes={offset}-{end_byte}"}
@@ -277,7 +286,15 @@ class RemoteLakeClient:
             req = urllib.request.Request(cdn_url, headers=headers)
             with urllib.request.urlopen(req, timeout=15.0) as resp:
                 raw_bytes = resp.read()
-        return pd.read_parquet(io.BytesIO(raw_bytes))
+
+        df = pd.read_parquet(io.BytesIO(raw_bytes))
+        if self.cache_dir and not df.empty:
+            try:
+                cache_file = self.cache_dir / f"{pack_filename}_{offset}_{length}.parquet"
+                df.to_parquet(cache_file, compression="zstd", index=False)
+            except Exception:
+                pass
+        return df
 
     def history(
         self,
@@ -500,6 +517,37 @@ class RemoteLakeClient:
             [f"%{self._clean_sym(q)}%"],
         ).df()
 
+    def dossier(self, symbol: str) -> dict[str, pd.DataFrame]:
+        """Fetch Financials, Shareholding, Holders, Actions, Deals, Insider & Annual Reports in 1 HTTP Range call."""
+        sym = self._clean_sym(symbol)
+        idx_data = self._load_ticker_index() or {}
+        canon = idx_data.get("aliases", {}).get(sym, sym)
+        loc = idx_data.get("tickers", {}).get(canon, {}).get("dossier")
+        if not loc:
+            return {}
+        offset, length = loc
+        cdn_url = self._resolve_cdn_url(f"{self.base_url}/by_ticker__nse_dossier.pack")
+        end_byte = offset + length - 1
+        headers = {"Range": f"bytes={offset}-{end_byte}"}
+        if self._http_pool is not None:
+            resp = self._http_pool.get(cdn_url, headers=headers, follow_redirects=True)
+            raw_bytes = resp.content
+        else:
+            if self.token:
+                headers["Authorization"] = f"Bearer {self.token}"
+            req = urllib.request.Request(cdn_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=10.0) as resp:
+                raw_bytes = resp.read()
+        payload = json.loads(zlib.decompress(raw_bytes).decode("utf-8"))
+        return {k: pd.DataFrame(v) for k, v in payload.items()}
+
+    def screener(self, sql_filter: str | None = None) -> pd.DataFrame:
+        """Query the latest cross-sectional market screener snapshot (~400 KB) in ~120 ms."""
+        self._ensure_httpfs()
+        url = self._resolve_cdn_url(f"{self.base_url}/snapshots__market_screener_latest.parquet")
+        where = f"WHERE {sql_filter}" if sql_filter else ""
+        return self.con.execute(f"SELECT * FROM read_parquet('{url}') {where}").df()
+
     def option_chain(
         self,
         symbol: str,
@@ -515,8 +563,12 @@ class RemoteLakeClient:
         url = self._resolve_cdn_url(self._asset_url("derivatives", f"nse_fo_{yr}.parquet"))
         if trade_date:
             return self.con.execute(
-                f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ? AND CAST(Date AS DATE) = CAST(? AS DATE) ORDER BY ExpiryDate, StrikePrice, OptionType",
-                [symbol.strip().upper(), str(trade_date)],
+                f"""SELECT * FROM read_parquet('{url}')
+                WHERE Symbol = ?
+                  AND Date >= CAST(? AS TIMESTAMP)
+                  AND Date < CAST(? AS TIMESTAMP) + INTERVAL 1 DAY
+                ORDER BY ExpiryDate, StrikePrice, OptionType""",
+                [symbol.strip().upper(), str(trade_date), str(trade_date)],
             ).df()
         return self.con.execute(
             f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ? ORDER BY Date, ExpiryDate, StrikePrice",

@@ -209,6 +209,125 @@ def _pack_frames_by_symbol(
     return offsets
 
 
+def build_company_dossier_pack(
+    data_dir: Path,
+    staging_dir: Path,
+    alias_to_canon: dict[str, str],
+) -> dict[str, list[int]]:
+    """
+    Packs all 8 non-price datasets (Financials, Shareholding, >1% Holders, Corporate Actions,
+    Bulk/Block Deals, Insider Trades, Concalls, Annual Reports) per canonical symbol into
+    `by_ticker__nse_dossier.pack` so all 8 tables can be fetched in a single ~25 KB HTTP Range request.
+    """
+    import zlib
+
+    tables = {
+        "financials": ("fundamentals/xbrl_financials.parquet", "Symbol"),
+        "shareholding": ("shareholding/nse_shareholding_summary.parquet", "Symbol"),
+        "named_holders": ("shareholding/named_shareholders.parquet", "Symbol"),
+        "actions": ("actions/nse_corporate_actions.parquet", "symbol"),
+        "deals": ("deals/bulk_block_deals.parquet", "Symbol"),
+        "insider_trades": ("deals/insider_trading_pit.parquet", "symbol"),
+        "annual_reports": ("documents/annual_reports.parquet", "Symbol"),
+        "concalls": ("documents/concalls_and_filings.parquet", "CompanyName"),
+    }
+
+    by_sym: dict[str, dict[str, list[dict]]] = {}
+    for key, (rel_path, sym_col) in tables.items():
+        p = data_dir / rel_path
+        if not p.exists():
+            continue
+        df = read_table_safe(p)
+        if df.empty or sym_col not in df.columns:
+            continue
+        for col in df.select_dtypes(include=["datetime64[ns]", "datetimetz"]).columns:
+            df[col] = df[col].dt.strftime("%Y-%m-%d")
+        raw_s = df[sym_col].astype(str).str.strip().str.upper()
+        df["_CanonSym"] = raw_s.map(lambda s: alias_to_canon.get(s, s))
+        for sym, grp in df.groupby("_CanonSym"):
+            sym_str = str(sym).strip().upper()
+            if not sym_str or sym_str in ("", "NAN", "NONE"):
+                continue
+            by_sym.setdefault(sym_str, {})[key] = grp.drop(columns=["_CanonSym"]).to_dict("records")
+
+    if not by_sym:
+        return {}
+
+    offsets: dict[str, list[int]] = {}
+    cursor = 0
+    pack_path = staging_dir / "by_ticker__nse_dossier.pack"
+    with pack_path.open("wb") as f:
+        for sym in sorted(by_sym.keys()):
+            raw_json = json.dumps(by_sym[sym], separators=(",", ":"), default=str).encode("utf-8")
+            compressed = zlib.compress(raw_json, level=6)
+            f.write(compressed)
+            offsets[sym] = [cursor, len(compressed)]
+            cursor += len(compressed)
+    return offsets
+
+
+def build_market_screener_snapshot(data_dir: Path, staging_dir: Path) -> dict | None:
+    """
+    Pre-joins latest EOD technicals with latest Quarterly Financials and Shareholding
+    into a single ~400 KB Parquet file.
+    """
+    eng = UnifiedLakeEngine(data_dir)
+    try:
+        df = eng.sql("""
+            WITH recent_eq AS (
+                SELECT
+                    Symbol, Date, Close, Volume, TurnoverValue, DeliveryPct,
+                    AVG(Close) OVER (PARTITION BY Symbol ORDER BY Date ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) AS SMA_50,
+                    AVG(Close) OVER (PARTITION BY Symbol ORDER BY Date ROWS BETWEEN 199 PRECEDING AND CURRENT ROW) AS SMA_200,
+                    MAX(Close) OVER (PARTITION BY Symbol ORDER BY Date ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS High_52W,
+                    MIN(Close) OVER (PARTITION BY Symbol ORDER BY Date ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS Low_52W,
+                    ROW_NUMBER() OVER (PARTITION BY Symbol ORDER BY Date DESC) AS rn
+                FROM equities_nse
+                WHERE Series = 'EQ' AND Date >= CURRENT_DATE - INTERVAL 400 DAY
+            ),
+            latest_eq AS (
+                SELECT * EXCLUDE (rn) FROM recent_eq WHERE rn = 1
+            ),
+            latest_fin AS (
+                SELECT Symbol, PeriodEnd AS FinQuarter, Sales_Cr, PBT_Cr, NetProfit_Cr, BasicEPS_Rs
+                FROM (
+                    SELECT *, ROW_NUMBER() OVER (PARTITION BY Symbol ORDER BY PeriodEnd DESC) AS rn
+                    FROM financials WHERE PeriodType = 'Quarterly'
+                ) WHERE rn = 1
+            ),
+            latest_shp AS (
+                SELECT Symbol, QuarterEnd AS ShpQuarter, PromoterPct, PromoterPledgedPct, MutualFundsPct, FPI_Pct, RetailPct
+                FROM (
+                    SELECT *, ROW_NUMBER() OVER (PARTITION BY Symbol ORDER BY QuarterEnd DESC) AS rn
+                    FROM shareholding
+                ) WHERE rn = 1
+            )
+            SELECT
+                e.*,
+                f.FinQuarter, f.Sales_Cr, f.PBT_Cr, f.NetProfit_Cr, f.BasicEPS_Rs,
+                s.ShpQuarter, s.PromoterPct, s.PromoterPledgedPct, s.MutualFundsPct, s.FPI_Pct, s.RetailPct
+            FROM latest_eq e
+            LEFT JOIN latest_fin f USING (Symbol)
+            LEFT JOIN latest_shp s USING (Symbol)
+            ORDER BY e.TurnoverValue DESC NULLS LAST
+        """)
+    except Exception as exc:
+        logger.debug("[Screener Snapshot] Note: %s", exc)
+        return None
+
+    if df.empty:
+        return None
+
+    asset_name = "snapshots__market_screener_latest.parquet"
+    dst = staging_dir / asset_name
+    write_parquet_atomic(df, dst, row_group_size=5_000)
+    return {
+        "asset_name": asset_name,
+        "size_bytes": dst.stat().st_size,
+        "sha256": compute_sha256(dst),
+    }
+
+
 def build_by_ticker_packs(
     data_dir: Path,
     staging_dir: Path,
@@ -307,6 +426,17 @@ def build_by_ticker_packs(
             }
 
     all_syms = sorted(set(hist_offsets.keys()) | set(curr_offsets.keys()))
+    dossier_offsets = build_company_dossier_pack(data_dir, staging_dir, alias_to_canon)
+    dossier_pack_name = "by_ticker__nse_dossier.pack"
+    if dossier_offsets and (staging_dir / dossier_pack_name).exists():
+        dst_dossier = staging_dir / dossier_pack_name
+        packs_meta[dossier_pack_name] = {
+            "asset_name": dossier_pack_name,
+            "size_bytes": dst_dossier.stat().st_size,
+            "sha256": compute_sha256(dst_dossier),
+        }
+
+    all_syms = sorted(set(all_syms) | set(dossier_offsets.keys()))
     tickers_index: dict[str, dict[str, list[int]]] = {}
     for sym in all_syms:
         entry: dict[str, list[int]] = {}
@@ -314,6 +444,8 @@ def build_by_ticker_packs(
             entry["hist"] = hist_offsets[sym]
         if sym in curr_offsets:
             entry["curr"] = curr_offsets[sym]
+        if sym in dossier_offsets:
+            entry["dossier"] = dossier_offsets[sym]
         tickers_index[sym] = entry
 
     index_payload = {
@@ -395,7 +527,11 @@ def prepare_release_staging(
     if packs_meta:
         manifest["by_ticker_packs"] = packs_meta
 
-    if compacted_meta or packs_meta:
+    screener_meta = build_market_screener_snapshot(data_dir, staging_dir)
+    if screener_meta:
+        manifest["snapshots"] = {"market_screener_latest.parquet": screener_meta}
+
+    if compacted_meta or packs_meta or screener_meta:
         (data_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     shutil.copy2(data_dir / "manifest.json", staging_dir / "manifest.json")
@@ -450,6 +586,13 @@ def prune_retired_release_assets(
             {
                 v["asset_name"]
                 for v in manifest_data.get("by_ticker_packs", {}).values()
+                if isinstance(v, dict) and "asset_name" in v
+            }
+        )
+        valid.update(
+            {
+                v["asset_name"]
+                for v in manifest_data.get("snapshots", {}).values()
                 if isinstance(v, dict) and "asset_name" in v
             }
         )

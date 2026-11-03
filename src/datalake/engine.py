@@ -357,6 +357,8 @@ class UnifiedLakeEngine:
                 df = sub.copy()
         return df.sort_values("PeriodEnd").reset_index(drop=True)
 
+    financials = fundamentals
+
     def shareholding(self, query: str | int) -> pd.DataFrame:
         """Return unified NSE + BSE quarterly Shareholding & Promoter Pledge history (2001–Present)."""
         ident = self.resolve(query)
@@ -408,10 +410,21 @@ class UnifiedLakeEngine:
             yearly = fo_dir / f"{exch}_fo_{dt.year}.parquet"
             monthly = fo_dir / f"{exch}_fo_{dt.year}_{dt.month:02d}.parquet"
             files = [yearly] if yearly.exists() else [monthly]
+            filters = [("Symbol", "==", sym), ("Date", "==", dt)]
         else:
             files = sorted(fo_dir.glob(f"{exch}_fo_*.parquet"), key=lambda p: p.stem.split("_")[2:])[-1:]
+            if not files or not files[0].exists():
+                return pd.DataFrame()
+            try:
+                date_df = pd.read_parquet(files[0], columns=["Date"], filters=[("Symbol", "==", sym)])
+                if date_df.empty:
+                    return pd.DataFrame()
+                max_dt = pd.to_datetime(date_df["Date"]).max()
+                filters = [("Symbol", "==", sym), ("Date", "==", max_dt)]
+            except Exception:
+                filters = [("Symbol", "==", sym)]
 
-        frames = [self._read_filtered_parquet(f, filters=[("Symbol", "==", sym)]) for f in files if f.exists()]
+        frames = [self._read_filtered_parquet(f, filters=filters) for f in files if f.exists()]
         if not frames:
             return pd.DataFrame()
         df = pd.concat(frames, ignore_index=True)
@@ -434,16 +447,20 @@ class UnifiedLakeEngine:
     ) -> pd.DataFrame:
         """Return 30-year Nifty Index Spot OHLC + Total Return Index (TRI) + P/E, P/B, DivYield."""
         p_bulk = self.root / "indices" / "nifty_30y_ohlc_tri_pe.parquet"
-        df = self._read_filtered_parquet(p_bulk, filters=[("IndexName", "==", index_name.strip().upper())])
+        clean_idx = index_name.strip().upper()
+        df = self._read_filtered_parquet(p_bulk, filters=[("IndexName", "==", clean_idx)])
         if df.empty:
             idx_dir = self.root / "indices"
             if idx_dir.exists():
                 files = sorted(idx_dir.glob("ind_close_all_*.parquet"))
-                frames = [read_table_safe(f) for f in files]
+                frames = [
+                    self._read_filtered_parquet(f, filters=[("IndexName", "==", clean_idx)])
+                    for f in files
+                    if f.exists()
+                ]
+                frames = [f for f in frames if not f.empty]
                 if frames:
-                    all_idx = pd.concat(frames, ignore_index=True)
-                    if "IndexName" in all_idx.columns:
-                        df = all_idx[all_idx["IndexName"].astype(str).str.upper() == index_name.strip().upper()].copy()
+                    df = pd.concat(frames, ignore_index=True)
         if df.empty:
             return df
         df["Date"] = pd.to_datetime(df["Date"])
@@ -452,6 +469,39 @@ class UnifiedLakeEngine:
         if end:
             df = df[df["Date"] <= pd.Timestamp(end)]
         return df.sort_values("Date").drop_duplicates(subset=["Date"], keep="last").reset_index(drop=True)
+
+    def dossier(self, query: str | int) -> dict[str, pd.DataFrame]:
+        """Return 360-degree company dossier combining all 8 non-price datasets for a symbol."""
+        ident = self.resolve(query)
+        sym = ident.symbol
+        bse = ident.bse_code
+
+        res: dict[str, pd.DataFrame] = {}
+        for key, func, arg in (
+            ("financials", self.financials, sym),
+            ("shareholding", self.shareholding, sym),
+            ("named_holders", self.named_holders, sym),
+            ("actions", self.corporate_actions, sym),
+            ("deals", self.deals, sym),
+            ("insider_trades", self.insider_trades, sym),
+            ("annual_reports", self.annual_reports, sym),
+            ("concalls", self.concalls, bse or sym),
+        ):
+            try:
+                table = func(arg)
+                if not table.empty:
+                    res[key] = table
+            except Exception:
+                pass
+        return res
+
+    def screener(self, sql_filter: str | None = None) -> pd.DataFrame:
+        """Query latest market screener snapshot locally or run cross-sectional analysis."""
+        snap_path = self.root / "snapshots" / "market_screener_latest.parquet"
+        where = f"WHERE {sql_filter}" if sql_filter else ""
+        if snap_path.exists():
+            return self.sql(f"SELECT * FROM read_parquet('{snap_path.as_posix()}') {where}")
+        return self.sql(f"SELECT * FROM equities_nse {where}")
 
     def mutual_fund(self, scheme_code: int | str, start: str | date | None = None, end: str | date | None = None) -> pd.DataFrame:
         """Return historical NAV series for a Mutual Fund scheme code across 2006..2026."""

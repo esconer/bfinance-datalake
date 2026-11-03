@@ -118,6 +118,40 @@ class TestRemoteAndStorageLayout(unittest.TestCase):
         self.assertEqual(list(res_filtered.columns), ["Date", "Close"])
         self.assertEqual(res_filtered["Close"].iloc[0], 3900.0)
 
+    def test_remote_client_dossier(self):
+        import json
+        import zlib
+        from unittest.mock import patch
+        client = RemoteLakeClient("user/bfinance-datalake", load_httpfs=False)
+        client._ticker_index_loaded = True
+        client._ticker_index = {
+            "version": 1,
+            "current_year": 2026,
+            "aliases": {},
+            "tickers": {
+                "RELIANCE": {
+                    "dossier": [0, 50],
+                }
+            },
+        }
+        sample_dossier = {"financials": [{"Symbol": "RELIANCE", "Sales_Cr": 200000.0}]}
+        raw_compressed = zlib.compress(json.dumps(sample_dossier).encode("utf-8"))
+
+        class MockResp:
+            content = raw_compressed
+            def read(self):
+                return raw_compressed
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+
+        client._http_pool = None
+        with patch("urllib.request.urlopen", return_value=MockResp()):
+            res = client.dossier("RELIANCE")
+            self.assertIn("financials", res)
+            self.assertEqual(res["financials"].iloc[0]["Sales_Cr"], 200000.0)
+
 
 if __name__ == "__main__":
     unittest.main()

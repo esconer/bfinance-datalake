@@ -259,7 +259,7 @@ class DealsAndDocumentsScraper:
         if all_rows:
             df = pd.DataFrame(all_rows)
             upsert_parquet_partition(
-                df, target, dedup_cols=["NewsId"], sort_cols=["FilingTimestamp", "ScripCode"]
+                df, target, dedup_cols=["NewsId"], sort_cols=["ScripCode", "FilingTimestamp"]
             )
             self.state.record(
                 "bse_concalls_filings", f"{start_date}_{end_date}", "OK", len(df)

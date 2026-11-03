@@ -122,6 +122,12 @@ class TestUnifiedLakeEngine(unittest.TestCase):
         self.assertTrue(hasattr(ident, "industry"))
         self.assertTrue(hasattr(ident, "listing_date"))
 
+    def test_dossier_and_screener(self):
+        dossier = self.lake.dossier("RELIANCE")
+        self.assertIsInstance(dossier, dict)
+        scr = self.lake.screener()
+        self.assertIsInstance(scr, pd.DataFrame)
+
 
 if __name__ == "__main__":
     unittest.main()
