@@ -244,29 +244,44 @@ class RemoteLakeClient:
         safe_cols = [f'"{c.replace(chr(34), "")}"' for c in columns]
         return ", ".join(safe_cols)
 
-    def _load_ticker_index(self) -> dict | None:
-        """Fetch and cache `by_ticker__nse_index.json` once per client session."""
+    def _load_ticker_index(self, exchange: str = "NSE") -> dict | None:
+        """Fetch and cache `by_ticker__{exch}_index.json` once per client session."""
         with self._lock:
-            if getattr(self, "_ticker_index_loaded", False):
-                return self._ticker_index
-            self._ticker_index_loaded = True
-            self._ticker_index: dict | None = None
+            exch = exchange.lower()
+            if exch == "nse" and getattr(self, "_ticker_index_loaded", False):
+                return getattr(self, "_ticker_index", None)
+            cache_attr = f"_ticker_index_{exch}"
+            loaded_attr = f"_ticker_index_loaded_{exch}"
+            if getattr(self, loaded_attr, False):
+                return getattr(self, cache_attr, None)
 
-            idx_url = self._resolve_cdn_url(f"{self.base_url}/by_ticker__nse_index.json")
+            setattr(self, loaded_attr, True)
+            setattr(self, cache_attr, None)
+            if exch == "nse":
+                self._ticker_index_loaded = True
+                self._ticker_index = None
+
+            idx_url = self._resolve_cdn_url(f"{self.base_url}/by_ticker__{exch}_index.json")
             try:
                 if self._http_pool is not None:
                     resp = self._http_pool.get(idx_url, follow_redirects=True)
                     if resp.status_code == 200:
-                        self._ticker_index = resp.json()
+                        data = resp.json()
+                        setattr(self, cache_attr, data)
+                        if exch == "nse":
+                            self._ticker_index = data
                 else:
                     headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
                     req = urllib.request.Request(idx_url, headers=headers)
                     with urllib.request.urlopen(req, timeout=5.0) as resp:
                         if resp.status == 200:
-                            self._ticker_index = json.loads(resp.read().decode("utf-8"))
+                            data = json.loads(resp.read().decode("utf-8"))
+                            setattr(self, cache_attr, data)
+                            if exch == "nse":
+                                self._ticker_index = data
             except Exception as exc:
-                logger.debug("Per-ticker index not available, falling back to DuckDB httpfs: %s", exc)
-            return self._ticker_index
+                logger.debug("Per-ticker %s index not available, falling back to DuckDB httpfs: %s", exch, exc)
+            return getattr(self, cache_attr, None)
 
     def _fetch_pack_slice(self, pack_filename: str, offset: int, length: int) -> pd.DataFrame:
         """Fetch a single ticker's exact byte range (`Range: bytes=start-end`) and parse as Parquet."""
@@ -300,10 +315,10 @@ class RemoteLakeClient:
                 pass
         return df
 
-    def _resolve_remote_symbol(self, symbol_or_code: str) -> str:
-        """Resolve NSE symbol, old alias, BSE 6-digit code, or 12-char ISIN via `by_ticker__nse_index.json`."""
+    def _resolve_remote_symbol(self, symbol_or_code: str, exchange: str = "NSE") -> str:
+        """Resolve NSE symbol, old alias, BSE 6-digit code, or 12-char ISIN via `by_ticker__{exch}_index.json`."""
         s = self._clean_sym(symbol_or_code)
-        idx_data = self._load_ticker_index()
+        idx_data = self._load_ticker_index(exchange)
         if not idx_data:
             return s
         if s in idx_data.get("aliases", {}):
@@ -376,6 +391,63 @@ class RemoteLakeClient:
             out["Dividends"] = np.round(out["Dividends"] * cum_split, 4)
         return out
 
+    def _try_pack_history(
+        self,
+        sym: str,
+        start_year: int,
+        end_year: int,
+        exchange: str,
+        columns: list[str] | None,
+        auto_adjust: bool,
+    ) -> pd.DataFrame | None:
+        exch = exchange.lower()
+        idx_data = self._load_ticker_index(exch)
+        if idx_data is None:
+            return None
+        canon_key = (
+            idx_data.get("aliases", {}).get(sym)
+            or idx_data.get("bse_to_symbol", {}).get(sym)
+            or idx_data.get("isin_to_symbol", {}).get(sym)
+            or sym
+        )
+        entry = idx_data.get("tickers", {}).get(canon_key)
+        if entry is None:
+            return None
+
+        cur_yr = int(idx_data.get("current_year", pd.Timestamp.now().year))
+        tasks: list[tuple[str, int, int]] = []
+        if start_year < cur_yr and "hist" in entry:
+            tasks.append((f"by_ticker__{exch}_hist.pack", entry["hist"][0], entry["hist"][1]))
+        if end_year >= cur_yr and "curr" in entry:
+            tasks.append((f"by_ticker__{exch}_curr.pack", entry["curr"][0], entry["curr"][1]))
+        if not tasks:
+            return pd.DataFrame()
+
+        if len(tasks) == 1:
+            frames = [self._fetch_pack_slice(*tasks[0])]
+        else:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                frames = list(pool.map(lambda t: self._fetch_pack_slice(*t), tasks))
+        df = pd.concat(frames, ignore_index=True)
+        if "actions" in entry and ("Adj Close" not in df.columns or df["Adj Close"].isna().all()):
+            df = self._apply_pack_actions(df, entry.get("actions", []), auto_adjust=auto_adjust)
+        elif auto_adjust and "Adj Close" in df.columns and "Close" in df.columns:
+            ratio = (df["Adj Close"] / df["Close"].replace(0, float("nan"))).fillna(1.0)
+            for c in ("Open", "High", "Low", "Close"):
+                if c in df.columns:
+                    df[c] = (df[c] * ratio).round(4)
+        years = pd.to_datetime(df["Date"]).dt.year
+        out = (
+            df[(years >= start_year) & (years <= end_year)]
+            .sort_values("Date")
+            .reset_index(drop=True)
+        )
+        if columns:
+            valid_cols = [c for c in columns if c in out.columns]
+            if valid_cols:
+                out = out[valid_cols]
+        return out
+
     def history(
         self,
         symbol: str,
@@ -387,53 +459,24 @@ class RemoteLakeClient:
     ) -> pd.DataFrame:
         """
         Stream a single stock's OHLCV + Delivery over HTTPS.
-        - Fast Path (~120 ms): Uses `by_ticker__nse_index.json` + direct HTTP Range slice from packfile.
+        - Fast Path (~120 ms): Uses `by_ticker__{exch}_index.json` + HTTP Range slice from NSE or BSE packfile.
         - Fallback Path: Uses two-tier compacted or yearly partitions via DuckDB `httpfs`.
         """
         sym = self._clean_sym(symbol)
         if start_year > end_year:
             start_year, end_year = end_year, start_year
 
-        exch = exchange.upper()
-        if exch == "NSE":
-            idx_data = self._load_ticker_index()
-            if idx_data is not None:
-                canon_sym = self._resolve_remote_symbol(sym)
-                entry = idx_data.get("tickers", {}).get(canon_sym)
-                if entry is not None:
-                    cur_yr = int(idx_data.get("current_year", pd.Timestamp.now().year))
-                    tasks: list[tuple[str, int, int]] = []
-                    if start_year < cur_yr and "hist" in entry:
-                        tasks.append(("by_ticker__nse_hist.pack", entry["hist"][0], entry["hist"][1]))
-                    if end_year >= cur_yr and "curr" in entry:
-                        tasks.append(("by_ticker__nse_curr.pack", entry["curr"][0], entry["curr"][1]))
-
-                    if tasks:
-                        if len(tasks) == 1:
-                            frames = [self._fetch_pack_slice(*tasks[0])]
-                        else:
-                            with ThreadPoolExecutor(max_workers=2) as pool:
-                                frames = list(pool.map(lambda t: self._fetch_pack_slice(*t), tasks))
-                        df = pd.concat(frames, ignore_index=True)
-                        if "actions" in entry and ("Adj Close" not in df.columns or df["Adj Close"].isna().all()):
-                            df = self._apply_pack_actions(df, entry.get("actions", []), auto_adjust=auto_adjust)
-                        elif auto_adjust and "Adj Close" in df.columns and "Close" in df.columns:
-                            ratio = (df["Adj Close"] / df["Close"].replace(0, float("nan"))).fillna(1.0)
-                            for c in ("Open", "High", "Low", "Close"):
-                                if c in df.columns:
-                                    df[c] = (df[c] * ratio).round(4)
-                        years = pd.to_datetime(df["Date"]).dt.year
-                        out = (
-                            df[(years >= start_year) & (years <= end_year)]
-                            .sort_values("Date")
-                            .reset_index(drop=True)
-                        )
-                        if columns:
-                            valid_cols = [c for c in columns if c in out.columns]
-                            if valid_cols:
-                                out = out[valid_cols]
-                        return out
-                    return pd.DataFrame()
+        exch = "BSE" if str(symbol).strip().upper().endswith(".BO") else exchange.upper()
+        pack_df = self._try_pack_history(sym, start_year, end_year, exch, columns, auto_adjust)
+        if pack_df is not None and not pack_df.empty:
+            return pack_df
+        # Auto-fallback to BSE pack if queried with default NSE exchange for a BSE-only scrip
+        if exch == "NSE" and (sym.isdigit() or pack_df is None or pack_df.empty):
+            bse_pack_df = self._try_pack_history(sym, start_year, end_year, "BSE", columns, auto_adjust)
+            if bse_pack_df is not None and not bse_pack_df.empty:
+                return bse_pack_df
+        if pack_df is not None:
+            return pack_df
 
         self._ensure_httpfs()
         sym = self._clean_sym(symbol)

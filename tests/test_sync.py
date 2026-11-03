@@ -179,21 +179,39 @@ class TestSyncEngine(unittest.TestCase):
                 })
                 df.to_parquet(eq_dir / f"nse_cm_{yr}.parquet")
 
+                bse_df = pd.DataFrame({
+                    "InstrumentId": ["500325"],
+                    "Date": pd.to_datetime([f"{yr}-01-02"]),
+                    "Close": [1300.0 + yr],
+                })
+                bse_df.to_parquet(eq_dir / f"bse_cm_{yr}.parquet")
+
             manifest = prepare_release_staging(src, stg)
             self.assertIn("by_ticker_packs", manifest)
             self.assertIn("by_ticker__nse_hist.pack", manifest["by_ticker_packs"])
             self.assertIn("by_ticker__nse_curr.pack", manifest["by_ticker_packs"])
             self.assertIn("by_ticker__nse_index.json", manifest["by_ticker_packs"])
+            self.assertIn("by_ticker__bse_hist.pack", manifest["by_ticker_packs"])
+            self.assertIn("by_ticker__bse_curr.pack", manifest["by_ticker_packs"])
+            self.assertIn("by_ticker__bse_index.json", manifest["by_ticker_packs"])
 
             self.assertTrue((stg / "by_ticker__nse_hist.pack").exists())
             self.assertTrue((stg / "by_ticker__nse_curr.pack").exists())
             self.assertTrue((stg / "by_ticker__nse_index.json").exists())
+            self.assertTrue((stg / "by_ticker__bse_hist.pack").exists())
+            self.assertTrue((stg / "by_ticker__bse_curr.pack").exists())
+            self.assertTrue((stg / "by_ticker__bse_index.json").exists())
 
             idx = json.loads((stg / "by_ticker__nse_index.json").read_text(encoding="utf-8"))
             self.assertIn("TCS", idx["tickers"])
             self.assertIn("INFY", idx["tickers"])
             self.assertIn("hist", idx["tickers"]["TCS"])
             self.assertIn("curr", idx["tickers"]["TCS"])
+
+            bse_idx = json.loads((stg / "by_ticker__bse_index.json").read_text(encoding="utf-8"))
+            self.assertIn("500325", bse_idx["tickers"])
+            self.assertIn("hist", bse_idx["tickers"]["500325"])
+            self.assertIn("curr", bse_idx["tickers"]["500325"])
 
 
 if __name__ == "__main__":
