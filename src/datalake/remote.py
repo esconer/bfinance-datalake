@@ -1143,3 +1143,7 @@ class RemoteLakeClient:
         self._ensure_httpfs()
         url = self._resolve_cdn_url(self._asset_url("derivatives", "fo_ban_list.parquet"))
         return self._safe_query(f"SELECT * FROM read_parquet('{url}')")
+
+
+# Alias for compatibility with UnifiedLakeEngine naming convention
+RemoteLakeEngine = RemoteLakeClient
