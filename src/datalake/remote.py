@@ -74,7 +74,8 @@ class RemoteLakeClient:
             httpx.Client(
                 headers={"User-Agent": "bfinance-datalake/0.2.0"},
                 follow_redirects=False,
-                timeout=15.0,
+                timeout=httpx.Timeout(connect=3.0, read=15.0, write=10.0, pool=5.0),
+                transport=httpx.HTTPTransport(local_address="0.0.0.0", retries=2),
                 limits=httpx.Limits(max_keepalive_connections=16, max_connections=24),
             )
             if HAS_HTTPX
@@ -565,11 +566,7 @@ class RemoteLakeClient:
         if not tasks:
             return pd.DataFrame()
 
-        if len(tasks) == 1:
-            frames = [self._fetch_pack_slice(*tasks[0])]
-        else:
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                frames = list(pool.map(lambda t: self._fetch_pack_slice(*t), tasks))
+        frames = [self._fetch_pack_slice(*t) for t in tasks]
 
         # Apply current-year corporate action carry-back factor to hist.pack slice so 2025->2026 Adj Close is seamless
         if start_year < cur_yr and "hist" in entry and "hist_carry" in entry and frames:

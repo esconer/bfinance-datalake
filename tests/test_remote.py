@@ -429,6 +429,17 @@ class TestRemoteAndStorageLayout(unittest.TestCase):
         self.assertEqual(kwargs.get("headers"), {"Range": "bytes=0-0"})
         self.assertEqual(kwargs.get("follow_redirects"), False)
 
+    def test_remote_transport_ipv4_and_timeout(self):
+        client = RemoteLakeClient("user/bfinance-datalake", load_httpfs=False)
+        if client._http_pool is not None:
+            # Verify IPv4 binding and connect timeout
+            self.assertEqual(client._http_pool.timeout.connect, 3.0)
+            transport = getattr(client._http_pool, "_transport", None)
+            if transport is not None:
+                pool = getattr(transport, "_pool", None)
+                if pool is not None and hasattr(pool, "_local_address"):
+                    self.assertEqual(pool._local_address, "0.0.0.0")
+
 
 if __name__ == "__main__":
     unittest.main()
