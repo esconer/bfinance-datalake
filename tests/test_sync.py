@@ -231,6 +231,28 @@ class TestSyncEngine(unittest.TestCase):
             self.assertIn("snapshots/market_screener_latest.parquet", manifest["files"])
             self.assertIn("snapshots__market_screener_latest.parquet", [p.name for p in stg.glob("*")])
 
+    def test_fo_option_chain_snapshot_in_manifest(self):
+        with tempfile.TemporaryDirectory() as src_dir, tempfile.TemporaryDirectory() as stg_dir:
+            src = Path(src_dir)
+            stg = Path(stg_dir)
+            fo_dir = src / "derivatives"
+            fo_dir.mkdir(parents=True)
+            df = pd.DataFrame([
+                {"Symbol": "NIFTY", "Date": pd.to_datetime("2026-01-01"), "ExpiryDate": pd.to_datetime("2026-01-29"), "StrikePrice": 24000.0, "OptionType": "CE", "Close": 100.0},
+                {"Symbol": "NIFTY", "Date": pd.to_datetime("2026-01-02"), "ExpiryDate": pd.to_datetime("2026-01-29"), "StrikePrice": 24000.0, "OptionType": "CE", "Close": 110.0},
+            ])
+            df.to_parquet(fo_dir / "nse_fo_2026.parquet")
+
+            prepare_release_staging(src, stg)
+            m_path = src / "manifest.json"
+            self.assertTrue(m_path.exists())
+            manifest = json.loads(m_path.read_text(encoding="utf-8"))
+            self.assertIn("snapshots/fo_option_chain_latest.parquet", manifest["files"])
+            self.assertIn("snapshots__fo_option_chain_latest.parquet", [p.name for p in stg.glob("*")])
+            snap_df = pd.read_parquet(stg / "snapshots__fo_option_chain_latest.parquet")
+            self.assertEqual(len(snap_df), 1)
+            self.assertEqual(snap_df.iloc[0]["Close"], 110.0)
+
 
 if __name__ == "__main__":
     unittest.main()

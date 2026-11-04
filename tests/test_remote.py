@@ -300,6 +300,85 @@ class TestRemoteAndStorageLayout(unittest.TestCase):
         self.assertEqual(len(res), 2)
         self.assertEqual(res.iloc[0]["Symbol"], "NIFTYBEES")
 
+    def test_remote_screener_cached_get_and_sql_filter(self):
+        client = RemoteLakeClient("user/bfinance-datalake", load_httpfs=False)
+        # Pre-seed cache as if downloaded in single GET
+        df_mock = pd.DataFrame({
+            "Symbol": ["RELIANCE", "TCS", "INFY"],
+            "Close": [2800.0, 3900.0, 1500.0],
+            "PE": [24.5, 29.1, 22.0],
+            "SMA_200": [2600.0, 3700.0, 1600.0],
+        })
+        client._screener_df_cache = df_mock
+
+        # Test full screener fetch (0 SQL filter)
+        all_df = client.screener()
+        self.assertEqual(len(all_df), 3)
+
+        # Test SQL filter in-memory DuckDB query
+        filtered = client.screener("Close > SMA_200 AND PE < 26")
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered.iloc[0]["Symbol"], "RELIANCE")
+
+    def test_remote_option_chain_single_pass_date_resolution(self):
+        client = RemoteLakeClient("user/bfinance-datalake", load_httpfs=False)
+        # Pre-populate max date cache or manifest watermark
+        client._manifest_cache = {
+            "latest_dates": {
+                "derivatives/nse_fo_2026.parquet": "2026-11-04",
+            }
+        }
+        resolved_date = client._get_latest_fo_date("nse", 2026, "http://dummy/nse_fo_2026.parquet")
+        self.assertEqual(resolved_date, "2026-11-04")
+
+        # 1. Test fast snapshot path
+        snapshot_queries = []
+        def mock_query_snap(q, params=None):
+            snapshot_queries.append((q, params))
+            return pd.DataFrame([{"Symbol": "WIPRO", "StrikePrice": 500.0, "OptionType": "CE"}])
+
+        client._safe_query = mock_query_snap
+        client._resolve_cdn_url = lambda u: u
+
+        res_snap = client.option_chain("WIPRO", year=2026, exchange="NSE")
+        self.assertEqual(len(res_snap), 1)
+        self.assertIn("snapshots__fo_option_chain_latest.parquet", snapshot_queries[0][0])
+
+        # 2. Test fallback to single-pass timestamp interval pushdown
+        yearly_queries = []
+        def mock_query_yearly(q, params=None):
+            yearly_queries.append((q, params))
+            if "snapshots__" in q:
+                return pd.DataFrame()  # simulate snapshot missing/empty
+            return pd.DataFrame([{"Symbol": "WIPRO", "StrikePrice": 500.0, "OptionType": "CE"}])
+
+        client._safe_query = mock_query_yearly
+        res_yearly = client.option_chain("WIPRO", year=2026, exchange="NSE")
+        self.assertEqual(len(res_yearly), 1)
+        last_sql, last_params = yearly_queries[-1]
+        self.assertIn("Date >= CAST(? AS TIMESTAMP)", last_sql)
+        self.assertEqual(last_params, ["WIPRO", "2026-11-04", "2026-11-04"])
+
+    def test_remote_ticker_index_local_disk_cache(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            client = RemoteLakeClient("user/bfinance-datalake", load_httpfs=False, cache_dir=tmp_dir)
+            index_payload = {
+                "version": 1,
+                "current_year": 2026,
+                "aliases": {"INFOSYSTCH": "INFY"},
+                "tickers": {"INFY": {"hist": [0, 500]}},
+            }
+            # Pre-populate disk cache file
+            cache_file = Path(tmp_dir) / "user__bfinance-datalake_datalake-latest_by_ticker__nse_index.json"
+            cache_file.write_text(json.dumps(index_payload), encoding="utf-8")
+
+            # Load index - should read directly from disk cache without network
+            data = client._load_ticker_index("NSE")
+            self.assertIsNotNone(data)
+            self.assertEqual(data["tickers"]["INFY"]["hist"], [0, 500])
+            self.assertEqual(data["aliases"]["INFOSYSTCH"], "INFY")
+
 
 if __name__ == "__main__":
     unittest.main()

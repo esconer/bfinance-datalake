@@ -333,6 +333,48 @@ def build_market_screener_snapshot(data_dir: Path, staging_dir: Path) -> dict | 
     }
 
 
+def build_fo_option_chain_snapshot(data_dir: Path, staging_dir: Path) -> dict | None:
+    """
+    Extracts the latest trading day's option chain across all F&O underlyings
+    into a compact ~850 KB Parquet file (`snapshots/fo_option_chain_latest.parquet`).
+    """
+    fo_dir = data_dir / "derivatives"
+    if not fo_dir.exists():
+        return None
+    curr_yr = today_ist().year
+    p = fo_dir / f"nse_fo_{curr_yr}.parquet"
+    if not p.exists():
+        p = fo_dir / f"nse_fo_{curr_yr - 1}.parquet"
+        if not p.exists():
+            return None
+    try:
+        df = read_table_safe(p)
+        if df.empty or "Date" not in df.columns:
+            return None
+        max_dt = df["Date"].max()
+        sort_cols = [c for c in ("Symbol", "ExpiryDate", "StrikePrice", "OptionType") if c in df.columns]
+        latest_df = df[df["Date"] == max_dt]
+        if sort_cols:
+            latest_df = latest_df.sort_values(sort_cols)
+        latest_df = latest_df.reset_index(drop=True)
+        if latest_df.empty:
+            return None
+
+        local_snap = data_dir / "snapshots" / "fo_option_chain_latest.parquet"
+        write_parquet_atomic(latest_df, local_snap, row_group_size=5_000)
+        asset_name = "snapshots__fo_option_chain_latest.parquet"
+        dst = staging_dir / asset_name
+        shutil.copy2(local_snap, dst)
+        return {
+            "asset_name": asset_name,
+            "size_bytes": dst.stat().st_size,
+            "sha256": compute_sha256(dst),
+        }
+    except Exception as exc:
+        logger.debug("[FO Snapshot] Note: %s", exc)
+        return None
+
+
 def _compute_curr_year_carry_factors(
     curr_frames: list[pd.DataFrame],
     alias_to_canon: dict[str, str],
@@ -605,9 +647,15 @@ def prepare_release_staging(
     staging_dir.mkdir(parents=True, exist_ok=True)
 
     screener_meta = build_market_screener_snapshot(data_dir, staging_dir)
+    fo_snap_meta = build_fo_option_chain_snapshot(data_dir, staging_dir)
     manifest = build_manifest(data_dir)
+    snapshots_meta = {}
     if screener_meta:
-        manifest["snapshots"] = {"market_screener_latest.parquet": screener_meta}
+        snapshots_meta["market_screener_latest.parquet"] = screener_meta
+    if fo_snap_meta:
+        snapshots_meta["fo_option_chain_latest.parquet"] = fo_snap_meta
+    if snapshots_meta:
+        manifest["snapshots"] = snapshots_meta
 
     compacted_meta = build_compacted_equity_bundles(
         data_dir, staging_dir, manifest, old_manifest=old_m, remote_sizes=remote_sizes
@@ -621,7 +669,7 @@ def prepare_release_staging(
     if packs_meta:
         manifest["by_ticker_packs"] = packs_meta
 
-    if compacted_meta or packs_meta or screener_meta:
+    if compacted_meta or packs_meta or snapshots_meta:
         (data_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     shutil.copy2(data_dir / "manifest.json", staging_dir / "manifest.json")
