@@ -901,16 +901,23 @@ class RemoteLakeClient:
         )
 
     def shareholding(self, symbol: str, exchange: str | None = None, use_pack: bool | None = None) -> pd.DataFrame:
-        """Stream a company's Shareholding & Promoter Pledge history from NSE or BSE."""
+        """Stream a company's Shareholding & Promoter Pledge history from NSE + BSE Dossier or httpfs."""
         sym, exch, _ = self._parse_symbol_and_exchange(symbol, exchange)
         should_use_pack = self.use_pack if use_pack is None else use_pack
         if should_use_pack:
             dos = self.dossier(sym)
-            key = "shareholding_bse" if exch == "BSE" and "shareholding_bse" in dos else "shareholding"
-            if key in dos:
-                return dos[key].copy()
-            if "shareholding_bse" in dos:
-                return dos["shareholding_bse"].copy()
+            nse_s = dos.get("shareholding", pd.DataFrame())
+            bse_s = dos.get("shareholding_bse", pd.DataFrame())
+            if exch == "BSE" and not bse_s.empty:
+                return bse_s.copy()
+            if exch == "NSE" and exchange is not None and not nse_s.empty:
+                return nse_s.copy()
+            if not nse_s.empty and not bse_s.empty:
+                return pd.concat([bse_s, nse_s], ignore_index=True)
+            if not nse_s.empty:
+                return nse_s.copy()
+            if not bse_s.empty:
+                return bse_s.copy()
             if self._load_ticker_index() is not None:
                 return pd.DataFrame()
 

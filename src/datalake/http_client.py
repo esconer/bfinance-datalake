@@ -118,6 +118,7 @@ class ResilientHTTPClient:
         self._nse_primed = False
         self._bse_primed = False
         self._nifty_primed = False
+        self._nsearchives_fail_streak = 0
         self._prime_lock = asyncio.Lock()
 
     def _active_ua(self) -> str:
@@ -152,6 +153,13 @@ class ResilientHTTPClient:
         prime_bse: bool = False,
         timeout: float = 60.0,
     ):
+        is_nsearchives = "nsearchives.nseindia.com" in url
+        if is_nsearchives:
+            if self._nsearchives_fail_streak >= 3:
+                raise RuntimeError("nsearchives.nseindia.com is unreachable from this runner IP")
+            retries = min(retries, 2)
+            timeout = min(timeout, 6.0)
+
         base_headers = headers or ARCHIVE_HEADERS
         is_exchange = any(k in url for k in ("nseindia.com", "bseindia.com", "niftyindices.com"))
         last_exc: Exception | None = None
@@ -196,7 +204,7 @@ class ResilientHTTPClient:
                 if resp.status_code in (401, 403):
                     if prime_nse or "nseindia.com" in url:
                         self._nse_primed = False
-                        await asyncio.sleep(1.5 * (attempt + 1))
+                        await asyncio.sleep(0.5 if is_nsearchives else 1.5 * (attempt + 1))
                         await self._prime_host("nse", reset_session=(attempt > 0))
                         continue
                     if prime_bse or "bseindia.com" in url:
@@ -216,10 +224,20 @@ class ResilientHTTPClient:
                         f"Truncated HTTP download from {url}: got {len(resp.content)} of {expected_len} bytes"
                     )
 
+                if is_nsearchives:
+                    if resp.status_code == 200:
+                        self._nsearchives_fail_streak = 0
+                    else:
+                        self._nsearchives_fail_streak += 1
                 return resp
             except Exception as exc:
                 last_exc = exc
-                await asyncio.sleep(1.5 * (2 ** attempt))
+                if is_nsearchives and attempt + 1 >= retries:
+                    self._nsearchives_fail_streak += 1
+                    break
+                await asyncio.sleep(0.5 if is_nsearchives else 1.5 * (2 ** attempt))
+        if is_nsearchives:
+            self._nsearchives_fail_streak += 1
         if last_exc:
             raise last_exc
         raise RuntimeError(f"Exhausted retries for {url}")
@@ -318,15 +336,19 @@ class ResilientHTTPClient:
                     if r.status_code == 200:
                         self._nse_primed = True
                 elif target == "bse" and not self._bse_primed:
-                    url = "https://www.bseindia.com/"
-                    if self.curl_session is not None:
-                        r = await self.curl_session.get(url, headers=prime_headers, timeout=30.0)
-                    elif self.client is not None:
-                        r = await self.client.get(url, headers=prime_headers)
-                    else:
-                        return
-                    if r.status_code == 200:
-                        self._bse_primed = True
+                    url = "https://api.bseindia.com/BseIndiaAPI/api/DefaultData/w"
+                    try:
+                        if self.curl_session is not None:
+                            await self.curl_session.get(
+                                url, headers={**prime_headers, "Referer": "https://www.bseindia.com/"}, timeout=5.0
+                            )
+                        elif self.client is not None:
+                            await self.client.get(
+                                url, headers={**prime_headers, "Referer": "https://www.bseindia.com/"}, timeout=5.0
+                            )
+                    except Exception:
+                        pass
+                    self._bse_primed = True
                 elif target == "nifty" and not self._nifty_primed:
                     url = "https://www.niftyindices.com/reports/historical-data"
                     if self.curl_session is not None:

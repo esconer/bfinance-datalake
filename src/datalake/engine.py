@@ -381,19 +381,26 @@ class UnifiedLakeEngine:
         s_dt = pd.Timestamp(start).normalize() if start else self._resolve_period_start(period, e_dt)
         ident, exch = self._infer_exchange(query, exchange)
         load_end_yr = max(e_dt.year, pd.Timestamp.now().year)
+        load_start_yr = s_dt.year if start else max(1990, s_dt.year - 1)
 
         lookup_key = (ident.bse_code or ident.symbol) if exch == "BSE" else ident.symbol
-        raw = self._cached_raw_equity(lookup_key, exch, s_dt.year, load_end_yr)
+        raw = self._cached_raw_equity(lookup_key, exch, load_start_yr, load_end_yr)
         # Auto-fallback to the other exchange if no explicit suffix/exchange was forced
         if raw.empty and exchange is None and self._strip_exchange_tag(query)[1] is None:
             alt_exch = "BSE" if exch == "NSE" else "NSE"
             alt_key = (ident.bse_code or ident.symbol) if alt_exch == "BSE" else ident.symbol
-            raw = self._cached_raw_equity(alt_key, alt_exch, s_dt.year, load_end_yr)
+            raw = self._cached_raw_equity(alt_key, alt_exch, load_start_yr, load_end_yr)
             if not raw.empty:
                 exch = alt_exch
 
         if raw.empty:
             return pd.DataFrame()
+
+        if end is None and start is None and period is not None and "Date" in raw.columns:
+            max_raw_dt = pd.to_datetime(raw["Date"]).max()
+            if pd.notna(max_raw_dt):
+                e_dt = pd.Timestamp(max_raw_dt).normalize()
+                s_dt = self._resolve_period_start(period, e_dt)
 
         key_for_actions = ident.symbol if exch == "NSE" else (ident.bse_code or ident.symbol)
         adj = self.adjuster.apply_adjustments(
@@ -525,6 +532,8 @@ class UnifiedLakeEngine:
             if ident.bse_code
             else pd.DataFrame()
         )
+        if bse_df.empty:
+            bse_df = self._read_filtered_parquet(bse_p, filters=[("Symbol", "in", list(ident.aliases))])
         frames = []
         if not nse_df.empty:
             ndf = nse_df.copy()
@@ -775,7 +784,7 @@ class UnifiedLakeEngine:
             df = df[df["Date"] <= pd.Timestamp(end)]
 
         # Prefer TRI where available, falling back to Close
-        df["_Val"] = df["TRI"].where(df.get("TRI", pd.Series(dtype=float)).notna(), df["Close"])
+        df["_Val"] = df["TRI"].where(df["TRI"].notna(), df["Close"]) if "TRI" in df.columns else df["Close"]
         piv = df.pivot_table(index="Date", columns="IndexName", values="_Val", aggfunc="last").sort_index()
         rets = piv.pct_change(fill_method=None)
 

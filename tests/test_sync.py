@@ -280,6 +280,129 @@ class TestSyncEngine(unittest.TestCase):
             self.assertEqual(len(payload["option_chain"]), 1)
             self.assertEqual(payload["option_chain"][0]["StrikePrice"], 2800.0)
 
+    def test_dossier_pack_scrip_code_always_overrides_symbol_for_tcs(self):
+        import zlib
+        from datalake.remote import RemoteLakeClient
+        from datalake.sync import build_company_dossier_pack
+
+        with tempfile.TemporaryDirectory() as src_dir, tempfile.TemporaryDirectory() as stg_dir:
+            src = Path(src_dir)
+            stg = Path(stg_dir)
+            shp_dir = src / "shareholding"
+            shp_dir.mkdir(parents=True)
+
+            # Simulate BSE shareholding history where Symbol was set to numeric "532540"
+            bse_shp = pd.DataFrame([
+                {
+                    "Symbol": "532540",
+                    "ScripCode": "532540",
+                    "QuarterId": f"Q{i}",
+                    "QuarterStr": f"Q{i} FY26",
+                    "PromoterPct": 71.77,
+                    "PublicPct": 28.23,
+                }
+                for i in range(1, 108)
+            ])
+            bse_shp.to_parquet(shp_dir / "bse_shareholding_history.parquet")
+
+            offsets = build_company_dossier_pack(
+                src,
+                stg,
+                alias_to_canon={"TCS": "TCS"},
+                scrip_to_canon={"532540": "TCS"},
+            )
+            self.assertIn("TCS", offsets)
+            self.assertNotIn("532540", offsets)
+
+            pack_file = stg / "by_ticker__nse_dossier.pack"
+            off, length = offsets["TCS"]
+            with pack_file.open("rb") as f:
+                f.seek(off)
+                payload = json.loads(zlib.decompress(f.read(length)).decode("utf-8"))
+            self.assertIn("shareholding_bse", payload)
+            self.assertEqual(len(payload["shareholding_bse"]), 107)
+
+            # Verify RemoteLakeClient.shareholding("TCS") returns all 107 quarters
+            client = RemoteLakeClient("user/bfinance-datalake", load_httpfs=False, use_pack=True)
+            client._dossier_cache["TCS"] = {
+                "shareholding_bse": pd.DataFrame(payload["shareholding_bse"]),
+            }
+            shp_df = client.shareholding("TCS")
+            self.assertEqual(len(shp_df), 107)
+
+    def test_bse_financials_fallback_and_shp_ixbrl_typed_member(self):
+        from datalake.config import LakeConfig
+        from datalake.scrapers.xbrl import XBRLScraper
+        from datalake.state import StateStore
+
+        sample_ixbrl = b"""<?xml version="1.0" encoding="utf-8"?>
+        <html xmlns:xbrli="http://www.xbrl.org/2003/instance"
+              xmlns:xbrldi="http://xbrl.org/2006/xbrldi"
+              xmlns:ix="http://www.xbrl.org/2013/inlineXBRL"
+              xmlns:in-bse-shp="http://www.bseindia.com/xbrl/shp/2022-09-30/in-bse-shp">
+          <head>
+            <xbrli:context id="OneD_Promo">
+              <xbrli:entity><xbrli:identifier scheme="http://www.bseindia.com">500325</xbrli:identifier>
+                <xbrli:segment>
+                  <xbrldi:explicitMember dimension="in-bse-shp:ShareholdingPatternAxis">in-bse-shp:ShareholdingOfPromoterAndPromoterGroupMember</xbrldi:explicitMember>
+                </xbrli:segment>
+              </xbrli:entity>
+            </xbrli:context>
+            <xbrli:context id="TypedOnly_Ctx1">
+              <xbrli:entity><xbrli:identifier scheme="http://www.bseindia.com">500325</xbrli:identifier>
+                <xbrli:segment>
+                  <xbrldi:typedMember dimension="in-bse-shp:DetailsOfSharesHeldByIndividualsOrHUFAxis">
+                    <in-bse-shp:DetailsOfSharesHeldByIndividualsOrHUFDomain>IndividualsOrHUF1</in-bse-shp:DetailsOfSharesHeldByIndividualsOrHUFDomain>
+                  </xbrldi:typedMember>
+                </xbrli:segment>
+              </xbrli:entity>
+            </xbrli:context>
+          </head>
+          <body>
+            <ix:nonFraction contextRef="OneD_Promo" name="in-bse-shp:ShareholdingAsAPercentageOfTotalNumberOfShares">50.01</ix:nonFraction>
+            <ix:nonNumeric contextRef="TypedOnly_Ctx1" name="in-bse-shp:NameOfTheShareholder">Life Insurance Corporation of India</ix:nonNumeric>
+            <ix:nonFraction contextRef="TypedOnly_Ctx1" name="in-bse-shp:ShareholdingAsAPercentageOfTotalNumberOfShares">6.45</ix:nonFraction>
+          </body>
+        </html>
+        """
+        parsed = XBRLScraper.parse_full_shp_xbrl(sample_ixbrl)
+        self.assertEqual(parsed["summary"]["PromoterPct"], 50.01)
+        self.assertEqual(len(parsed["named_holders"]), 1)
+        self.assertEqual(parsed["named_holders"][0]["HolderName"], "Life Insurance Corporation of India")
+        self.assertEqual(parsed["named_holders"][0]["PctOfTotal"], 6.45)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cfg = LakeConfig(root_dir=Path(tmp_dir))
+            state = StateStore(cfg.state_db_path)
+            mock_http = AsyncMock()
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.text = json.dumps({
+                "QtlyinCr": (
+                    "<table><tr><td>Particulars</td><td>Sep-26</td><td>Jun-26</td></tr>"
+                    "<tr><td>Revenue</td><td>65,000.00</td><td>64,000.00</td></tr>"
+                    "<tr><td>Net Profit</td><td>12,500.00</td><td>12,100.00</td></tr>"
+                    "<tr><td>EPS</td><td>34.50</td><td>33.40</td></tr></table>"
+                ),
+                "AnninCr": (
+                    "<table><tr><td>Particulars</td><td>2026</td><td>2025</td></tr>"
+                    "<tr><td>Revenue</td><td>255,000.00</td><td>240,000.00</td></tr>"
+                    "<tr><td>Net Profit</td><td>48,500.00</td><td>45,900.00</td></tr>"
+                    "<tr><td>EPS</td><td>134.00</td><td>126.80</td></tr></table>"
+                ),
+            })
+            mock_resp.json.return_value = json.loads(mock_resp.text)
+            mock_http.get.return_value = mock_resp
+
+            scraper = XBRLScraper(mock_http, state, cfg)
+            count = asyncio.run(scraper.sync_symbol_financials_bse("532540", "TCS"))
+            self.assertEqual(count, 4)
+            fin_df = pd.read_parquet(cfg.root_dir / "fundamentals" / "xbrl_financials.parquet")
+            self.assertEqual(len(fin_df), 4)
+            self.assertEqual(set(fin_df["Symbol"]), {"TCS"})
+            self.assertEqual(set(fin_df["PeriodType"]), {"Quarterly", "Annual"})
+
 
 if __name__ == "__main__":
     unittest.main()
+

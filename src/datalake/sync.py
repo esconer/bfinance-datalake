@@ -247,7 +247,7 @@ def build_company_dossier_pack(
         "financials": ("fundamentals/xbrl_financials.parquet", "Symbol", None),
         "shareholding": ("shareholding/nse_shareholding_summary.parquet", "Symbol", None),
         "shareholding_bse": ("shareholding/bse_shareholding_history.parquet", "Symbol", "ScripCode"),
-        "named_holders": ("shareholding/named_shareholders.parquet", "Symbol", None),
+        "named_holders": ("shareholding/named_shareholders.parquet", "Symbol", "ScripCode"),
         "actions": ("actions/nse_corporate_actions.parquet", "symbol", None),
         "actions_bse": ("actions/bse_corporate_actions.parquet", "short_name", "scrip_code"),
         "deals": ("deals/bulk_block_deals.parquet", "Symbol", None),
@@ -267,20 +267,17 @@ def build_company_dossier_pack(
         for col in df.select_dtypes(include=["datetime64[ns]", "datetimetz"]).columns:
             df[col] = df[col].dt.strftime("%Y-%m-%d")
 
-        if scrip_col and scrip_col in df.columns:
-            sc_s = df[scrip_col].fillna("").astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
-        else:
-            sc_s = pd.Series([""] * len(df), index=df.index)
-
         if sym_col and sym_col in df.columns:
             raw_s = df[sym_col].fillna("").astype(str).str.strip().str.upper()
         else:
             raw_s = pd.Series([""] * len(df), index=df.index)
 
         if scrip_col and scrip_col in df.columns:
-            # Map BSE ScripCode -> Canonical NSE Symbol (or keep ScripCode for BSE-only stocks)
-            mapped_sc = sc_s.map(lambda sc: scrip_map.get(sc, sc))
+            sc_s = df[scrip_col].fillna("").astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
+            mapped_sc = sc_s.map(lambda sc: scrip_map.get(sc, ""))
+            # Always prefer canonical NSE symbol mapped from ScripCode (fixes '532540' -> 'TCS')
             raw_s = mapped_sc.where(mapped_sc != "", raw_s)
+            raw_s = raw_s.where(~raw_s.isin(["", "NAN", "NONE"]), sc_s)
 
         df["_CanonSym"] = raw_s.map(lambda s: alias_to_canon.get(s, s))
         for sym, grp in df.groupby("_CanonSym"):

@@ -73,7 +73,9 @@ async def run_backfill(
         await dd.sync_bulk_and_block_deals()
         await dd.backfill_historical_bulk_block_deals(start_year=max(2005, start.year), end_year=end.year, force=force)
         await dd.sync_insider_trading_pit(start_date=max(date(2018, 1, 1), start), end_date=end, force=force)
-        await dd.sync_concalls_and_presentations(start_date=max(end - timedelta(days=90), start), end_date=end)
+        await dd.sync_concalls_and_presentations(start_date=max(end - timedelta(days=365), start), end_date=end)
+        xbrl = XBRLScraper(http, state, cfg)
+        await xbrl.sync_recent_market_financials_nse()
 
         logger.info("=== Step 6/6: AMFI Mutual Fund NAVs ===")
         await ff.sync_amfi_daily()
@@ -124,9 +126,8 @@ async def run_daily_update(cfg: LakeConfig, lookback_days: int = 7, include_fo: 
         await dd.sync_bulk_and_block_deals()
         await dd.sync_insider_trading_pit(default_start, today)
         await dd.sync_concalls_and_presentations(default_start, today)
+        await XBRLScraper(http, state, cfg).sync_recent_market_financials_nse()
         await ff.sync_amfi_daily()
-        xbrl = XBRLScraper(http, state, cfg)
-        await xbrl.sync_recent_market_financials_nse()
 
     LakeDoctor(cfg).run_full_check_and_repair()
 
@@ -156,9 +157,10 @@ async def run_xbrl_sync(
             except Exception as exc:
                 logger.warning("[XBRL CLI] Failed symbol %s: %s", sym, exc)
         if bse_scrips:
-            for scrip in bse_scrips:
+            for idx_s, scrip in enumerate(bse_scrips):
+                matched_sym = symbols[idx_s] if idx_s < len(symbols) else None
                 try:
-                    await xbrl.sync_bse_shareholding(scrip)
+                    await xbrl.sync_bse_shareholding(scrip, symbol=matched_sym)
                 except Exception as exc:
                     logger.warning("[XBRL CLI] Failed BSE scrip %s: %s", scrip, exc)
             await dd.sync_annual_reports_bse(bse_scrips, symbols=symbols)

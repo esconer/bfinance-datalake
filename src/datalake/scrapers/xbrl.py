@@ -98,9 +98,55 @@ def _safe_float(v: object) -> float:
         return float("nan")
 
 
+_DEFAULT_BSE_SCRIP_MAP = {
+    "RELIANCE": "500325",
+    "TCS": "532540",
+    "HDFCBANK": "500180",
+    "INFY": "500209",
+    "ICICIBANK": "532174",
+    "SBIN": "500112",
+    "ITC": "500875",
+    "WIPRO": "507685",
+    "BHARTIARTL": "532454",
+    "LT": "500510",
+    "AXISBANK": "532215",
+    "KOTAKBANK": "500247",
+    "MARUTI": "532500",
+    "SUNPHARMA": "524715",
+    "TATAMOTORS": "500570",
+}
+
+
+def _parse_bse_period_header(hdr: str, is_annual_table: bool) -> tuple[str, str | None, str | None]:
+    h = str(hdr or "").strip()
+    if not h:
+        return ("Annual" if is_annual_table else "Quarterly"), None, None
+    if h.upper().startswith("FY"):
+        parts = h.upper().replace("FY", "").strip().split("-")
+        if len(parts) == 2 and parts[-1].strip().isdigit():
+            yr = int(parts[-1].strip())
+            if yr < 100:
+                yr += 2000
+            return "Annual", f"{yr - 1}-04-01", f"{yr}-03-31"
+    if h.isdigit() and len(h) == 4:
+        yr = int(h)
+        return "Annual", f"{yr - 1}-04-01", f"{yr}-03-31"
+    try:
+        dt = pd.to_datetime("01-" + h, format="%d-%b-%y", errors="coerce")
+        if pd.notna(dt):
+            end_dt = (dt + pd.offsets.MonthEnd(1)).date()
+            if is_annual_table:
+                return "Annual", f"{end_dt.year - 1}-04-01", end_dt.isoformat()
+            start_dt = (dt - pd.DateOffset(months=2)).date().replace(day=1)
+            return "Quarterly", start_dt.isoformat(), end_dt.isoformat()
+    except Exception:
+        pass
+    return ("Annual" if is_annual_table else "Quarterly"), None, h
+
+
 class XBRLScraper:
     """
-    Discovers and parses NSE/BSE Ind-AS Financial XBRL XMLs (with JSON fallback when XBRL link is '/-')
+    Discovers and parses NSE/BSE Ind-AS Financial XBRL XMLs (with JSON & BSE fallback when NSE is blocked)
     and Shareholding XBRL/iXBRLs (Promoter Pledge, FPI/MF/Insurance %, and Named >1% Holders).
     """
 
@@ -109,6 +155,50 @@ class XBRLScraper:
         self.state = state
         self.cfg = cfg
 
+    def _build_bse_nse_maps(self) -> tuple[dict[str, str], dict[str, str]]:
+        sym_to_scrip: dict[str, str] = dict(_DEFAULT_BSE_SCRIP_MAP)
+        scrip_to_sym: dict[str, str] = {v: k for k, v in _DEFAULT_BSE_SCRIP_MAP.items()}
+        nse_master = self.cfg.root_dir / "universe" / "nse_equity_master.parquet"
+        bse_master = self.cfg.root_dir / "universe" / "bse_scrip_master.parquet"
+        isin_to_sym: dict[str, str] = {}
+        if nse_master.exists():
+            ndf = read_table_safe(nse_master)
+            isin_col = next((c for c in ndf.columns if "ISIN" in c.upper()), None)
+            sym_col = next((c for c in ndf.columns if c.strip().upper() == "SYMBOL"), "SYMBOL")
+            if sym_col in ndf.columns and isin_col:
+                for r in ndf[[sym_col, isin_col]].dropna().to_dict("records"):
+                    s = str(r[sym_col]).strip().upper()
+                    isin = str(r[isin_col]).strip().upper()
+                    if s and isin:
+                        isin_to_sym[isin] = s
+        if bse_master.exists():
+            bdf = read_table_safe(bse_master)
+            for r in bdf.to_dict("records"):
+                sc = str(r.get("SCRIP_CD") or "").replace(".0", "").strip()
+                if not sc:
+                    continue
+                isin = str(r.get("ISIN_NUMBER") or "").strip().upper()
+                scrip_id = str(r.get("scrip_id") or "").strip().upper()
+                matched = isin_to_sym.get(isin) or scrip_id
+                if matched:
+                    if matched not in sym_to_scrip:
+                        sym_to_scrip[matched] = sc
+                    if sc not in scrip_to_sym:
+                        scrip_to_sym[sc] = matched
+        return sym_to_scrip, scrip_to_sym
+
+    def _resolve_bse_scrip_for_symbol(self, symbol: str) -> str | None:
+        sym = symbol.strip().upper()
+        bse_master = self.cfg.root_dir / "universe" / "bse_scrip_master.parquet"
+        if bse_master.exists():
+            bdf = read_table_safe(bse_master)
+            if "scrip_id" in bdf.columns and "SCRIP_CD" in bdf.columns:
+                m = bdf[bdf["scrip_id"].astype(str).str.strip().str.upper() == sym]
+                if not m.empty:
+                    return str(m.iloc[0]["SCRIP_CD"]).replace(".0", "").strip()
+        sym_to_scrip, _ = self._build_bse_nse_maps()
+        return sym_to_scrip.get(sym)
+
     async def sync_all_market(
         self, max_companies: int | None = None, force: bool = False
     ) -> tuple[list[str], list[str]]:
@@ -116,12 +206,16 @@ class XBRLScraper:
         bse_master = self.cfg.root_dir / "universe" / "bse_scrip_master.parquet"
         synced_syms: list[str] = []
         synced_scrips: list[str] = []
+        sym_to_scrip, scrip_to_sym = self._build_bse_nse_maps()
 
         if nse_master.exists():
             ndf = read_table_safe(nse_master)
             done_fin = self.state.completed_keys("xbrl_financials_symbol")
             done_shp = self.state.completed_keys("nse_shareholding_symbol")
-            all_syms = ndf["SYMBOL"].dropna().astype(str).str.strip().unique().tolist()
+            raw_syms = ndf["SYMBOL"].dropna().astype(str).str.strip().unique().tolist()
+            prio_syms = [s for s in _DEFAULT_BSE_SCRIP_MAP if s in raw_syms]
+            other_syms = [s for s in raw_syms if s not in _DEFAULT_BSE_SCRIP_MAP]
+            all_syms = prio_syms + other_syms
             syms = all_syms if force else [s for s in all_syms if not (s in done_fin and s in done_shp)]
             if max_companies:
                 syms = syms[:max_companies]
@@ -150,7 +244,12 @@ class XBRLScraper:
             bdf = read_table_safe(bse_master)
             bdf = bdf[bdf["Status"] == "Active"] if "Status" in bdf.columns else bdf
             done_bse = self.state.completed_keys("bse_shareholding")
-            all_scrips = bdf["SCRIP_CD"].dropna().astype(str).str.strip().unique().tolist()
+            raw_scrips = [str(x).replace(".0", "").strip() for x in bdf["SCRIP_CD"].dropna().unique().tolist()]
+            # Prioritize core bluechips and NSE-crosswalked scrips so e.g. 532540 (TCS) is synced first
+            core_scrips = [sc for sc in _DEFAULT_BSE_SCRIP_MAP.values() if sc in raw_scrips]
+            nse_mapped_scrips = [sc for sc in raw_scrips if sc in scrip_to_sym and sc not in core_scrips]
+            bse_only_scrips = [sc for sc in raw_scrips if sc not in scrip_to_sym]
+            all_scrips = core_scrips + nse_mapped_scrips + bse_only_scrips
             scrips = all_scrips if force else [sc for sc in all_scrips if sc not in done_bse]
             if max_companies:
                 scrips = scrips[:max_companies]
@@ -161,7 +260,7 @@ class XBRLScraper:
                 async def _sync_one_scrip(sc: str) -> None:
                     async with sem_bse:
                         try:
-                            await self.sync_bse_shareholding(sc)
+                            await self.sync_bse_shareholding(sc, symbol=scrip_to_sym.get(sc))
                         except Exception as exc:
                             logger.warning("[XBRL All-Market] BSE Shareholding failed for %s: %s", sc, exc)
                         await asyncio.sleep(self.cfg.polite_delay_sec)
@@ -175,6 +274,7 @@ class XBRLScraper:
         """
         Fetches NSE's market-wide recent financial results manifest in 1 HTTP call and
         ingests any new quarterly/annual XBRL filings not yet in `state.db`.
+        Automatically falls back to BSE financials if NSE is blocked on cloud runners.
         """
         rows: list[dict] = []
         sem = asyncio.Semaphore(4)
@@ -223,14 +323,151 @@ class XBRLScraper:
                 for b in batches:
                     rows.extend(b)
 
+        target = self.cfg.root_dir / "fundamentals" / "xbrl_financials.parquet"
         if rows:
-            target = self.cfg.root_dir / "fundamentals" / "xbrl_financials.parquet"
             upsert_parquet_partition(
                 pd.DataFrame(rows),
                 target,
                 dedup_cols=["Symbol", "NatureOfReport", "PeriodType", "PeriodStart", "PeriodEnd"],
                 sort_cols=["Symbol", "PeriodEnd", "PeriodType", "FilingDate"],
             )
+            return len(rows)
+
+        # Fallback: if NSE was blocked on a cloud runner or xbrl_financials.parquet does not exist yet,
+        # populate financials from BSE for core benchmark equities so financials are never empty
+        bse_total = 0
+        done_fin = self.state.completed_keys("xbrl_financials_symbol")
+        for sym, sc in _DEFAULT_BSE_SCRIP_MAP.items():
+            if not target.exists() or sym not in done_fin:
+                try:
+                    bse_total += await self.sync_symbol_financials_bse(sc, sym)
+                except Exception as exc:
+                    logger.debug("[BSE Market Financials Fallback %s] %s", sym, exc)
+        return bse_total
+
+    async def sync_symbol_financials_bse(self, scrip_code: str, symbol: str) -> int:
+        """
+        Fallback financial statements fetcher via `api.bseindia.com` (works reliably on GitHub Actions
+        US runners even when Akamai blocks `www.nseindia.com`).
+        Queries both `GetReportNewFor_Result/w` (5 Quarterly + 5 Annual statements in Rs Cr) and `PeerGp/w`.
+        """
+        sc = str(scrip_code).replace(".0", "").strip()
+        sym = symbol.strip().upper()
+        if not sc:
+            return 0
+        rows: list[dict] = []
+
+        # 1. Primary BSE structured results endpoint (`GetReportNewFor_Result/w` -> `QtlyinCr` & `AnninCr`)
+        rep_url = f"https://api.bseindia.com/BseIndiaAPI/api/GetReportNewFor_Result/w?scripcode={sc}"
+        try:
+            resp = await self.http.get(rep_url, headers=BSE_API_HEADERS, prime_bse=True)
+            if resp.status_code == 200 and resp.text.strip().startswith("{"):
+                data = resp.json()
+                row_map = {
+                    "revenue": "Sales_Cr",
+                    "interest earned": "InterestEarned_Cr",
+                    "other income": "OtherIncome_Cr",
+                    "total income": "TotalIncome_Cr",
+                    "interest": "Interest_Cr",
+                    "interest expended": "InterestExpended_Cr",
+                    "depreciation": "Depreciation_Cr",
+                    "pbt": "PBT_Cr",
+                    "tax": "Tax_Cr",
+                    "net profit": "NetProfit_Cr",
+                    "equity": "EquityCapital_Cr",
+                    "eps": "BasicEPS_Rs",
+                }
+                for tbl_key, is_ann in (("QtlyinCr", False), ("AnninCr", True)):
+                    raw_html = str(data.get(tbl_key) or "").strip()
+                    if not raw_html:
+                        continue
+                    root = etree.HTML("<table>" + raw_html + "</table>")
+                    if root is None:
+                        continue
+                    headers: list[str] = []
+                    metrics_by_col: dict[int, dict[str, float]] = {}
+                    for tr in root.xpath("//tr"):
+                        cells = ["".join(td.itertext()).strip() for td in tr.xpath("./td|./th")]
+                        if not cells:
+                            continue
+                        if cells[0].strip().lower().startswith(("(in cr", "particulars")) and len(cells) > 1:
+                            headers = cells[1:]
+                            metrics_by_col = {i: {} for i in range(len(headers))}
+                            continue
+                        if not headers or len(cells) < 2:
+                            continue
+                        col_target = row_map.get(cells[0].strip().lower())
+                        if not col_target:
+                            continue
+                        for idx, val_str in enumerate(cells[1 : len(headers) + 1]):
+                            fval = _safe_float(val_str)
+                            if pd.notna(fval):
+                                if col_target in ("Interest_Cr", "Depreciation_Cr", "Tax_Cr", "InterestExpended_Cr"):
+                                    fval = abs(fval)
+                                metrics_by_col[idx][col_target] = fval
+                    for idx, h_str in enumerate(headers):
+                        m = metrics_by_col.get(idx, {})
+                        if not m:
+                            continue
+                        if "Sales_Cr" not in m and "InterestEarned_Cr" in m:
+                            m["Sales_Cr"] = m["InterestEarned_Cr"]
+                        ptype, pstart, pend = _parse_bse_period_header(h_str, is_ann)
+                        if not pend or (pd.isna(m.get("Sales_Cr", float("nan"))) and pd.isna(m.get("NetProfit_Cr", float("nan")))):
+                            continue
+                        rows.append({
+                            "Symbol": sym,
+                            "NatureOfReport": "Consolidated",
+                            "PeriodType": ptype,
+                            "PeriodStart": pstart,
+                            "PeriodEnd": pend,
+                            "FilingDate": pend,
+                            "SourceURL": rep_url,
+                            **m,
+                        })
+        except Exception as exc:
+            logger.debug("[BSE GetReportNewFor_Result %s] %s", sym, exc)
+
+        # 2. Secondary fallback (`PeerGp/w`) if `GetReportNewFor_Result/w` returned no rows
+        if not rows:
+            try:
+                q_url = f"https://api.bseindia.com/BseIndiaAPI/api/PeerGp/w?scripcode={sc}&scripcomare="
+                resp = await self.http.get(q_url, headers=BSE_API_HEADERS, prime_bse=True)
+                if resp.status_code == 200 and resp.text.strip().startswith("{"):
+                    data = resp.json()
+                    for tbl_key in ("Table", "Table1"):
+                        for item in data.get(tbl_key, []) or []:
+                            qtr = str(item.get("Qtr") or item.get("Year") or "").strip()
+                            sales = _safe_float(item.get("Sales") or item.get("NetSales") or item.get("TotalIncome"))
+                            pat = _safe_float(item.get("NP") or item.get("NetProfit") or item.get("PAT"))
+                            eps = _safe_float(item.get("EPS") or item.get("BasicEPS"))
+                            if qtr and (pd.notna(sales) or pd.notna(pat)):
+                                ptype, pstart, pend = _parse_bse_period_header(
+                                    qtr, "FY" in qtr.upper() or len(qtr) == 4
+                                )
+                                rows.append({
+                                    "Symbol": sym,
+                                    "NatureOfReport": "Consolidated",
+                                    "PeriodType": ptype,
+                                    "PeriodStart": pstart,
+                                    "PeriodEnd": pend or qtr,
+                                    "FilingDate": pend or qtr,
+                                    "SourceURL": q_url,
+                                    "Sales_Cr": sales,
+                                    "NetProfit_Cr": pat,
+                                    "BasicEPS_Rs": eps,
+                                })
+            except Exception as exc:
+                logger.debug("[BSE Financials Fallback %s] %s", sym, exc)
+
+        if rows:
+            target = self.cfg.root_dir / "fundamentals" / "xbrl_financials.parquet"
+            upsert_parquet_partition(
+                pd.DataFrame(rows),
+                target,
+                dedup_cols=["Symbol", "NatureOfReport", "PeriodType", "PeriodEnd"],
+                sort_cols=["Symbol", "PeriodEnd", "PeriodType"],
+            )
+            self.state.record("xbrl_financials_symbol", sym, "OK", len(rows))
         return len(rows)
 
     async def sync_symbol_financials_nse(self, symbol: str) -> None:
@@ -239,6 +476,16 @@ class XBRLScraper:
         any_200_ok = False
         already_completed_filings = 0
 
+        # 1. Seed baseline Quarterly + Annual financials from BSE (`api.bseindia.com` works 100% on US/cloud IPs)
+        sc = self._resolve_bse_scrip_for_symbol(sym)
+        bse_rows = 0
+        if sc:
+            try:
+                bse_rows = await self.sync_symbol_financials_bse(sc, sym)
+            except Exception as exc:
+                logger.debug("[BSE Baseline Financials %s] %s", sym, exc)
+
+        # 2. Enrich/upsert with NSE Ind-AS XBRL statements (full P&L + Balance Sheet + Cash Flow) when reachable
         for period in ("Quarterly", "Annual"):
             disc_url = (
                 f"https://www.nseindia.com/api/corporates-financial-results"
@@ -257,7 +504,10 @@ class XBRLScraper:
                 logger.debug("[XBRL Financials %s %s] %s", sym, period, exc)
                 continue
 
-            for item in filings:
+            sem = asyncio.Semaphore(4)
+
+            async def _process_fin_item(item: dict) -> list[dict]:
+                nonlocal already_completed_filings
                 filing_dt = (
                     item.get("filingDate")
                     or item.get("re_create_dt")
@@ -268,40 +518,43 @@ class XBRLScraper:
                 if _is_valid_xbrl_url(xbrl_url):
                     filing_key = f"{sym}:{xbrl_url.split('/')[-1]}"
                     if not self.state.is_completed("xbrl_financials", filing_key):
-                        try:
-                            xml_resp = await self.http.get(xbrl_url, headers=ARCHIVE_HEADERS, prime_nse=True)
-                            if xml_resp.status_code == 200 and b"<" in xml_resp.content[:200]:
-                                parsed_rows = self.parse_indas_xbrl(
-                                    xml_resp.content, default_symbol=sym, source_url=xbrl_url, filing_date=filing_dt
-                                )
-                                if parsed_rows:
-                                    rows.extend(parsed_rows)
-                                    self.state.record(
-                                        "xbrl_financials", filing_key, "OK", len(parsed_rows), xml_resp.content, xbrl_url
+                        async with sem:
+                            try:
+                                xml_resp = await self.http.get(xbrl_url, headers=ARCHIVE_HEADERS, prime_nse=True, timeout=15.0)
+                                if xml_resp.status_code == 200 and b"<" in xml_resp.content[:200]:
+                                    parsed_rows = self.parse_indas_xbrl(
+                                        xml_resp.content, default_symbol=sym, source_url=xbrl_url, filing_date=filing_dt
                                     )
-                                    continue
-                        except Exception:
-                            pass
+                                    if parsed_rows:
+                                        self.state.record(
+                                            "xbrl_financials", filing_key, "OK", len(parsed_rows), xml_resp.content, xbrl_url
+                                        )
+                                        return parsed_rows
+                            except Exception:
+                                pass
                     else:
                         already_completed_filings += 1
-                        continue
+                        return []
 
                 # JSON Fallback when `xbrl` is `.../corporate/xbrl/-` or XML download unavailable
                 fb_row = self._extract_json_financial_row(item, sym, period, filing_date=filing_dt)
-                if fb_row is not None:
-                    rows.append(fb_row)
+                return [fb_row] if fb_row is not None else []
+
+            batches = await asyncio.gather(*[_process_fin_item(it) for it in filings])
+            for b in batches:
+                rows.extend(b)
 
         if rows:
             target = self.cfg.root_dir / "fundamentals" / "xbrl_financials.parquet"
             upsert_parquet_partition(
                 pd.DataFrame(rows),
                 target,
-                dedup_cols=["Symbol", "NatureOfReport", "PeriodType", "PeriodStart", "PeriodEnd"],
+                dedup_cols=["Symbol", "NatureOfReport", "PeriodType", "PeriodEnd"],
                 sort_cols=["Symbol", "PeriodEnd", "PeriodType", "FilingDate"],
             )
-            self.state.record("xbrl_financials_symbol", sym, "OK", len(rows))
-        elif already_completed_filings > 0:
-            self.state.record("xbrl_financials_symbol", sym, "OK", already_completed_filings)
+            self.state.record("xbrl_financials_symbol", sym, "OK", len(rows) + bse_rows)
+        elif already_completed_filings > 0 or bse_rows > 0:
+            self.state.record("xbrl_financials_symbol", sym, "OK", already_completed_filings + bse_rows)
         elif any_200_ok:
             self.state.record("xbrl_financials_symbol", sym, "HOLIDAY")
 
@@ -332,13 +585,22 @@ class XBRLScraper:
         if inc_lakhs is None and pat_lakhs is None:
             return None
 
+        def _iso_dt(val: str | None) -> str | None:
+            if not val:
+                return None
+            s = str(val).strip()
+            try:
+                return pd.to_datetime(s, format="mixed", dayfirst=True).strftime("%Y-%m-%d")
+            except Exception:
+                return s
+
         nature = item.get("consolidated") or "Standalone"
         return {
             "Symbol": item.get("symbol") or default_symbol,
             "NatureOfReport": str(nature).strip(),
             "PeriodType": default_period,
-            "PeriodStart": str(from_dt).strip() if from_dt else None,
-            "PeriodEnd": str(to_dt).strip(),
+            "PeriodStart": _iso_dt(from_dt),
+            "PeriodEnd": _iso_dt(to_dt) or str(to_dt).strip(),
             "FilingDate": str(filing_date).strip() if filing_date else None,
             "SourceURL": "https://www.nseindia.com/api/corporates-financial-results",
             "Sales_Cr": round(inc_lakhs / 100.0, 4) if inc_lakhs is not None else None,
@@ -490,13 +752,17 @@ class XBRLScraper:
 
         summary_rows = []
         named_rows = []
-        for item in items:
+        sem = asyncio.Semaphore(6)
+        xbrl_fetched = 0
+
+        async def _process_shp_item(item: dict) -> tuple[dict | None, list[dict]]:
+            nonlocal xbrl_fetched
             if not isinstance(item, dict):
-                continue
+                return None, []
             xbrl_url = item.get("xbrl")
             qtr_date = str(item.get("date") or "").strip()
             if not qtr_date:
-                continue
+                return None, []
             base_row = {
                 "Symbol": sym,
                 "QuarterEnd": qtr_date,
@@ -510,24 +776,34 @@ class XBRLScraper:
                 "RetailPct": float("nan"),
                 "SourceURL": str(xbrl_url or url),
             }
+            local_nh: list[dict] = []
             if _is_valid_xbrl_url(xbrl_url):
                 key = f"{sym}:{qtr_date}"
                 if not self.state.is_completed("nse_shareholding_xbrl", key):
-                    try:
-                        x_resp = await self.http.get(xbrl_url, headers=ARCHIVE_HEADERS, prime_nse=True)
-                        if x_resp.status_code == 200 and b"<" in x_resp.content[:200]:
-                            parsed = self.parse_full_shp_xbrl(x_resp.content)
-                            for k, v in parsed["summary"].items():
-                                if v is not None:
-                                    base_row[k] = float(v)
-                            for nh in parsed["named_holders"]:
-                                named_rows.append({"Symbol": sym, "QuarterEnd": qtr_date, **nh})
-                            self.state.record("nse_shareholding_xbrl", key, "OK", 1, x_resp.content, xbrl_url)
-                    except Exception:
-                        pass
+                    if xbrl_fetched < 12:
+                        xbrl_fetched += 1
+                        async with sem:
+                            try:
+                                x_resp = await self.http.get(xbrl_url, headers=ARCHIVE_HEADERS, prime_nse=True, timeout=15.0)
+                                if x_resp.status_code == 200 and b"<" in x_resp.content[:200]:
+                                    parsed = self.parse_full_shp_xbrl(x_resp.content)
+                                    for k, v in parsed["summary"].items():
+                                        if v is not None:
+                                            base_row[k] = float(v)
+                                    for nh in parsed["named_holders"]:
+                                        local_nh.append({"Symbol": sym, "QuarterEnd": qtr_date, **nh})
+                                    self.state.record("nse_shareholding_xbrl", key, "OK", 1, x_resp.content, xbrl_url)
+                            except Exception:
+                                pass
                 elif qtr_date in existing_qtrs:
-                    continue
-            summary_rows.append(base_row)
+                    return None, []
+            return base_row, local_nh
+
+        shp_results = await asyncio.gather(*[_process_shp_item(it) for it in items])
+        for row_item, nh_list in shp_results:
+            if row_item is not None:
+                summary_rows.append(row_item)
+            named_rows.extend(nh_list)
 
         if summary_rows:
             upsert_parquet_partition(
@@ -552,10 +828,10 @@ class XBRLScraper:
         self,
         scrip_code: str | int,
         symbol: str | None = None,
-        max_xbrl_quarters: int | None = None,
+        max_xbrl_quarters: int | None = 4,
     ) -> None:
-        # Also sync NSE shareholding if a symbol was provided so shareholding always populates
-        if symbol:
+        # Also sync NSE shareholding if a symbol was provided and not already synced
+        if symbol and not self.state.is_completed("nse_shareholding_symbol", symbol.strip().upper()):
             await self.sync_symbol_shareholding_nse(symbol)
 
         scrip_str = str(scrip_code).strip()
@@ -692,6 +968,10 @@ class XBRLScraper:
                     ctx_to_member[cid] = (f"{m_clean}:{typed[0].strip()}", True)
                 else:
                     ctx_to_member[cid] = (m_clean, False)
+            elif cid and typed:
+                typed_elems = ctx.xpath(".//*[local-name()='typedMember']")
+                dim = typed_elems[0].get("dimension", "").split(":")[-1].strip() if typed_elems else "TypedHolder"
+                ctx_to_member[cid] = (f"{dim}:{typed[0].strip()}", True)
 
         tags = {
             "NumberOfShares": "Shares",
@@ -699,6 +979,7 @@ class XBRLScraper:
             "NumberOfSharesPledgedOrOtherwiseEncumbered": "PledgedShares",
             "SharesPledgedOrOtherwiseEncumberedAsAPercentageOfTotalNumberOfShares": "PledgedPct",
             "NameOfTheShareHolders": "HolderName",
+            "NameOfTheShareholder": "HolderName",
             "PermanentAccountNumberOfShareholder": "PAN",
         }
 
@@ -739,8 +1020,19 @@ class XBRLScraper:
             or {}
         )
         fpi_pct = (
-            _get_pct("ForeignPortfolioInvestorsCategoryIMember", "ForeignPortfolioInvestorsMember") or 0.0
-        ) + (_get_pct("ForeignPortfolioInvestorsCategoryIIMember") or 0.0)
+            _get_pct(
+                "ForeignPortfolioInvestorsCategoryIMember",
+                "InstitutionsForeignPortfolioInvestorCategoryOneMember",
+                "ForeignPortfolioInvestorsMember",
+            )
+            or 0.0
+        ) + (
+            _get_pct(
+                "ForeignPortfolioInvestorsCategoryIIMember",
+                "InstitutionsForeignPortfolioInvestorCategoryTwoMember",
+            )
+            or 0.0
+        )
 
         pub_entry = by_member.get("PublicShareholdingMember", {})
         tot_sh = (promo.get("Shares") or 0.0) + (pub_entry.get("Shares") or 0.0)
@@ -752,11 +1044,14 @@ class XBRLScraper:
             "PublicPct": _get_pct("PublicShareholdingMember"),
             "TotalShares": tot_sh if tot_sh > 0 else None,
             "MutualFundsPct": _get_pct("MutualFundsOrUTIMember", "MutualFundsMember"),
-            "FPI_Pct": round(fpi_pct, 4) if fpi_pct > 0 else _get_pct("ForeignInstitutionsMember"),
+            "FPI_Pct": round(fpi_pct, 4)
+            if fpi_pct > 0
+            else _get_pct("ForeignInstitutionsMember", "InstitutionsForeignMember"),
             "InsurancePct": _get_pct("InsuranceCompaniesMember"),
             "RetailPct": _get_pct(
                 "IndividualsShareholdersHoldingNominalShareCapitalUpToTwoLakhMember",
                 "ResidentIndividualsHoldingNominalShareCapitalUpToTwoLakhsMember",
+                "ResidentIndividualShareholdersHoldingNominalShareCapitalUpToRsTwoLakhMember",
             ),
         }
 
