@@ -581,6 +581,12 @@ class RemoteLakeClient:
             frames[0] = h_df
 
         df = pd.concat(frames, ignore_index=True)
+        if not df.empty and "Date" in df.columns:
+            max_dt = pd.to_datetime(df["Date"]).max()
+            if pd.notna(max_dt):
+                cache = getattr(self, "_fo_max_date_cache", {})
+                cache[f"{exch}_{max_dt.year}"] = max_dt.strftime("%Y-%m-%d")
+                self._fo_max_date_cache = cache
         if "actions" in entry and ("Adj Close" not in df.columns or df["Adj Close"].isna().all()):
             df = self._apply_pack_actions(df, entry.get("actions", []), auto_adjust=auto_adjust)
         elif auto_adjust and "Adj Close" in df.columns and "Close" in df.columns:
@@ -839,7 +845,36 @@ class RemoteLakeClient:
             req = urllib.request.Request(cdn_url, headers=headers)
             with urllib.request.urlopen(req, timeout=15.0) as resp:
                 raw_bytes = resp.read()
-        payload = json.loads(zlib.decompress(raw_bytes).decode("utf-8"))
+        try:
+            payload = json.loads(zlib.decompress(raw_bytes).decode("utf-8"))
+        except Exception:
+            # Self-healing retry: local disk cache might hold stale offsets from a newly published release
+            with self._lock:
+                self._ticker_index_loaded = False
+                self._ticker_index = None
+                setattr(self, "_ticker_index_loaded_nse", False)
+                setattr(self, "_ticker_index_nse", None)
+                try:
+                    import tempfile
+                    tmp_cache_dir = self.cache_dir or (Path(tempfile.gettempdir()) / "bfinance_datalake_cache")
+                    for p in tmp_cache_dir.glob(f"{self.repo.replace('/', '__')}_{self.tag}_by_ticker__*index.json"):
+                        p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            fresh_idx = self._load_ticker_index("NSE") or {}
+            new_loc = fresh_idx.get("tickers", {}).get(canon, {}).get("dossier")
+            if not new_loc:
+                return {}
+            n_off, n_len = new_loc
+            n_headers = {"Range": f"bytes={n_off}-{n_off + n_len - 1}"}
+            if self._http_pool is not None:
+                resp = self._http_pool.get(cdn_url, headers=n_headers, follow_redirects=True)
+                raw_bytes = resp.content
+            else:
+                req = urllib.request.Request(cdn_url, headers=n_headers)
+                with urllib.request.urlopen(req, timeout=15.0) as resp:
+                    raw_bytes = resp.read()
+            payload = json.loads(zlib.decompress(raw_bytes).decode("utf-8"))
         res = {k: pd.DataFrame(v) for k, v in payload.items()}
         self._dossier_cache[canon] = res
         return res

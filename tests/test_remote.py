@@ -440,6 +440,37 @@ class TestRemoteAndStorageLayout(unittest.TestCase):
                 if pool is not None and hasattr(pool, "_local_address"):
                     self.assertEqual(pool._local_address, "0.0.0.0")
 
+    def test_try_pack_history_caches_fo_max_date(self):
+        client = RemoteLakeClient("user/bfinance-datalake", load_httpfs=False)
+        idx_payload = {
+            "version": 1,
+            "current_year": 2026,
+            "aliases": {},
+            "tickers": {
+                "RELIANCE": {
+                    "curr": [0, 100],
+                }
+            },
+        }
+        client._ticker_index_loaded = True
+        client._ticker_index = idx_payload
+        client._ticker_index_loaded_nse = True
+        client._ticker_index_nse = idx_payload
+        df_curr = pd.DataFrame({
+            "Symbol": ["RELIANCE"],
+            "Date": pd.to_datetime(["2026-11-04"]),
+            "Close": [2800.0],
+            "Adj Close": [2800.0],
+        })
+        client._fetch_pack_slice = lambda pack_fn, off, length: df_curr
+
+        res = client._try_pack_history("RELIANCE", 2026, 2026, "NSE", columns=None, auto_adjust=False)
+        self.assertIsNotNone(res)
+        self.assertEqual(len(res), 1)
+
+        # Verify that _fo_max_date_cache["nse_2026"] is now populated with "2026-11-04"
+        self.assertEqual(client._fo_max_date_cache.get("nse_2026"), "2026-11-04")
+
 
 if __name__ == "__main__":
     unittest.main()
