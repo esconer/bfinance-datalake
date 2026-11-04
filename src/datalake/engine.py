@@ -31,6 +31,7 @@ class SecurityIdentity:
     face_value: float | None = None
     industry: str | None = None
     listing_date: str | None = None
+    primary_exchange: str = "NSE"
 
 
 class UnifiedLakeEngine:
@@ -186,6 +187,7 @@ class UnifiedLakeEngine:
                 face_value=None,
                 industry=ind,
                 listing_date=None,
+                primary_exchange="BSE",
             )
             self._by_bse[sc] = ident
             if sym not in self._by_symbol:
@@ -193,12 +195,39 @@ class UnifiedLakeEngine:
             if isin and isin not in self._by_isin:
                 self._by_isin[isin] = ident
 
+    @staticmethod
+    def _strip_exchange_tag(query: str | int) -> tuple[str, str | None]:
+        """Extract clean query and explicit exchange ('NSE', 'BSE', or None) from prefix/suffix."""
+        q = str(query).strip().upper()
+        if q.endswith(".BO") or q.endswith(".BSE"):
+            return q.rsplit(".", 1)[0].strip(), "BSE"
+        if q.endswith(".NS") or q.endswith(".NSE"):
+            return q.rsplit(".", 1)[0].strip(), "NSE"
+        if q.startswith("BSE:"):
+            return q[4:].strip(), "BSE"
+        if q.startswith("NSE:"):
+            return q[4:].strip(), "NSE"
+        if q in ("SENSEX", "BANKEX", "SENSEX50", "^BSESN"):
+            return ("SENSEX" if q == "^BSESN" else q), "BSE"
+        if q in ("^NSEI", "^NSEBANK", "^CNXIT"):
+            idx_map = {"^NSEI": "NIFTY 50", "^NSEBANK": "NIFTY BANK", "^CNXIT": "NIFTY IT"}
+            return idx_map[q], "NSE"
+        return q, None
+
+    def _infer_exchange(self, query: str | int, explicit_exchange: str | None = None) -> tuple[SecurityIdentity, str]:
+        """Resolve identity and determine target exchange ('NSE' or 'BSE') automatically."""
+        clean_q, tag_exch = self._strip_exchange_tag(query)
+        ident = self.resolve(clean_q)
+        if explicit_exchange:
+            return ident, explicit_exchange.strip().upper()
+        if tag_exch:
+            return ident, tag_exch
+        return ident, ident.primary_exchange
+
     def resolve(self, query: str | int) -> SecurityIdentity:
         """Resolve any NSE symbol, old renamed symbol, BSE 6-digit code, or 12-char ISIN into a unified identity."""
         self._ensure_crosswalk()
-        q = str(query).strip().upper()
-        if q.endswith(".NS") or q.endswith(".BO"):
-            q = q[:-3]
+        q, tag_exch = self._strip_exchange_tag(query)
 
         if q in self._by_symbol:
             return self._by_symbol[q]
@@ -210,17 +239,20 @@ class UnifiedLakeEngine:
         aliases = tuple(self.resolver.all_aliases(q))
         if aliases[0] in self._by_symbol:
             return self._by_symbol[aliases[0]]
+        is_bse_num = q.isdigit() and len(q) == 6
         return SecurityIdentity(
             symbol=aliases[0],
             bse_code=q if q.isdigit() else None,
             isin=q if len(q) == 12 and q.startswith(("INE", "INF")) else None,
             company_name=None,
             aliases=aliases,
+            primary_exchange=tag_exch or ("BSE" if is_bse_num else "NSE"),
         )
 
     def ticker(self, query: str | int) -> LakeTicker:
-        """Return a unified yfinance-style LakeTicker object for instant access to all 15 datasets."""
-        return LakeTicker(self, self.resolve(query))
+        """Return a unified yfinance-style LakeTicker object (remembers .BO / .NS exchange preference)."""
+        ident, pref_exch = self._infer_exchange(query)
+        return LakeTicker(self, ident, default_exchange=pref_exch)
 
     def _read_filtered_parquet(self, path: Path, filters: list[tuple] | None = None) -> pd.DataFrame:
         if not path.exists():
@@ -337,7 +369,7 @@ class UnifiedLakeEngine:
         start: str | date | None = None,
         end: str | date | None = None,
         period: str | None = None,
-        exchange: str = "NSE",
+        exchange: str | None = None,
         auto_adjust: bool = False,
     ) -> pd.DataFrame:
         """
@@ -346,20 +378,25 @@ class UnifiedLakeEngine:
         """
         e_dt = pd.Timestamp(end).normalize() if end else pd.Timestamp.now().normalize()
         s_dt = pd.Timestamp(start).normalize() if start else self._resolve_period_start(period, e_dt)
-        ident = self.resolve(query)
+        ident, exch = self._infer_exchange(query, exchange)
         load_end_yr = max(e_dt.year, pd.Timestamp.now().year)
 
-        raw = self._cached_raw_equity(ident.symbol, exchange.upper(), s_dt.year, load_end_yr)
-        if raw.empty and exchange.upper() == "NSE" and ident.bse_code:
-            raw = self._cached_raw_equity(ident.bse_code, "BSE", s_dt.year, load_end_yr)
-            exchange = "BSE"
+        lookup_key = (ident.bse_code or ident.symbol) if exch == "BSE" else ident.symbol
+        raw = self._cached_raw_equity(lookup_key, exch, s_dt.year, load_end_yr)
+        # Auto-fallback to the other exchange if no explicit suffix/exchange was forced
+        if raw.empty and exchange is None and self._strip_exchange_tag(query)[1] is None:
+            alt_exch = "BSE" if exch == "NSE" else "NSE"
+            alt_key = (ident.bse_code or ident.symbol) if alt_exch == "BSE" else ident.symbol
+            raw = self._cached_raw_equity(alt_key, alt_exch, s_dt.year, load_end_yr)
+            if not raw.empty:
+                exch = alt_exch
 
         if raw.empty:
             return pd.DataFrame()
 
-        key_for_actions = ident.symbol if exchange.upper() == "NSE" else (ident.bse_code or ident.symbol)
+        key_for_actions = ident.symbol if exch == "NSE" else (ident.bse_code or ident.symbol)
         adj = self.adjuster.apply_adjustments(
-            raw, key_for_actions, exchange=exchange, auto_adjust=auto_adjust, include_future_splits=True
+            raw, key_for_actions, exchange=exch, auto_adjust=auto_adjust, include_future_splits=True
         )
         adj = adj[(adj["Date"] >= s_dt) & (adj["Date"] <= e_dt)].reset_index(drop=True)
         return adj
@@ -370,35 +407,63 @@ class UnifiedLakeEngine:
         start: str | date | None = None,
         end: str | date | None = None,
         period: str | None = None,
-        exchange: str = "NSE",
+        exchange: str | None = None,
         auto_adjust: bool = False,
     ) -> dict[str, pd.DataFrame]:
         """Vectorized multi-symbol OHLCV download reading each annual Parquet file only once."""
+        if not queries:
+            return {}
+        if exchange is None:
+            nse_queries = [q for q in queries if self._infer_exchange(q, None)[1] == "NSE"]
+            bse_queries = [q for q in queries if self._infer_exchange(q, None)[1] == "BSE"]
+            if nse_queries and bse_queries:
+                res_nse = self.download(nse_queries, start=start, end=end, period=period, exchange="NSE", auto_adjust=auto_adjust)
+                res_bse = self.download(bse_queries, start=start, end=end, period=period, exchange="BSE", auto_adjust=auto_adjust)
+                return {**res_nse, **res_bse}
+            exch = "BSE" if bse_queries else "NSE"
+        else:
+            exch = exchange.strip().upper()
+
         e_dt = pd.Timestamp(end).normalize() if end else pd.Timestamp.now().normalize()
         s_dt = pd.Timestamp(start).normalize() if start else self._resolve_period_start(period, e_dt)
         load_end_yr = max(e_dt.year, pd.Timestamp.now().year)
-        exch = exchange.upper()
         prefix = "nse_cm_" if exch == "NSE" else "bse_cm_"
         eq_dir = self.root / "equities"
-        if not eq_dir.exists() or not queries:
+        if not eq_dir.exists():
             return {}
 
         idents = [self.resolve(q) for q in queries]
-        alias_to_canon = {al: ident.symbol for ident in idents for al in ident.aliases}
+        if exch == "BSE":
+            alias_to_canon = {}
+            for ident in idents:
+                target_k = ident.bse_code or ident.symbol
+                alias_to_canon[target_k] = target_k
+                for al in ident.aliases:
+                    alias_to_canon[al] = target_k
+                if ident.bse_code:
+                    alias_to_canon[ident.bse_code] = target_k
+        else:
+            alias_to_canon = {al: ident.symbol for ident in idents for al in ident.aliases}
         all_aliases = list(alias_to_canon.keys())
 
         frames = []
         for yr in range(s_dt.year, load_end_yr + 1):
             p = eq_dir / f"{prefix}{yr}.parquet"
             if p.exists():
-                sub = self._read_filtered_parquet(p, filters=[("Symbol", "in", all_aliases)])
+                if exch == "BSE":
+                    sub = self._read_filtered_parquet(p, filters=[("InstrumentId", "in", all_aliases)])
+                    if sub.empty:
+                        sub = self._read_filtered_parquet(p, filters=[("Symbol", "in", all_aliases)])
+                else:
+                    sub = self._read_filtered_parquet(p, filters=[("Symbol", "in", all_aliases)])
                 if not sub.empty:
                     frames.append(sub)
         if not frames:
             return {}
 
         combined = pd.concat(frames, ignore_index=True)
-        combined["_CanonSymbol"] = combined["Symbol"].astype(str).str.strip().str.upper().map(alias_to_canon)
+        key_col = "InstrumentId" if (exch == "BSE" and "InstrumentId" in combined.columns) else "Symbol"
+        combined["_CanonSymbol"] = combined[key_col].astype(str).str.strip().str.upper().map(alias_to_canon)
         out_map: dict[str, pd.DataFrame] = {}
         for canon_sym, grp in combined.groupby("_CanonSymbol"):
             grp = grp.drop(columns=["_CanonSymbol"])
@@ -490,9 +555,13 @@ class UnifiedLakeEngine:
         p = self.root / "shareholding" / "named_shareholders.parquet"
         return self._read_filtered_parquet(p, filters=[("Symbol", "in", list(ident.aliases))])
 
-    def corporate_actions(self, query: str | int) -> pd.DataFrame:
-        """Return parsed Dividends, Splits, and Bonuses for the security across NSE & BSE."""
-        ident = self.resolve(query)
+    def corporate_actions(self, query: str | int, exchange: str | None = None) -> pd.DataFrame:
+        """Return parsed Dividends, Splits, and Bonuses for the security across NSE or BSE."""
+        ident, exch = self._infer_exchange(query, exchange)
+        if exch == "BSE" and ident.bse_code:
+            bse_act = self.adjuster.get_symbol_actions(ident.bse_code, exchange="BSE")
+            if not bse_act.empty:
+                return bse_act
         nse_act = self.adjuster.get_symbol_actions(ident.symbol, exchange="NSE")
         if not nse_act.empty:
             return nse_act
@@ -505,11 +574,11 @@ class UnifiedLakeEngine:
         symbol: str = "NIFTY",
         trade_date: str | date | None = None,
         expiry: str | date | None = None,
-        exchange: str = "NSE",
+        exchange: str | None = None,
     ) -> pd.DataFrame:
         """Return EOD Futures & Option Chain (CE/PE, Strike, SettlePrice, OI, ChangeInOI) in milliseconds."""
-        sym = symbol.strip().upper()
-        exch = exchange.lower()
+        sym, tag_exch = self._strip_exchange_tag(symbol)
+        exch = (exchange or tag_exch or ("BSE" if sym in ("SENSEX", "BANKEX") else "NSE")).lower()
         fo_dir = self.root / "derivatives"
         if not fo_dir.exists():
             return pd.DataFrame()
@@ -1029,9 +1098,10 @@ class UnifiedLakeEngine:
 class LakeTicker:
     """Unified yfinance-like Ticker facade backed by UnifiedLakeEngine (sub-millisecond cached access)."""
 
-    def __init__(self, engine: UnifiedLakeEngine, identity: SecurityIdentity):
+    def __init__(self, engine: UnifiedLakeEngine, identity: SecurityIdentity, default_exchange: str | None = None):
         self.engine = engine
         self.identity = identity
+        self.default_exchange = default_exchange or getattr(identity, "primary_exchange", "NSE")
 
     @property
     def symbol(self) -> str:
@@ -1050,11 +1120,12 @@ class LakeTicker:
         start: str | date | None = None,
         end: str | date | None = None,
         period: str | None = None,
-        exchange: str = "NSE",
+        exchange: str | None = None,
         auto_adjust: bool = False,
     ) -> pd.DataFrame:
+        exch = exchange or self.default_exchange
         return self.engine.history(
-            self.identity.symbol, start=start, end=end, period=period, exchange=exchange, auto_adjust=auto_adjust
+            self.identity.symbol, start=start, end=end, period=period, exchange=exch, auto_adjust=auto_adjust
         )
 
     @property
@@ -1079,7 +1150,7 @@ class LakeTicker:
 
     @property
     def actions(self) -> pd.DataFrame:
-        return self.engine.corporate_actions(self.identity.symbol)
+        return self.engine.corporate_actions(self.identity.symbol, exchange=self.default_exchange)
 
     @property
     def deals(self) -> pd.DataFrame:

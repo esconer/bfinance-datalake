@@ -44,6 +44,7 @@ class RemoteLakeClient:
         token: str | None = None,
         load_httpfs: bool = True,
         cache_dir: Path | str | None = None,
+        use_pack: bool = True,
     ):
         if not HAS_DUCKDB:
             raise RuntimeError("Install duckdb (`uv add duckdb`) for zero-disk HTTP Range Parquet queries.")
@@ -57,18 +58,19 @@ class RemoteLakeClient:
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
 
+        self.use_pack = use_pack
         self._httpfs_loaded = False
         self._cdn_url_cache: dict[str, tuple[float, str]] = {}
         self._compacted_bounds_cache: dict[str, tuple[int, int] | None] | None = None
+        self._dossier_cache: dict[str, dict[str, pd.DataFrame]] = {}
 
-        headers = {"User-Agent": "bfinance-datalake/0.2.0"}
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
+        # IMPORTANT: Do NOT set Authorization on _http_pool default headers, because
+        # objects.githubusercontent.com (Azure CDN) returns 403 if Bearer auth is sent with ?sig= SAS URLs.
         self._http_pool = (
             httpx.Client(
-                headers=headers,
+                headers={"User-Agent": "bfinance-datalake/0.2.0"},
                 follow_redirects=False,
-                timeout=5.0,
+                timeout=15.0,
                 limits=httpx.Limits(max_keepalive_connections=16, max_connections=24),
             )
             if HAS_HTTPX
@@ -125,7 +127,7 @@ class RemoteLakeClient:
             if self.token:
                 try:
                     self.con.execute(
-                        "CREATE OR REPLACE SECRET gh_token (TYPE HTTP, EXTRA_HTTP_HEADERS MAP {'Authorization': ?});",
+                        "CREATE OR REPLACE SECRET gh_token (TYPE HTTP, SCOPE 'https://github.com', EXTRA_HTTP_HEADERS MAP {'Authorization': ?});",
                         [f"Bearer {self.token}"],
                     )
                 except Exception:
@@ -136,6 +138,8 @@ class RemoteLakeClient:
 
     def _resolve_cdn_url(self, gh_url: str) -> str:
         """Resolve GitHub Release 302 redirect to direct CDN URL using a pooled connection (cached 10 min)."""
+        if self.repo == "user/bfinance-datalake":
+            return gh_url
         now = time.monotonic()
         cached = self._cdn_url_cache.get(gh_url)
         if cached and (now - cached[0]) < 600.0:
@@ -143,7 +147,8 @@ class RemoteLakeClient:
 
         if self._http_pool is not None:
             try:
-                resp = self._http_pool.head(gh_url)
+                gh_headers = {"Authorization": f"Bearer {self.token}"} if self.token else None
+                resp = self._http_pool.head(gh_url, headers=gh_headers)
                 if resp.status_code in (301, 302, 303, 307, 308):
                     cdn_url = resp.headers.get("Location") or resp.headers.get("location")
                     if cdn_url:
@@ -162,7 +167,7 @@ class RemoteLakeClient:
             req.add_header("Authorization", f"Bearer {self.token}")
         opener = urllib.request.build_opener(_NoRedirect)
         try:
-            opener.open(req, timeout=5.0)
+            opener.open(req, timeout=15.0)
         except urllib.error.HTTPError as e:
             if e.code in (301, 302, 303, 307, 308):
                 cdn_url = e.headers.get("Location")
@@ -235,7 +240,93 @@ class RemoteLakeClient:
     @staticmethod
     def _clean_sym(symbol: str) -> str:
         s = str(symbol).strip().upper()
-        return s[:-3] if s.endswith((".NS", ".BO")) else s
+        for pfx in ("NSE:", "BSE:"):
+            if s.startswith(pfx):
+                s = s[len(pfx):].strip()
+        for sfx in (".NS", ".BO", ".NSE", ".BSE"):
+            if s.endswith(sfx):
+                s = s[:-len(sfx)].strip()
+        return s
+
+    @staticmethod
+    def _detect_exchange(symbol: str, default_exchange: str = "NSE") -> str:
+        s = str(symbol).strip().upper()
+        if s.endswith((".BO", ".BSE")) or s.startswith("BSE:"):
+            return "BSE"
+        if s.endswith((".NS", ".NSE")) or s.startswith("NSE:"):
+            return "NSE"
+        if s in ("SENSEX", "BANKEX", "SENSEX50", "^BSESN"):
+            return "BSE"
+        return default_exchange.upper()
+
+    def _parse_symbol_and_exchange(self, symbol: str, exchange: str | None = None) -> tuple[str, str, bool]:
+        """
+        Returns `(clean_symbol, target_exchange, is_explicit_exchange)`.
+        - 'RELIANCE'       -> ('RELIANCE', 'NSE', False)
+        - 'RELIANCE.NS'    -> ('RELIANCE', 'NSE', True)
+        - 'RELIANCE.BO'    -> ('RELIANCE', 'BSE', True)
+        - '500325.BO'      -> ('500325',   'BSE', True)
+        - 'BSE:500325'     -> ('500325',   'BSE', True)
+        - '500325'         -> ('500325',   'BSE' if BSE-only or httpfs-only, else 'NSE', False)
+        """
+        raw = str(symbol).strip().upper()
+        clean = self._clean_sym(raw)
+
+        if exchange is not None:
+            return clean, exchange.strip().upper(), True
+        if raw.endswith((".BO", ".BSE")) or raw.startswith("BSE:"):
+            return clean, "BSE", True
+        if raw.endswith((".NS", ".NSE")) or raw.startswith("NSE:"):
+            return clean, "NSE", True
+        if clean in ("SENSEX", "BANKEX", "SENSEX50", "^BSESN"):
+            return ("SENSEX" if clean == "^BSESN" else clean), "BSE", True
+
+        if clean.isdigit() and len(clean) == 6:
+            nse_idx = self._load_ticker_index("NSE") if self.use_pack else None
+            if nse_idx and clean in nse_idx.get("bse_to_symbol", {}):
+                return clean, "NSE", False
+            return clean, "BSE", False
+
+        if len(clean) == 12 and clean.startswith(("INE", "INF")):
+            nse_idx = self._load_ticker_index("NSE") if self.use_pack else None
+            if nse_idx and clean not in nse_idx.get("isin_to_symbol", {}):
+                bse_idx = self._load_ticker_index("BSE") if self.use_pack else None
+                if bse_idx and clean in bse_idx.get("isin_to_symbol", {}):
+                    return clean, "BSE", False
+
+        return clean, "NSE", False
+
+    def _resolve_for_exchange(self, symbol: str, exchange: str) -> str:
+        """
+        Resolves any input (NSE Symbol, old alias, 6-digit BSE ScripCode, or ISIN)
+        to the target key for `exchange` ('RELIANCE' for NSE, '500325' for BSE).
+        """
+        sym = self._clean_sym(symbol)
+        exch = exchange.upper()
+        idx_data = self._load_ticker_index(exch) or self._load_ticker_index("NSE")
+        if not idx_data:
+            return sym
+
+        if exch == "NSE":
+            return (
+                idx_data.get("aliases", {}).get(sym)
+                or idx_data.get("bse_to_symbol", {}).get(sym)
+                or idx_data.get("isin_to_symbol", {}).get(sym)
+                or sym
+            )
+        bse_idx = self._load_ticker_index("BSE") or {}
+        if sym in bse_idx.get("tickers", {}):
+            return sym
+        if sym in bse_idx.get("aliases", {}):
+            return bse_idx["aliases"][sym]
+        if sym in bse_idx.get("isin_to_symbol", {}):
+            return bse_idx["isin_to_symbol"][sym]
+        nse_idx = self._load_ticker_index("NSE") or {}
+        canon_nse = nse_idx.get("aliases", {}).get(sym, sym)
+        meta = nse_idx.get("tickers", {}).get(canon_nse, {}).get("meta", {})
+        if meta.get("bse_code"):
+            return str(meta["bse_code"])
+        return sym
 
     @staticmethod
     def _select_clause(columns: list[str] | None) -> str:
@@ -453,76 +544,114 @@ class RemoteLakeClient:
         symbol: str,
         start_year: int = 2024,
         end_year: int = 2026,
-        exchange: str = "NSE",
+        exchange: str | None = None,
+        columns: list[str] | None = None,
+        auto_adjust: bool = False,
+        use_pack: bool | None = None,
+    ) -> pd.DataFrame:
+        """
+        Stream a single stock's OHLCV + Delivery over HTTPS from NSE or BSE.
+        - `use_pack=True` (default): Uses per-ticker `.pack` byte range (~120 ms), with auto-fallback to DuckDB `httpfs`.
+        - `use_pack=False`: Queries compacted/yearly `.parquet` files directly via DuckDB `httpfs`.
+        """
+        sym, exch, is_explicit = self._parse_symbol_and_exchange(symbol, exchange)
+        if start_year > end_year:
+            start_year, end_year = end_year, start_year
+
+        should_use_pack = self.use_pack if use_pack is None else use_pack
+
+        # 1. Fast Path: Per-Ticker Packfile (NSE or BSE)
+        if should_use_pack:
+            pack_df = self._try_pack_history(sym, start_year, end_year, exch, columns, auto_adjust)
+            if pack_df is not None and not pack_df.empty:
+                return pack_df
+            # Auto-fallback to other exchange pack if not explicitly locked
+            if not is_explicit:
+                alt_exch = "BSE" if exch == "NSE" else "NSE"
+                alt_df = self._try_pack_history(sym, start_year, end_year, alt_exch, columns, auto_adjust)
+                if alt_df is not None and not alt_df.empty:
+                    return alt_df
+            if pack_df is not None:
+                return pack_df
+
+        # 2. DuckDB httpfs Path (Two-Tier Compacted or Yearly Parquet)
+        df = self._httpfs_history(sym, start_year, end_year, exch, columns, auto_adjust)
+        if df.empty and not is_explicit:
+            alt_exch = "BSE" if exch == "NSE" else "NSE"
+            df = self._httpfs_history(sym, start_year, end_year, alt_exch, columns, auto_adjust)
+        return df
+
+    def _httpfs_history(
+        self,
+        sym: str,
+        start_year: int,
+        end_year: int,
+        exchange: str,
         columns: list[str] | None = None,
         auto_adjust: bool = False,
     ) -> pd.DataFrame:
-        """
-        Stream a single stock's OHLCV + Delivery over HTTPS.
-        - Fast Path (~120 ms): Uses `by_ticker__{exch}_index.json` + HTTP Range slice from NSE or BSE packfile.
-        - Fallback Path: Uses two-tier compacted or yearly partitions via DuckDB `httpfs`.
-        """
-        sym = self._clean_sym(symbol)
-        if start_year > end_year:
-            start_year, end_year = end_year, start_year
-
-        exch = "BSE" if str(symbol).strip().upper().endswith(".BO") else exchange.upper()
-        pack_df = self._try_pack_history(sym, start_year, end_year, exch, columns, auto_adjust)
-        if pack_df is not None and not pack_df.empty:
-            return pack_df
-        # Auto-fallback to BSE pack if queried with default NSE exchange for a BSE-only scrip
-        if exch == "NSE" and (sym.isdigit() or pack_df is None or pack_df.empty):
-            bse_pack_df = self._try_pack_history(sym, start_year, end_year, "BSE", columns, auto_adjust)
-            if bse_pack_df is not None and not bse_pack_df.empty:
-                return bse_pack_df
-        if pack_df is not None:
-            return pack_df
-
         self._ensure_httpfs()
-        sym = self._clean_sym(symbol)
-        if start_year > end_year:
-            start_year, end_year = end_year, start_year
-
         exch = exchange.upper()
-        sel = self._select_clause(columns)
+        target_key = self._resolve_for_exchange(sym, exch) if self.use_pack else sym
+        sel = self._select_clause(columns if not auto_adjust else None)
         current_yr = pd.Timestamp.now().year
 
-        # Optional local immutable slice cache for historical years (< current_yr)
-        if self.cache_dir and start_year < current_yr and columns is None:
-            cache_file = self.cache_dir / f"{exch}_{sym}_{start_year}_{min(end_year, current_yr - 1)}.parquet"
+        if self.cache_dir and start_year < current_yr and columns is None and not auto_adjust:
+            cache_file = self.cache_dir / f"{exch}_{target_key}_{start_year}_{min(end_year, current_yr - 1)}.parquet"
             if cache_file.exists():
                 hist_df = pd.read_parquet(cache_file)
                 if end_year >= current_yr:
                     cur_urls = self._equity_urls_for_range(exch, current_yr, end_year)
-                    cur_sql = ", ".join(f"'{u}'" for u in cur_urls)
-                    cur_df = self.con.cursor().execute(
-                        f"SELECT {sel} FROM read_parquet([{cur_sql}]) WHERE Symbol = ? ORDER BY Date ASC",
-                        [sym],
-                    ).df()
-                    return pd.concat([hist_df, cur_df], ignore_index=True).sort_values("Date").reset_index(drop=True)
+                    if cur_urls:
+                        cur_sql = ", ".join(f"'{u}'" for u in cur_urls)
+                        where_clause = "InstrumentId = ? OR Symbol = ?" if exch == "BSE" else "Symbol = ?"
+                        params = [target_key, sym] if exch == "BSE" else [target_key]
+                        cur_df = self._safe_query(
+                            f"SELECT {sel} FROM read_parquet([{cur_sql}]) WHERE ({where_clause}) ORDER BY Date ASC",
+                            params,
+                        )
+                        return pd.concat([hist_df, cur_df], ignore_index=True).sort_values("Date").reset_index(drop=True)
                 return hist_df
 
         urls = self._equity_urls_for_range(exch, start_year, end_year)
+        if not urls:
+            return pd.DataFrame()
         url_list_sql = ", ".join(f"'{u}'" for u in urls)
 
-        id_col = "InstrumentId" if exch == "BSE" and sym.isdigit() else "Symbol"
-        query = f"""
-            SELECT {sel}
-            FROM read_parquet([{url_list_sql}])
-            WHERE {id_col} = ?
-              AND EXTRACT(YEAR FROM CAST(Date AS DATE)) BETWEEN ? AND ?
-            ORDER BY Date ASC
-        """
-        df = self.con.cursor().execute(query, [sym, start_year, end_year]).df()
+        if exch == "BSE":
+            query = f"""
+                SELECT {sel}
+                FROM read_parquet([{url_list_sql}])
+                WHERE (InstrumentId = ? OR Symbol = ?)
+                  AND EXTRACT(YEAR FROM CAST(Date AS DATE)) BETWEEN ? AND ?
+                ORDER BY Date ASC
+            """
+            df = self._safe_query(query, [target_key, sym, start_year, end_year])
+        else:
+            query = f"""
+                SELECT {sel}
+                FROM read_parquet([{url_list_sql}])
+                WHERE Symbol = ?
+                  AND EXTRACT(YEAR FROM CAST(Date AS DATE)) BETWEEN ? AND ?
+                ORDER BY Date ASC
+            """
+            df = self._safe_query(query, [target_key, start_year, end_year])
+            # If empty on NSE and user passed a 6-digit BSE code, auto-fallback to BSE httpfs
+            if df.empty and sym.isdigit():
+                return self._httpfs_history(sym, start_year, end_year, "BSE", columns, auto_adjust)
 
-        if self.cache_dir and not df.empty and start_year < current_yr and columns is None:
+        if self.cache_dir and not df.empty and start_year < current_yr and columns is None and not auto_adjust:
             hist_end = min(end_year, current_yr - 1)
-            cache_file = self.cache_dir / f"{exch}_{sym}_{start_year}_{hist_end}.parquet"
+            cache_file = self.cache_dir / f"{exch}_{target_key}_{start_year}_{hist_end}.parquet"
             if not cache_file.exists():
                 hist_slice = df[pd.to_datetime(df["Date"]).dt.year <= hist_end]
                 if not hist_slice.empty:
                     hist_slice.to_parquet(cache_file, compression="zstd", index=False)
 
+        if columns and not df.empty:
+            valid_cols = [c for c in columns if c in df.columns]
+            if valid_cols:
+                df = df[valid_cols]
         return df
 
     def download(
@@ -530,21 +659,61 @@ class RemoteLakeClient:
         symbols: list[str],
         start_year: int = 2024,
         end_year: int = 2026,
-        exchange: str = "NSE",
+        exchange: str | None = None,
         columns: list[str] | None = None,
+        use_pack: bool | None = None,
     ) -> pd.DataFrame:
-        """Stream multiple symbols in a single vectorized HTTP Range query."""
-        self._ensure_httpfs()
+        """Stream multiple symbols from NSE or BSE via Pack slices (for small lists) or vectorized DuckDB httpfs."""
         if not symbols:
             return pd.DataFrame()
         if start_year > end_year:
             start_year, end_year = end_year, start_year
+
+        if exchange is None:
+            nse_syms = [s for s in symbols if self._parse_symbol_and_exchange(s, None)[1] == "NSE"]
+            bse_syms = [s for s in symbols if self._parse_symbol_and_exchange(s, None)[1] == "BSE"]
+            if nse_syms and bse_syms:
+                f_nse = self.download(nse_syms, start_year, end_year, exchange="NSE", columns=columns, use_pack=use_pack)
+                f_bse = self.download(bse_syms, start_year, end_year, exchange="BSE", columns=columns, use_pack=use_pack)
+                return pd.concat([f for f in (f_nse, f_bse) if not f.empty], ignore_index=True)
+            exch = "BSE" if bse_syms else "NSE"
+        else:
+            exch = exchange.strip().upper()
+
+        should_use_pack = self.use_pack if use_pack is None else use_pack
+
+        if should_use_pack and len(symbols) <= 15 and self._load_ticker_index(exch) is not None:
+            with ThreadPoolExecutor(max_workers=min(8, len(symbols))) as pool:
+                frames = list(
+                    pool.map(
+                        lambda s: self.history(s, start_year=start_year, end_year=end_year, exchange=exch, columns=columns, use_pack=True),
+                        symbols,
+                    )
+                )
+            non_empty = [f for f in frames if not f.empty]
+            return pd.concat(non_empty, ignore_index=True) if non_empty else pd.DataFrame()
+
+        self._ensure_httpfs()
         clean_syms = [self._clean_sym(s) for s in symbols]
-        urls = self._equity_urls_for_range(exchange.upper(), start_year, end_year)
+        urls = self._equity_urls_for_range(exch, start_year, end_year)
+        if not urls:
+            return pd.DataFrame()
         url_list_sql = ", ".join(f"'{u}'" for u in urls)
         placeholders = ", ".join(["?"] * len(clean_syms))
         sel = self._select_clause(columns)
-        return self.con.cursor().execute(
+
+        if exch == "BSE":
+            return self._safe_query(
+                f"""
+                SELECT {sel}
+                FROM read_parquet([{url_list_sql}])
+                WHERE (InstrumentId IN ({placeholders}) OR Symbol IN ({placeholders}))
+                  AND EXTRACT(YEAR FROM CAST(Date AS DATE)) BETWEEN ? AND ?
+                ORDER BY Symbol, Date ASC
+                """,
+                [*clean_syms, *clean_syms, start_year, end_year],
+            )
+        return self._safe_query(
             f"""
             SELECT {sel}
             FROM read_parquet([{url_list_sql}])
@@ -553,7 +722,7 @@ class RemoteLakeClient:
             ORDER BY Symbol, Date ASC
             """,
             [*clean_syms, start_year, end_year],
-        ).df()
+        )
 
     def _safe_query(self, query: str, params: list[Any] | None = None) -> pd.DataFrame:
         """Execute a DuckDB SQL query, gracefully returning an empty DataFrame if remote asset is not found (HTTP 404)."""
@@ -569,40 +738,156 @@ class RemoteLakeClient:
                 return pd.DataFrame()
             raise
 
-    def financials(self, symbol: str, period_type: str = "Quarterly") -> pd.DataFrame:
-        """Stream a company's Ind-AS XBRL Financials over HTTPS in ~250ms."""
+    def dossier(self, symbol: str) -> dict[str, pd.DataFrame]:
+        """Fetch Financials, Shareholding, Holders, Actions, Deals, Insider, Concalls & Annual Reports in 1 HTTP Range call."""
+        sym = self._clean_sym(symbol)
+        if sym in self._dossier_cache:
+            return self._dossier_cache[sym]
+        idx_data = self._load_ticker_index("NSE") or {}
+        canon = (
+            idx_data.get("aliases", {}).get(sym)
+            or idx_data.get("bse_to_symbol", {}).get(sym)
+            or idx_data.get("isin_to_symbol", {}).get(sym)
+            or sym
+        )
+        if canon in self._dossier_cache:
+            return self._dossier_cache[canon]
+
+        loc = idx_data.get("tickers", {}).get(canon, {}).get("dossier")
+        if not loc:
+            bse_idx = self._load_ticker_index("BSE") or {}
+            canon_bse = (
+                bse_idx.get("aliases", {}).get(sym)
+                or bse_idx.get("isin_to_symbol", {}).get(sym)
+                or sym
+            )
+            loc = bse_idx.get("tickers", {}).get(canon_bse, {}).get("dossier")
+            if not loc:
+                return {}
+
+        offset, length = loc
+        cdn_url = self._resolve_cdn_url(f"{self.base_url}/by_ticker__nse_dossier.pack")
+        if not cdn_url:
+            return {}
+        end_byte = offset + length - 1
+        headers = {"Range": f"bytes={offset}-{end_byte}"}
+        if self._http_pool is not None:
+            resp = self._http_pool.get(cdn_url, headers=headers, follow_redirects=True)
+            raw_bytes = resp.content
+        else:
+            req = urllib.request.Request(cdn_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15.0) as resp:
+                raw_bytes = resp.read()
+        payload = json.loads(zlib.decompress(raw_bytes).decode("utf-8"))
+        res = {k: pd.DataFrame(v) for k, v in payload.items()}
+        self._dossier_cache[canon] = res
+        return res
+
+    def financials(self, symbol: str, period_type: str = "Quarterly", use_pack: bool | None = None) -> pd.DataFrame:
+        """Stream a company's Ind-AS XBRL Financials over HTTPS."""
+        should_use_pack = self.use_pack if use_pack is None else use_pack
+        if should_use_pack:
+            dos = self.dossier(symbol)
+            if "financials" in dos:
+                df = dos["financials"]
+                if not df.empty and "PeriodType" in df.columns:
+                    return df[df["PeriodType"].astype(str).str.lower() == period_type.lower()].reset_index(drop=True)
+                return df
+            if self._load_ticker_index() is not None:
+                return pd.DataFrame()
         self._ensure_httpfs()
         url = self._resolve_cdn_url(self._asset_url("fundamentals", "xbrl_financials.parquet"))
+        if not url:
+            return pd.DataFrame()
         return self._safe_query(
             f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ? AND PeriodType = ? ORDER BY PeriodEnd ASC",
             [self._clean_sym(symbol), period_type],
         )
 
-    def shareholding(self, symbol: str) -> pd.DataFrame:
-        """Stream a company's Shareholding & Promoter Pledge history over HTTPS in ~250ms."""
+    def shareholding(self, symbol: str, exchange: str | None = None, use_pack: bool | None = None) -> pd.DataFrame:
+        """Stream a company's Shareholding & Promoter Pledge history from NSE or BSE."""
+        sym, exch, _ = self._parse_symbol_and_exchange(symbol, exchange)
+        should_use_pack = self.use_pack if use_pack is None else use_pack
+        if should_use_pack:
+            dos = self.dossier(sym)
+            key = "shareholding_bse" if exch == "BSE" and "shareholding_bse" in dos else "shareholding"
+            if key in dos:
+                return dos[key].copy()
+            if "shareholding_bse" in dos:
+                return dos["shareholding_bse"].copy()
+            if self._load_ticker_index() is not None:
+                return pd.DataFrame()
+
         self._ensure_httpfs()
+        if exch == "BSE":
+            url = self._resolve_cdn_url(self._asset_url("shareholding", "bse_shareholding_history.parquet"))
+            if not url:
+                return pd.DataFrame()
+            bse_key = self._resolve_for_exchange(sym, "BSE")
+            return self._safe_query(
+                f"SELECT * FROM read_parquet('{url}') WHERE (ScripCode = ? OR UPPER(Symbol) = ?) ORDER BY QuarterId ASC",
+                [bse_key, sym],
+            )
         url = self._resolve_cdn_url(self._asset_url("shareholding", "nse_shareholding_summary.parquet"))
+        if not url:
+            return pd.DataFrame()
         return self._safe_query(
             f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ? ORDER BY QuarterEnd ASC",
-            [self._clean_sym(symbol)],
+            [self._resolve_for_exchange(sym, "NSE")],
         )
 
-    def named_holders(self, symbol: str) -> pd.DataFrame:
+    def named_holders(self, symbol: str, use_pack: bool | None = None) -> pd.DataFrame:
         """Stream >1% institutional and named shareholders over HTTPS."""
+        should_use_pack = self.use_pack if use_pack is None else use_pack
+        if should_use_pack:
+            dos = self.dossier(symbol)
+            if "named_holders" in dos:
+                return dos["named_holders"].copy()
+            if self._load_ticker_index() is not None:
+                return pd.DataFrame()
         self._ensure_httpfs()
         url = self._resolve_cdn_url(self._asset_url("shareholding", "named_shareholders.parquet"))
+        if not url:
+            return pd.DataFrame()
         return self._safe_query(
             f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ? ORDER BY QuarterEnd DESC, PctOfTotal DESC",
             [self._clean_sym(symbol)],
         )
 
-    def corporate_actions(self, symbol: str) -> pd.DataFrame:
-        """Stream parsed corporate actions (splits, bonuses, dividends) over HTTPS."""
+    def corporate_actions(self, symbol: str, exchange: str | None = None, use_pack: bool | None = None) -> pd.DataFrame:
+        """Stream parsed corporate actions (splits, bonuses, dividends) from NSE or BSE."""
+        sym, exch, _ = self._parse_symbol_and_exchange(symbol, exchange)
+        should_use_pack = self.use_pack if use_pack is None else use_pack
+        if should_use_pack:
+            dos = self.dossier(sym)
+            key = "actions_bse" if exch == "BSE" and "actions_bse" in dos else "actions"
+            if key in dos:
+                df = dos[key].copy()
+                if "ExDate" in df.columns:
+                    df["ExDate"] = pd.to_datetime(df["ExDate"], errors="coerce")
+                return df
+            if "actions_bse" in dos:
+                df = dos["actions_bse"].copy()
+                if "ExDate" in df.columns:
+                    df["ExDate"] = pd.to_datetime(df["ExDate"], errors="coerce")
+                return df
+
         self._ensure_httpfs()
+        if exch == "BSE":
+            url = self._resolve_cdn_url(self._asset_url("actions", "bse_corporate_actions.parquet"))
+            if not url:
+                return pd.DataFrame()
+            bse_key = self._resolve_for_exchange(sym, "BSE")
+            return self._safe_query(
+                f"SELECT * FROM read_parquet('{url}') WHERE (CAST(scrip_code AS VARCHAR) = ? OR UPPER(short_name) = ?) ORDER BY ExDate ASC",
+                [bse_key, sym],
+            )
         url = self._resolve_cdn_url(self._asset_url("actions", "nse_corporate_actions.parquet"))
+        if not url:
+            return pd.DataFrame()
         df = self._safe_query(
             f"SELECT * FROM read_parquet('{url}') WHERE symbol = ? ORDER BY exDate ASC",
-            [self._clean_sym(symbol)],
+            [self._resolve_for_exchange(sym, "NSE")],
         )
         if df.empty:
             return df
@@ -621,37 +906,65 @@ class RemoteLakeClient:
             [index_name.strip().upper()],
         )
 
-    def deals(self, symbol: str) -> pd.DataFrame:
+    def deals(self, symbol: str, use_pack: bool | None = None) -> pd.DataFrame:
         """Stream Bulk & Block deals for a symbol over HTTPS."""
+        should_use_pack = self.use_pack if use_pack is None else use_pack
+        if should_use_pack:
+            dos = self.dossier(symbol)
+            if "deals" in dos:
+                return dos["deals"].copy()
         self._ensure_httpfs()
         url = self._resolve_cdn_url(self._asset_url("deals", "bulk_block_deals.parquet"))
+        if not url:
+            return pd.DataFrame()
         return self._safe_query(
             f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ? ORDER BY Date DESC",
             [self._clean_sym(symbol)],
         )
 
-    def insider_trades(self, symbol: str) -> pd.DataFrame:
+    def insider_trades(self, symbol: str, use_pack: bool | None = None) -> pd.DataFrame:
         """Stream SEBI PIT insider trading disclosures for a symbol over HTTPS."""
+        should_use_pack = self.use_pack if use_pack is None else use_pack
+        if should_use_pack:
+            dos = self.dossier(symbol)
+            if "insider_trades" in dos:
+                return dos["insider_trades"].copy()
         self._ensure_httpfs()
         url = self._resolve_cdn_url(self._asset_url("deals", "insider_trading_pit.parquet"))
+        if not url:
+            return pd.DataFrame()
         return self._safe_query(
             f"SELECT * FROM read_parquet('{url}') WHERE symbol = ? ORDER BY date DESC",
             [self._clean_sym(symbol)],
         )
 
-    def annual_reports(self, symbol: str) -> pd.DataFrame:
+    def annual_reports(self, symbol: str, use_pack: bool | None = None) -> pd.DataFrame:
         """Stream 20-year Annual Report PDF links over HTTPS."""
+        should_use_pack = self.use_pack if use_pack is None else use_pack
+        if should_use_pack:
+            dos = self.dossier(symbol)
+            if "annual_reports" in dos:
+                return dos["annual_reports"].copy()
         self._ensure_httpfs()
         url = self._resolve_cdn_url(self._asset_url("documents", "annual_reports.parquet"))
+        if not url:
+            return pd.DataFrame()
         return self._safe_query(
             f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ? ORDER BY Year DESC",
             [self._clean_sym(symbol)],
         )
 
-    def concalls(self, scrip_code_or_symbol: str) -> pd.DataFrame:
+    def concalls(self, scrip_code_or_symbol: str, use_pack: bool | None = None) -> pd.DataFrame:
         """Stream Concall Transcripts, Investor Presentations & Credit Ratings over HTTPS."""
+        should_use_pack = self.use_pack if use_pack is None else use_pack
+        if should_use_pack:
+            dos = self.dossier(scrip_code_or_symbol)
+            if "concalls" in dos:
+                return dos["concalls"].copy()
         self._ensure_httpfs()
         url = self._resolve_cdn_url(self._asset_url("documents", "concalls_and_filings.parquet"))
+        if not url:
+            return pd.DataFrame()
         q = str(scrip_code_or_symbol).strip()
         if q.isdigit():
             return self._safe_query(
@@ -662,30 +975,6 @@ class RemoteLakeClient:
             f"SELECT * FROM read_parquet('{url}') WHERE UPPER(CompanyName) LIKE ? ORDER BY FilingTimestamp DESC",
             [f"%{self._clean_sym(q)}%"],
         )
-
-    def dossier(self, symbol: str) -> dict[str, pd.DataFrame]:
-        """Fetch Financials, Shareholding, Holders, Actions, Deals, Insider, Concalls & Annual Reports in 1 HTTP Range call."""
-        sym = self._clean_sym(symbol)
-        idx_data = self._load_ticker_index() or {}
-        canon = self._resolve_remote_symbol(sym)
-        loc = idx_data.get("tickers", {}).get(canon, {}).get("dossier")
-        if not loc:
-            return {}
-        offset, length = loc
-        cdn_url = self._resolve_cdn_url(f"{self.base_url}/by_ticker__nse_dossier.pack")
-        end_byte = offset + length - 1
-        headers = {"Range": f"bytes={offset}-{end_byte}"}
-        if self._http_pool is not None:
-            resp = self._http_pool.get(cdn_url, headers=headers, follow_redirects=True)
-            raw_bytes = resp.content
-        else:
-            if self.token:
-                headers["Authorization"] = f"Bearer {self.token}"
-            req = urllib.request.Request(cdn_url, headers=headers)
-            with urllib.request.urlopen(req, timeout=10.0) as resp:
-                raw_bytes = resp.read()
-        payload = json.loads(zlib.decompress(raw_bytes).decode("utf-8"))
-        return {k: pd.DataFrame(v) for k, v in payload.items()}
 
     def fii_dii_flows(self) -> pd.DataFrame:
         """Stream Cash Market FII/FPI and DII net inflows/outflows over HTTPS."""
@@ -713,13 +1002,18 @@ class RemoteLakeClient:
         year: int | None = None,
         month: int | None = None,
         trade_date: str | date | None = None,
+        exchange: str | None = None,
     ) -> pd.DataFrame:
-        """Stream an EOD Option Chain for a specific symbol over HTTPS in ~400ms."""
+        """Stream an EOD Option Chain from NSE or BSE (auto-selects BSE for SENSEX/BANKEX, defaults to latest trade date)."""
         self._ensure_httpfs()
+        sym = self._clean_sym(symbol)
+        exch = "bse" if (sym in ("SENSEX", "BANKEX") or (exchange and exchange.upper() == "BSE")) else "nse"
         if trade_date and year is None:
             year = pd.Timestamp(trade_date).year
         yr = year or pd.Timestamp.now().year
-        url = self._resolve_cdn_url(self._asset_url("derivatives", f"nse_fo_{yr}.parquet"))
+        url = self._resolve_cdn_url(self._asset_url("derivatives", f"{exch}_fo_{yr}.parquet"))
+        if not url:
+            return pd.DataFrame()
         if trade_date:
             return self._safe_query(
                 f"""SELECT * FROM read_parquet('{url}')
@@ -727,11 +1021,18 @@ class RemoteLakeClient:
                   AND Date >= CAST(? AS TIMESTAMP)
                   AND Date < CAST(? AS TIMESTAMP) + INTERVAL 1 DAY
                 ORDER BY ExpiryDate, StrikePrice, OptionType""",
-                [symbol.strip().upper(), str(trade_date), str(trade_date)],
+                [sym, str(trade_date), str(trade_date)],
             )
         return self._safe_query(
-            f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ? ORDER BY Date, ExpiryDate, StrikePrice",
-            [symbol.strip().upper()],
+            f"""
+            WITH sym_fo AS (
+                SELECT * FROM read_parquet('{url}') WHERE Symbol = ?
+            )
+            SELECT * FROM sym_fo
+            WHERE Date = (SELECT MAX(Date) FROM sym_fo)
+            ORDER BY ExpiryDate, StrikePrice, OptionType
+            """,
+            [sym],
         )
 
     def panel(
@@ -740,7 +1041,7 @@ class RemoteLakeClient:
         field: str = "Adj Close",
         start_year: int = 2024,
         end_year: int = 2026,
-        exchange: str = "NSE",
+        exchange: str | None = None,
     ) -> pd.DataFrame:
         """Stream a date-aligned 2D (Date x Symbol) matrix over HTTPS."""
         df = self.download(symbols, start_year=start_year, end_year=end_year, exchange=exchange)

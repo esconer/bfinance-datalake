@@ -236,9 +236,9 @@ def build_company_dossier_pack(
     scrip_to_canon: dict[str, str] | None = None,
 ) -> dict[str, list[int]]:
     """
-    Packs all 8 non-price datasets (Financials, Shareholding, >1% Holders, Corporate Actions,
-    Bulk/Block Deals, Insider Trades, Concalls, Annual Reports) per canonical symbol into
-    `by_ticker__nse_dossier.pack` so all 8 tables can be fetched in a single ~25 KB HTTP Range request.
+    Packs all NSE & BSE non-price datasets (Financials, NSE+BSE Shareholding, >1% Holders,
+    NSE+BSE Corporate Actions, Deals, Insider Trades, Concalls, Annual Reports) per canonical
+    symbol (or BSE ScripCode for BSE-only companies) into `by_ticker__nse_dossier.pack`.
     """
     import zlib
 
@@ -246,8 +246,10 @@ def build_company_dossier_pack(
     tables = {
         "financials": ("fundamentals/xbrl_financials.parquet", "Symbol", None),
         "shareholding": ("shareholding/nse_shareholding_summary.parquet", "Symbol", None),
+        "shareholding_bse": ("shareholding/bse_shareholding_history.parquet", "Symbol", "ScripCode"),
         "named_holders": ("shareholding/named_shareholders.parquet", "Symbol", None),
         "actions": ("actions/nse_corporate_actions.parquet", "symbol", None),
+        "actions_bse": ("actions/bse_corporate_actions.parquet", "short_name", "scrip_code"),
         "deals": ("deals/bulk_block_deals.parquet", "Symbol", None),
         "insider_trades": ("deals/insider_trading_pit.parquet", "symbol", None),
         "annual_reports": ("documents/annual_reports.parquet", "Symbol", "ScripCode"),
@@ -265,15 +267,20 @@ def build_company_dossier_pack(
         for col in df.select_dtypes(include=["datetime64[ns]", "datetimetz"]).columns:
             df[col] = df[col].dt.strftime("%Y-%m-%d")
 
-        if sym_col in df.columns:
+        if scrip_col and scrip_col in df.columns:
+            sc_s = df[scrip_col].fillna("").astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
+        else:
+            sc_s = pd.Series([""] * len(df), index=df.index)
+
+        if sym_col and sym_col in df.columns:
             raw_s = df[sym_col].fillna("").astype(str).str.strip().str.upper()
         else:
             raw_s = pd.Series([""] * len(df), index=df.index)
 
         if scrip_col and scrip_col in df.columns:
-            sc_s = df[scrip_col].fillna("").astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
-            mapped_sc = sc_s.map(lambda sc: scrip_map.get(sc, ""))
-            raw_s = raw_s.where(~raw_s.isin(["", "NAN", "NONE"]), mapped_sc)
+            # Map BSE ScripCode -> Canonical NSE Symbol (or keep ScripCode for BSE-only stocks)
+            mapped_sc = sc_s.map(lambda sc: scrip_map.get(sc, sc))
+            raw_s = mapped_sc.where(mapped_sc != "", raw_s)
 
         df["_CanonSym"] = raw_s.map(lambda s: alias_to_canon.get(s, s))
         for sym, grp in df.groupby("_CanonSym"):

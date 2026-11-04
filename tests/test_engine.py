@@ -342,6 +342,37 @@ class TestUnifiedLakeEngine(unittest.TestCase):
         out3 = adj.apply_adjustments(df_date_gap.copy(), "TEST_GAP", auto_adjust=False)
         self.assertEqual(out3.loc[0, "Adj Close"], 1000.0)
 
+    def test_auto_exchange_detection_and_ticker_preference(self):
+        # 1. Test strip_exchange_tag helper
+        q, exch = self.lake._strip_exchange_tag("RELIANCE.NS")
+        self.assertEqual((q, exch), ("RELIANCE", "NSE"))
+
+        q, exch = self.lake._strip_exchange_tag("500325.BO")
+        self.assertEqual((q, exch), ("500325", "BSE"))
+
+        q, exch = self.lake._strip_exchange_tag("BSE:TCS")
+        self.assertEqual((q, exch), ("TCS", "BSE"))
+
+        q, exch = self.lake._strip_exchange_tag("SENSEX")
+        self.assertEqual((q, exch), ("SENSEX", "BSE"))
+
+        q, exch = self.lake._strip_exchange_tag("^NSEI")
+        self.assertEqual((q, exch), ("NIFTY 50", "NSE"))
+
+        # 2. Test infer_exchange helper
+        ident, exch = self.lake._infer_exchange("RELIANCE.BO")
+        self.assertEqual(exch, "BSE")
+
+        ident, exch = self.lake._infer_exchange("512345")
+        self.assertEqual(exch, "BSE")
+
+        # 3. Test LakeTicker preference
+        t_bse = self.lake.ticker("500325.BO")
+        self.assertEqual(t_bse.default_exchange, "BSE")
+
+        t_nse = self.lake.ticker("RELIANCE.NS")
+        self.assertEqual(t_nse.default_exchange, "NSE")
+
 
 if __name__ == "__main__":
     unittest.main()

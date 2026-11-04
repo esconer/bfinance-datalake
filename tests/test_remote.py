@@ -209,6 +209,87 @@ class TestRemoteAndStorageLayout(unittest.TestCase):
         self.assertEqual(p_df.loc["2024-01-01", "RELIANCE"], 1300.0)
         self.assertEqual(p_df.loc["2024-01-02", "TCS"], 3850.0)
 
+    def test_remote_dossier_routing_and_cache(self):
+        client = RemoteLakeClient("user/bfinance-datalake", load_httpfs=False, use_pack=True)
+        client._dossier_cache["WIPRO"] = {
+            "financials": pd.DataFrame([{"Symbol": "WIPRO", "PeriodType": "Quarterly", "Sales_Cr": 22000.0}]),
+            "shareholding": pd.DataFrame([{"Symbol": "WIPRO", "QuarterEnd": "2024-03-31", "PromoterPct": 73.0}]),
+            "shareholding_bse": pd.DataFrame([{"Symbol": "WIPRO", "ScripCode": "507685", "QuarterId": "2024-03-31"}]),
+            "named_holders": pd.DataFrame([{"Symbol": "WIPRO", "HolderName": "LIC", "PctOfTotal": 4.5}]),
+            "actions": pd.DataFrame([{"symbol": "WIPRO", "ExDate": "2024-01-10", "purpose": "Bonus 1:1"}]),
+            "actions_bse": pd.DataFrame([{"scrip_code": "507685", "ExDate": "2024-01-10", "purpose": "Bonus 1:1"}]),
+            "deals": pd.DataFrame([{"Symbol": "WIPRO", "Date": "2024-02-01", "ClientName": "Big Fund"}]),
+            "insider_trades": pd.DataFrame([{"symbol": "WIPRO", "date": "2024-02-02", "name": "Insider"}]),
+            "annual_reports": pd.DataFrame([{"Symbol": "WIPRO", "Year": 2024, "Url": "http://wipro.pdf"}]),
+            "concalls": pd.DataFrame([{"Symbol": "WIPRO", "FilingTimestamp": "2024-02-03", "TranscriptUrl": "http://wipro_cc.pdf"}]),
+        }
+
+        # Verify all non-price methods route through dossier cache without network calls
+        fin = client.financials("WIPRO", period_type="Quarterly")
+        self.assertEqual(fin["Sales_Cr"].iloc[0], 22000.0)
+
+        shp = client.shareholding("WIPRO", exchange="NSE")
+        self.assertEqual(shp["PromoterPct"].iloc[0], 73.0)
+
+        shp_bse = client.shareholding("WIPRO", exchange="BSE")
+        self.assertEqual(shp_bse["ScripCode"].iloc[0], "507685")
+
+        nh = client.named_holders("WIPRO")
+        self.assertEqual(nh["HolderName"].iloc[0], "LIC")
+
+        ca = client.corporate_actions("WIPRO", exchange="NSE")
+        self.assertEqual(ca["purpose"].iloc[0], "Bonus 1:1")
+
+        ca_bse = client.corporate_actions("WIPRO", exchange="BSE")
+        self.assertEqual(ca_bse["purpose"].iloc[0], "Bonus 1:1")
+
+        deals = client.deals("WIPRO")
+        self.assertEqual(deals["ClientName"].iloc[0], "Big Fund")
+
+        pit = client.insider_trades("WIPRO")
+        self.assertEqual(pit["name"].iloc[0], "Insider")
+
+        ar = client.annual_reports("WIPRO")
+        self.assertEqual(ar["Year"].iloc[0], 2024)
+
+        cc = client.concalls("WIPRO")
+        self.assertEqual(cc["TranscriptUrl"].iloc[0], "http://wipro_cc.pdf")
+
+    def test_remote_exchange_detection_and_parsing(self):
+        client = RemoteLakeClient("user/bfinance-datalake", load_httpfs=False)
+        client._ticker_index_loaded = True
+        client._ticker_index_loaded_nse = True
+        client._ticker_index_nse = {}
+        client._ticker_index_loaded_bse = True
+        client._ticker_index_bse = {}
+        self.assertEqual(client._detect_exchange("RELIANCE"), "NSE")
+        self.assertEqual(client._detect_exchange("RELIANCE.NS"), "NSE")
+        self.assertEqual(client._detect_exchange("NSE:RELIANCE"), "NSE")
+        self.assertEqual(client._detect_exchange("RELIANCE.BO"), "BSE")
+        self.assertEqual(client._detect_exchange("BSE:RELIANCE"), "BSE")
+        self.assertEqual(client._detect_exchange("500325.BO"), "BSE")
+        self.assertEqual(client._detect_exchange("SENSEX"), "BSE")
+        self.assertEqual(client._detect_exchange("BANKEX"), "BSE")
+
+        # Parse symbol & exchange
+        sym, exch, is_exp = client._parse_symbol_and_exchange("RELIANCE")
+        self.assertEqual((sym, exch, is_exp), ("RELIANCE", "NSE", False))
+
+        sym, exch, is_exp = client._parse_symbol_and_exchange("RELIANCE.BO")
+        self.assertEqual((sym, exch, is_exp), ("RELIANCE", "BSE", True))
+
+        sym, exch, is_exp = client._parse_symbol_and_exchange("500325.BO")
+        self.assertEqual((sym, exch, is_exp), ("500325", "BSE", True))
+
+        sym, exch, is_exp = client._parse_symbol_and_exchange("512345")
+        self.assertEqual((sym, exch, is_exp), ("512345", "BSE", False))
+
+    def test_remote_http_pool_auth_isolation(self):
+        client = RemoteLakeClient("user/bfinance-datalake", token="ghp_dummySecretToken123", load_httpfs=False)
+        # Verify _http_pool does NOT contain Authorization in its default headers (protecting Azure SAS URLs)
+        if client._http_pool is not None:
+            self.assertNotIn("authorization", {k.lower() for k in client._http_pool.headers.keys()})
+
 
 if __name__ == "__main__":
     unittest.main()
