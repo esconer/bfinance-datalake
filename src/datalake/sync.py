@@ -289,6 +289,32 @@ def build_company_dossier_pack(
                 continue
             by_sym.setdefault(sym_str, {})[key] = grp.drop(columns=["_CanonSym"]).to_dict("records")
 
+    # Also pack the latest trading day's F&O Option Chain per underlying symbol (~3 KB/symbol)
+    fo_dir = data_dir / "derivatives"
+    if fo_dir.exists():
+        fo_files = sorted(fo_dir.glob("nse_fo_*.parquet"))
+        if fo_files:
+            try:
+                fo_df = read_table_safe(fo_files[-1])
+                if not fo_df.empty and "Date" in fo_df.columns and "Symbol" in fo_df.columns:
+                    max_fo_dt = pd.to_datetime(fo_df["Date"]).max()
+                    latest_fo = fo_df[pd.to_datetime(fo_df["Date"]) == max_fo_dt].copy()
+                    for col in latest_fo.select_dtypes(include=["datetime64[ns]", "datetimetz"]).columns:
+                        latest_fo[col] = latest_fo[col].dt.strftime("%Y-%m-%d")
+                    latest_fo["_CanonSym"] = (
+                        latest_fo["Symbol"].astype(str).str.strip().str.upper().map(lambda s: alias_to_canon.get(s, s))
+                    )
+                    sort_cols = [c for c in ("ExpiryDate", "StrikePrice", "OptionType") if c in latest_fo.columns]
+                    for sym, grp in latest_fo.groupby("_CanonSym"):
+                        sym_str = str(sym).strip().upper()
+                        if sym_str:
+                            clean_sub = grp.drop(columns=["_CanonSym"])
+                            if sort_cols:
+                                clean_sub = clean_sub.sort_values(sort_cols)
+                            by_sym.setdefault(sym_str, {})["option_chain"] = clean_sub.to_dict("records")
+            except Exception as exc:
+                logger.debug("[Dossier Pack F&O] %s", exc)
+
     if not by_sym:
         return {}
 

@@ -253,6 +253,33 @@ class TestSyncEngine(unittest.TestCase):
             self.assertEqual(len(snap_df), 1)
             self.assertEqual(snap_df.iloc[0]["Close"], 110.0)
 
+    def test_dossier_pack_includes_option_chain(self):
+        import zlib
+        with tempfile.TemporaryDirectory() as src_dir, tempfile.TemporaryDirectory() as stg_dir:
+            src = Path(src_dir)
+            stg = Path(stg_dir)
+            fo_dir = src / "derivatives"
+            fo_dir.mkdir(parents=True)
+            df = pd.DataFrame([
+                {"Symbol": "RELIANCE", "Date": pd.to_datetime("2026-01-02"), "ExpiryDate": "2026-01-29", "StrikePrice": 2800.0, "OptionType": "CE", "Close": 55.0},
+            ])
+            df.to_parquet(fo_dir / "nse_fo_2026.parquet")
+
+            from datalake.sync import build_company_dossier_pack
+            offsets = build_company_dossier_pack(src, stg, alias_to_canon={"RELIANCE": "RELIANCE"})
+            self.assertIn("RELIANCE", offsets)
+
+            pack_file = stg / "by_ticker__nse_dossier.pack"
+            self.assertTrue(pack_file.exists())
+            off, length = offsets["RELIANCE"]
+            with pack_file.open("rb") as f:
+                f.seek(off)
+                blob = f.read(length)
+            payload = json.loads(zlib.decompress(blob).decode("utf-8"))
+            self.assertIn("option_chain", payload)
+            self.assertEqual(len(payload["option_chain"]), 1)
+            self.assertEqual(payload["option_chain"][0]["StrikePrice"], 2800.0)
+
 
 if __name__ == "__main__":
     unittest.main()

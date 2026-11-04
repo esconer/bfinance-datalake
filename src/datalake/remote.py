@@ -63,6 +63,7 @@ class RemoteLakeClient:
         self._cdn_url_cache: dict[str, tuple[float, str]] = {}
         self._compacted_bounds_cache: dict[str, tuple[int, int] | None] | None = None
         self._dossier_cache: dict[str, dict[str, pd.DataFrame]] = {}
+        self._slice_mem_cache: dict[tuple[str, int, int], pd.DataFrame] = {}
         self._screener_df_cache: pd.DataFrame | None = None
         self._fo_max_date_cache: dict[str, str] = {}
         self._manifest_cache: dict[str, Any] | None = None
@@ -140,7 +141,10 @@ class RemoteLakeClient:
         return f"{self.base_url}/{folder}__{filename}"
 
     def _resolve_cdn_url(self, gh_url: str) -> str:
-        """Resolve GitHub Release 302 redirect to direct CDN URL using a pooled connection (cached 10 min)."""
+        """
+        Resolve GitHub Release 302 redirect to direct CDN URL (cached 10 min).
+        Uses GET with `Range: bytes=0-0` (no redirect) so GitHub signs the CDN URL for GET, not HEAD.
+        """
         if self.repo == "user/bfinance-datalake":
             return gh_url
         now = time.monotonic()
@@ -148,15 +152,21 @@ class RemoteLakeClient:
         if cached and (now - cached[0]) < 600.0:
             return cached[1]
 
+        req_headers = {"Range": "bytes=0-0"}
+        if self.token:
+            req_headers["Authorization"] = f"Bearer {self.token}"
+
         if self._http_pool is not None:
             try:
-                gh_headers = {"Authorization": f"Bearer {self.token}"} if self.token else None
-                resp = self._http_pool.head(gh_url, headers=gh_headers)
+                resp = self._http_pool.get(gh_url, headers=req_headers, follow_redirects=False)
                 if resp.status_code in (301, 302, 303, 307, 308):
                     cdn_url = resp.headers.get("Location") or resp.headers.get("location")
                     if cdn_url:
                         self._cdn_url_cache[gh_url] = (now, cdn_url)
                         return cdn_url
+                if resp.status_code == 404:
+                    self._cdn_url_cache[gh_url] = (now, "")
+                    return ""
             except Exception:
                 pass
             return gh_url
@@ -165,9 +175,7 @@ class RemoteLakeClient:
             def redirect_request(self, req, fp, code, msg, headers, newurl):
                 return None
 
-        req = urllib.request.Request(gh_url, method="HEAD")
-        if self.token:
-            req.add_header("Authorization", f"Bearer {self.token}")
+        req = urllib.request.Request(gh_url, headers=req_headers, method="GET")
         opener = urllib.request.build_opener(_NoRedirect)
         try:
             opener.open(req, timeout=15.0)
@@ -177,6 +185,9 @@ class RemoteLakeClient:
                 if cdn_url:
                     self._cdn_url_cache[gh_url] = (now, cdn_url)
                     return cdn_url
+            if e.code == 404:
+                self._cdn_url_cache[gh_url] = (now, "")
+                return ""
         except Exception:
             pass
         return gh_url
@@ -407,13 +418,19 @@ class RemoteLakeClient:
             return getattr(self, cache_attr, None)
 
     def _fetch_pack_slice(self, pack_filename: str, offset: int, length: int) -> pd.DataFrame:
-        """Fetch a single ticker's exact byte range (`Range: bytes=start-end`) and parse as Parquet."""
+        """Fetch a single ticker's exact byte range (`Range: bytes=start-end`) with in-memory & disk caching."""
+        mem_key = (pack_filename, offset, length)
+        if mem_key in self._slice_mem_cache:
+            return self._slice_mem_cache[mem_key].copy()
+
         is_immutable_hist = "hist.pack" in pack_filename
         if self.cache_dir and is_immutable_hist:
             cache_file = self.cache_dir / f"{pack_filename}_{offset}_{length}.parquet"
             if cache_file.exists():
                 try:
-                    return pd.read_parquet(cache_file)
+                    df = pd.read_parquet(cache_file)
+                    self._slice_mem_cache[mem_key] = df
+                    return df.copy()
                 except Exception:
                     pass
 
@@ -431,13 +448,14 @@ class RemoteLakeClient:
                 raw_bytes = resp.read()
 
         df = pd.read_parquet(io.BytesIO(raw_bytes))
+        self._slice_mem_cache[mem_key] = df
         if self.cache_dir and is_immutable_hist and not df.empty:
             try:
                 cache_file = self.cache_dir / f"{pack_filename}_{offset}_{length}.parquet"
                 df.to_parquet(cache_file, compression="zstd", index=False)
             except Exception:
                 pass
-        return df
+        return df.copy()
 
     def _resolve_remote_symbol(self, symbol_or_code: str, exchange: str = "NSE") -> str:
         """Resolve NSE symbol, old alias, BSE 6-digit code, or 12-char ISIN via `by_ticker__{exch}_index.json`."""
@@ -1107,10 +1125,17 @@ class RemoteLakeClient:
         month: int | None = None,
         trade_date: str | date | None = None,
         exchange: str | None = None,
+        use_pack: bool | None = None,
     ) -> pd.DataFrame:
-        """Stream an EOD Option Chain from NSE or BSE in a single pass (~400ms)."""
-        self._ensure_httpfs()
+        """Stream an EOD Option Chain from Dossier Pack (~0ms warm) or DuckDB httpfs."""
         sym, exch_code, _ = self._parse_symbol_and_exchange(symbol, exchange)
+        should_use_pack = self.use_pack if use_pack is None else use_pack
+        if should_use_pack and trade_date is None:
+            dos = self.dossier(sym)
+            if "option_chain" in dos and not dos["option_chain"].empty:
+                return dos["option_chain"].copy()
+
+        self._ensure_httpfs()
         exch = "bse" if (sym in ("SENSEX", "BANKEX") or exch_code == "BSE") else "nse"
         if trade_date and year is None:
             year = pd.Timestamp(trade_date).year

@@ -379,6 +379,56 @@ class TestRemoteAndStorageLayout(unittest.TestCase):
             self.assertEqual(data["tickers"]["INFY"]["hist"], [0, 500])
             self.assertEqual(data["aliases"]["INFOSYSTCH"], "INFY")
 
+    def test_remote_slice_mem_cache(self):
+        client = RemoteLakeClient("user/bfinance-datalake", load_httpfs=False)
+        network_calls = 0
+        test_df = pd.DataFrame({"Symbol": ["RELIANCE"], "Close": [2800.0]})
+
+        # Seed in-memory slice cache directly
+        mem_key = ("by_ticker__nse_hist.pack", 1000, 200)
+        client._slice_mem_cache[mem_key] = test_df
+
+        # Fetch slice - should return copy from memory without any network or disk activity
+        df1 = client._fetch_pack_slice("by_ticker__nse_hist.pack", 1000, 200)
+        df2 = client._fetch_pack_slice("by_ticker__nse_hist.pack", 1000, 200)
+        self.assertEqual(len(df1), 1)
+        self.assertEqual(df1["Close"].iloc[0], 2800.0)
+        self.assertEqual(len(df2), 1)
+        self.assertEqual(df2["Close"].iloc[0], 2800.0)
+
+    def test_remote_option_chain_dossier_fast_path(self):
+        client = RemoteLakeClient("user/bfinance-datalake", load_httpfs=False)
+        # Pre-seed dossier with option_chain table
+        client._dossier_cache["RELIANCE"] = {
+            "option_chain": pd.DataFrame([
+                {"Symbol": "RELIANCE", "ExpiryDate": "2026-01-29", "StrikePrice": 2800.0, "OptionType": "CE", "Close": 55.0}
+            ])
+        }
+
+        # Query option chain without trade_date - should immediately return dossier table
+        opt_df = client.option_chain("RELIANCE")
+        self.assertEqual(len(opt_df), 1)
+        self.assertEqual(opt_df.iloc[0]["StrikePrice"], 2800.0)
+        self.assertEqual(opt_df.iloc[0]["Close"], 55.0)
+
+    def test_remote_resolve_cdn_url_uses_get_range(self):
+        from unittest.mock import MagicMock
+        client = RemoteLakeClient("esconer/bfinance-datalake", load_httpfs=False)
+        mock_resp = MagicMock()
+        mock_resp.status_code = 302
+        mock_resp.headers = {"Location": "https://objects.githubusercontent.com/signed-asset"}
+        mock_pool = MagicMock()
+        mock_pool.get.return_value = mock_resp
+        client._http_pool = mock_pool
+
+        cdn = client._resolve_cdn_url("https://github.com/esconer/bfinance-datalake/releases/download/latest/test.pack")
+        self.assertEqual(cdn, "https://objects.githubusercontent.com/signed-asset")
+        # Verify get() was called with Range: bytes=0-0 and follow_redirects=False (signing for GET, not HEAD)
+        mock_pool.get.assert_called_once()
+        args, kwargs = mock_pool.get.call_args
+        self.assertEqual(kwargs.get("headers"), {"Range": "bytes=0-0"})
+        self.assertEqual(kwargs.get("follow_redirects"), False)
+
 
 if __name__ == "__main__":
     unittest.main()
