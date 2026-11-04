@@ -522,6 +522,123 @@ class TestUnifiedLakeEngine(unittest.TestCase):
         summary = res.get("summary", {})
         self.assertEqual(summary.get("TotalShares"), 10000000.0)
 
+    def test_get_symbol_actions_preserves_action_type(self):
+        from datalake.adjuster import OHLCVAdjuster
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            p = Path(tmp_dir)
+            act_dir = p / "actions"
+            act_dir.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame([
+                {
+                    "symbol": "RELIANCE",
+                    "ExDate": "2024-10-28",
+                    "ActionType": "BONUS",
+                    "DividendPerShareRs": 0.0,
+                    "ShareMultiplier": 2.0,
+                },
+                {
+                    "symbol": "RELIANCE",
+                    "ExDate": "2024-08-19",
+                    "ActionType": "DIVIDEND",
+                    "DividendPerShareRs": 10.0,
+                    "ShareMultiplier": 1.0,
+                },
+            ]).to_parquet(act_dir / "nse_corporate_actions.parquet", index=False)
+            adj = OHLCVAdjuster(p)
+            acts = adj.get_symbol_actions("RELIANCE", exchange="NSE")
+            self.assertIn("ActionType", acts.columns)
+            bonus_row = acts[acts["ExDate"] == pd.Timestamp("2024-10-28")].iloc[0]
+            self.assertEqual(bonus_row["ActionType"], "BONUS")
+            self.assertEqual(bonus_row["ShareMultiplier"], 2.0)
+
+    def test_fo_and_indices_legacy_symbol_normalization(self):
+        from datalake.scrapers.fo_eod import _FO_SYMBOL_MAP
+        from datalake.scrapers.indices import _LEGACY_INDEX_MAP
+
+        self.assertEqual(_FO_SYMBOL_MAP["S&P CNX NIFTY"], "NIFTY")
+        self.assertEqual(_FO_SYMBOL_MAP["CNX BANK"], "BANKNIFTY")
+        self.assertEqual(_LEGACY_INDEX_MAP["CNX NIFTY"], "NIFTY 50")
+        self.assertEqual(_LEGACY_INDEX_MAP["CNX 100"], "NIFTY 100")
+
+        # Test continuous_futures stitches pre-2016 CNX NIFTY data
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            p = Path(tmp_dir)
+            d_dir = p / "derivatives"
+            d_dir.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame([{
+                "Date": pd.Timestamp("2014-06-12"),
+                "Exchange": "NSE",
+                "InstrumentType": "FUTIDX",
+                "Symbol": "CNX NIFTY",
+                "ExpiryDate": pd.Timestamp("2014-06-26"),
+                "StrikePrice": 0.0,
+                "OptionType": "XX",
+                "Open": 7500.0, "High": 7550.0, "Low": 7480.0, "Close": 7520.0,
+                "SettlePrice": 7520.0, "Contracts": 100.0, "OpenInterest": 5000.0, "ChangeInOI": 50.0
+            }]).to_parquet(d_dir / "nse_fo_2014.parquet", index=False)
+
+            eng = UnifiedLakeEngine(p)
+            cf = eng.continuous_futures("NIFTY", start="2014-01-01", end="2014-12-31")
+            self.assertFalse(cf.empty)
+            self.assertEqual(cf.iloc[0]["Close"], 7520.0)
+            self.assertEqual(cf.iloc[0]["Symbol"], "NIFTY")
+
+    def test_trading_days_and_factor_returns(self):
+        tdays = self.lake.trading_days(start="2026-01-01", end="2026-01-05")
+        self.assertIsInstance(tdays, pd.DatetimeIndex)
+
+        # Factor returns
+        factors = self.lake.factor_returns(start="2026-01-01")
+        self.assertIsInstance(factors, pd.DataFrame)
+
+    def test_calendar_and_fo_ban_list(self):
+        cal = self.lake.calendar("RELIANCE")
+        self.assertIsInstance(cal, pd.DataFrame)
+        bans = self.lake.fo_ban_list()
+        self.assertIsInstance(bans, pd.DataFrame)
+
+    def test_info_dictionary(self):
+        inf = self.lake.info("RELIANCE")
+        self.assertIsInstance(inf, dict)
+        self.assertEqual(inf.get("symbol"), "RELIANCE")
+        t = self.lake.ticker("RELIANCE")
+        self.assertEqual(t.info.get("symbol"), "RELIANCE")
+
+    def test_auto_adjust_scales_last_and_prevclose(self):
+        from datalake.adjuster import OHLCVAdjuster
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            p = Path(tmp_dir)
+            act_dir = p / "actions"
+            act_dir.mkdir(parents=True, exist_ok=True)
+            # 1:1 bonus (multiplier 2.0)
+            pd.DataFrame([{
+                "symbol": "TCS",
+                "ExDate": "2026-01-05",
+                "ActionType": "BONUS",
+                "DividendPerShareRs": 0.0,
+                "ShareMultiplier": 2.0,
+            }]).to_parquet(act_dir / "nse_corporate_actions.parquet", index=False)
+            adj = OHLCVAdjuster(p)
+            df = pd.DataFrame([
+                {
+                    "Date": pd.Timestamp("2026-01-02"),
+                    "Open": 4000.0, "High": 4100.0, "Low": 3950.0, "Close": 4000.0,
+                    "Last": 4000.0, "PrevClose": 3980.0, "Volume": 1000,
+                },
+                {
+                    "Date": pd.Timestamp("2026-01-05"),
+                    "Open": 2000.0, "High": 2050.0, "Low": 1980.0, "Close": 2000.0,
+                    "Last": 2000.0, "PrevClose": 2000.0, "Volume": 2000,
+                },
+            ])
+            res = adj.apply_adjustments(df, "TCS", exchange="NSE", auto_adjust=True)
+            # Pre-bonus day should be halved across all 6 price columns
+            row0 = res.iloc[0]
+            self.assertEqual(row0["Close"], 2000.0)
+            self.assertEqual(row0["Last"], 2000.0)
+            self.assertEqual(row0["PrevClose"], 1990.0)
+            self.assertEqual(row0["Volume"], 2000)
+
 
 if __name__ == "__main__":
     unittest.main()

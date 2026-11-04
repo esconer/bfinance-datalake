@@ -333,6 +333,53 @@ def build_market_screener_snapshot(data_dir: Path, staging_dir: Path) -> dict | 
     }
 
 
+def _compute_curr_year_carry_factors(
+    curr_frames: list[pd.DataFrame],
+    alias_to_canon: dict[str, str],
+    exchange: str,
+    adjuster: Any,
+) -> dict[str, tuple[float, float]]:
+    """
+    Computes the cumulative (price_factor, split_factor) from all `current_year` corporate actions
+    for each symbol so `hist.pack` (< current_year) can be scaled on read without rebuilding `hist.pack`.
+    """
+    if not curr_frames or adjuster is None:
+        return {}
+    combined = sanitize_for_parquet(pd.concat(curr_frames, ignore_index=True))
+    exch = exchange.upper()
+    key_col = "InstrumentId" if (exch == "BSE" and "InstrumentId" in combined.columns) else "Symbol"
+    if combined.empty or key_col not in combined.columns:
+        return {}
+
+    raw_key = combined[key_col].astype(str).str.replace(r"\.0$", "", regex=True).str.strip().str.upper()
+    combined["_CanonSym"] = raw_key.map(lambda s: alias_to_canon.get(s, s))
+
+    carry: dict[str, tuple[float, float]] = {}
+    for sym, grp in combined.groupby("_CanonSym"):
+        clean_grp = grp.drop(columns=["_CanonSym"]).sort_values("Date").drop_duplicates("Date")
+        if clean_grp.empty:
+            continue
+        first_row = clean_grp.iloc[0].copy()
+        anchor_price = float(first_row.get("PrevClose") or first_row.get("Open") or first_row["Close"] or 100.0)
+        if pd.isna(anchor_price) or anchor_price <= 0:
+            anchor_price = float(first_row["Close"] or 100.0)
+        anchor = first_row.copy()
+        anchor["Date"] = pd.Timestamp(year=pd.to_datetime(first_row["Date"]).year - 1, month=12, day=31)
+        anchor["Close"] = anchor_price
+        anchor["Open"] = anchor_price
+        anchor["High"] = anchor_price
+        anchor["Low"] = anchor_price
+
+        test_df = pd.concat([pd.DataFrame([anchor]), clean_grp], ignore_index=True)
+        adj_df = adjuster.apply_adjustments(test_df, str(sym), exchange=exch, auto_adjust=False, include_future_splits=True)
+        p_factor = round(float(adj_df["Adj Close"].iloc[0]) / anchor_price, 8)
+        splits = adj_df["Stock Splits"].iloc[1:].replace(0.0, 1.0).to_numpy(dtype=float)
+        s_factor = round(1.0 / float(splits.prod()), 8) if len(splits) > 0 else 1.0
+        if p_factor != 1.0 or s_factor != 1.0:
+            carry[str(sym)] = (p_factor, s_factor)
+    return carry
+
+
 def build_by_ticker_packs(
     data_dir: Path,
     staging_dir: Path,
@@ -444,11 +491,13 @@ def build_by_ticker_packs(
             hist_offsets = {}
 
         curr_offsets: dict[str, list[int]] = {}
-        if curr_files:
+        curr_raw_frames = [read_table_safe(p) for p in curr_files] if curr_files else []
+        carry_map = _compute_curr_year_carry_factors(curr_raw_frames, alias_map, exch.upper(), eng.adjuster)
+        if curr_raw_frames:
             logger.info("[By-Ticker Pack] Building %s for current year %d...", curr_pack_name, current_year)
             curr_dst = staging_dir / curr_pack_name
             curr_offsets = _pack_frames_by_symbol(
-                [read_table_safe(p) for p in curr_files],
+                curr_raw_frames,
                 alias_map,
                 curr_dst,
                 exchange=exch.upper(),
@@ -469,6 +518,8 @@ def build_by_ticker_packs(
                 entry["hist"] = hist_offsets[k]
             if k in curr_offsets:
                 entry["curr"] = curr_offsets[k]
+            if k in carry_map:
+                entry["hist_carry"] = [carry_map[k][0], carry_map[k][1]]
             d_key = k if exch == "nse" else bse_to_nse_sym.get(k, k)
             if d_key in dossier_offsets:
                 entry["dossier"] = dossier_offsets[d_key]
@@ -548,11 +599,15 @@ def prepare_release_staging(
                 remote_sizes = None
 
     UnifiedLakeEngine(data_dir).optimize_layout()
-    manifest = build_manifest(data_dir)
 
     if staging_dir.exists():
         shutil.rmtree(staging_dir)
     staging_dir.mkdir(parents=True, exist_ok=True)
+
+    screener_meta = build_market_screener_snapshot(data_dir, staging_dir)
+    manifest = build_manifest(data_dir)
+    if screener_meta:
+        manifest["snapshots"] = {"market_screener_latest.parquet": screener_meta}
 
     compacted_meta = build_compacted_equity_bundles(
         data_dir, staging_dir, manifest, old_manifest=old_m, remote_sizes=remote_sizes
@@ -565,10 +620,6 @@ def prepare_release_staging(
     )
     if packs_meta:
         manifest["by_ticker_packs"] = packs_meta
-
-    screener_meta = build_market_screener_snapshot(data_dir, staging_dir)
-    if screener_meta:
-        manifest["snapshots"] = {"market_screener_latest.parquet": screener_meta}
 
     if compacted_meta or packs_meta or screener_meta:
         (data_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")

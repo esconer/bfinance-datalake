@@ -227,6 +227,58 @@ class UniverseAndActionsScraper:
             )
             self.state.record("nifty_constituents_pit", today.isoformat(), "OK", sum(len(f) for f in const_frames))
 
+        await self.sync_upcoming_calendar_and_fo_ban()
+
+    async def sync_upcoming_calendar_and_fo_ban(self) -> None:
+        """
+        Syncs:
+          1. Upcoming NSE Corporate Board Meetings (`/api/corporate-board-meetings?index=equities`)
+             into `actions/upcoming_board_meetings.parquet` (powers `ticker.calendar` in bfinance).
+          2. Daily NSE F&O Security Ban List (`fo_secban.csv`) into `derivatives/fo_ban_list.parquet`.
+        """
+        bm_url = "https://www.nseindia.com/api/corporate-board-meetings?index=equities"
+        try:
+            resp = await self.http.get(bm_url, headers=NSE_API_HEADERS, prime_nse=True)
+            if resp.status_code == 200 and resp.text.lstrip().startswith("["):
+                rows = resp.json()
+                if isinstance(rows, list) and rows:
+                    bm_df = pd.DataFrame(rows)
+                    bm_df = bm_df.rename(columns={
+                        "bm_symbol": "Symbol",
+                        "bm_date": "MeetingDate",
+                        "bm_purpose": "Purpose",
+                        "bm_desc": "Description",
+                        "sm_name": "CompanyName",
+                    })
+                    if "MeetingDate" in bm_df.columns:
+                        bm_df["MeetingDate"] = pd.to_datetime(bm_df["MeetingDate"], format="mixed", dayfirst=True, errors="coerce")
+                    upsert_parquet_partition(
+                        bm_df,
+                        self.cfg.root_dir / "actions" / "upcoming_board_meetings.parquet",
+                        dedup_cols=["Symbol", "MeetingDate", "Purpose"],
+                        sort_cols=["Symbol", "MeetingDate"],
+                    )
+        except Exception as exc:
+            logger.debug("[Board Meetings] %s", exc)
+
+        ban_url = "https://nsearchives.nseindia.com/content/fo/fo_secban.csv"
+        try:
+            b_resp = await self.http.get(ban_url, headers=ARCHIVE_HEADERS)
+            if b_resp.status_code == 200 and not b_resp.text.lstrip().startswith("<"):
+                lines = [ln.strip() for ln in b_resp.text.splitlines() if ln.strip()]
+                syms = [
+                    ln.split(",")[-1].strip().upper()
+                    for ln in lines[1:]
+                    if "," in ln or ln.strip().isalpha()
+                ]
+                ban_df = pd.DataFrame({
+                    "Date": [pd.Timestamp(today_ist())] * len(syms),
+                    "Symbol": syms,
+                })
+                write_parquet_atomic(ban_df, self.cfg.root_dir / "derivatives" / "fo_ban_list.parquet")
+        except Exception as exc:
+            logger.debug("[FO Ban List] %s", exc)
+
     async def sync_corporate_actions(
         self, start_year: int = 2000, end_year: int | None = None, force: bool = False
     ) -> None:

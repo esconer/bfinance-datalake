@@ -376,7 +376,8 @@ class RemoteLakeClient:
 
     def _fetch_pack_slice(self, pack_filename: str, offset: int, length: int) -> pd.DataFrame:
         """Fetch a single ticker's exact byte range (`Range: bytes=start-end`) and parse as Parquet."""
-        if self.cache_dir:
+        is_immutable_hist = "hist.pack" in pack_filename
+        if self.cache_dir and is_immutable_hist:
             cache_file = self.cache_dir / f"{pack_filename}_{offset}_{length}.parquet"
             if cache_file.exists():
                 try:
@@ -398,7 +399,7 @@ class RemoteLakeClient:
                 raw_bytes = resp.read()
 
         df = pd.read_parquet(io.BytesIO(raw_bytes))
-        if self.cache_dir and not df.empty:
+        if self.cache_dir and is_immutable_hist and not df.empty:
             try:
                 cache_file = self.cache_dir / f"{pack_filename}_{offset}_{length}.parquet"
                 df.to_parquet(cache_file, compression="zstd", index=False)
@@ -519,12 +520,25 @@ class RemoteLakeClient:
         else:
             with ThreadPoolExecutor(max_workers=2) as pool:
                 frames = list(pool.map(lambda t: self._fetch_pack_slice(*t), tasks))
+
+        # Apply current-year corporate action carry-back factor to hist.pack slice so 2025->2026 Adj Close is seamless
+        if start_year < cur_yr and "hist" in entry and "hist_carry" in entry and frames:
+            p_fac, s_fac = float(entry["hist_carry"][0]), float(entry["hist_carry"][1])
+            h_df = frames[0].copy()
+            if "Adj Close" in h_df.columns and p_fac != 1.0:
+                h_df["Adj Close"] = (h_df["Adj Close"] * p_fac).round(4)
+            if s_fac != 1.0:
+                for vcol in ("Volume", "DeliverableQty"):
+                    if vcol in h_df.columns:
+                        h_df[vcol] = (h_df[vcol] / s_fac).round()
+            frames[0] = h_df
+
         df = pd.concat(frames, ignore_index=True)
         if "actions" in entry and ("Adj Close" not in df.columns or df["Adj Close"].isna().all()):
             df = self._apply_pack_actions(df, entry.get("actions", []), auto_adjust=auto_adjust)
         elif auto_adjust and "Adj Close" in df.columns and "Close" in df.columns:
             ratio = (df["Adj Close"] / df["Close"].replace(0, float("nan"))).fillna(1.0)
-            for c in ("Open", "High", "Low", "Close"):
+            for c in ("Open", "High", "Low", "Close", "Last", "PrevClose"):
                 if c in df.columns:
                     df[c] = (df[c] * ratio).round(4)
         years = pd.to_datetime(df["Date"]).dt.year
@@ -546,7 +560,7 @@ class RemoteLakeClient:
         end_year: int = 2026,
         exchange: str | None = None,
         columns: list[str] | None = None,
-        auto_adjust: bool = False,
+        auto_adjust: bool = True,
         use_pack: bool | None = None,
     ) -> pd.DataFrame:
         """
@@ -1085,3 +1099,47 @@ class RemoteLakeClient:
     def sql(self, query: str, params: list[Any] | None = None) -> pd.DataFrame:
         """Execute arbitrary analytical SQL over remote Parquet datasets via DuckDB."""
         return self._safe_query(query, params)
+
+    def info(self, symbol: str) -> dict[str, Any]:
+        """Return summary dict combining SecurityIdentity metadata, technicals, and valuation."""
+        sym = symbol.strip().upper()
+        out: dict[str, Any] = {"symbol": sym}
+        try:
+            scr = self.screener(f"Symbol = '{sym}'")
+            if not scr.empty:
+                row = scr.iloc[0]
+                close_p = float(row["Close"]) if pd.notna(row.get("Close")) else None
+                out.update({
+                    "regularMarketPrice": close_p,
+                    "fiftyDayAverage": float(row["SMA_50"]) if pd.notna(row.get("SMA_50")) else None,
+                    "twoHundredDayAverage": float(row["SMA_200"]) if pd.notna(row.get("SMA_200")) else None,
+                    "fiftyTwoWeekHigh": float(row["High_52W"]) if pd.notna(row.get("High_52W")) else None,
+                    "fiftyTwoWeekLow": float(row["Low_52W"]) if pd.notna(row.get("Low_52W")) else None,
+                    "volume": int(row["Volume"]) if pd.notna(row.get("Volume")) else None,
+                    "trailingPE": float(row["PE"]) if pd.notna(row.get("PE")) else None,
+                    "trailingEps": float(row["BasicEPS_Rs"]) if pd.notna(row.get("BasicEPS_Rs")) else None,
+                    "totalRevenueCr": float(row["Sales_Cr"]) if pd.notna(row.get("Sales_Cr")) else None,
+                    "netIncomeCr": float(row["NetProfit_Cr"]) if pd.notna(row.get("NetProfit_Cr")) else None,
+                    "returnOnEquityPct": float(row["ROE_Pct"]) if pd.notna(row.get("ROE_Pct")) else None,
+                    "debtToEquity": float(row["DebtToEquity"]) if pd.notna(row.get("DebtToEquity")) else None,
+                    "heldPercentPromoters": float(row["PromoterPct"]) if pd.notna(row.get("PromoterPct")) else None,
+                    "promoterPledgedPct": float(row["PromoterPledgedPct"]) if pd.notna(row.get("PromoterPledgedPct")) else None,
+                    "heldPercentFPI": float(row["FPI_Pct"]) if pd.notna(row.get("FPI_Pct")) else None,
+                    "heldPercentMutualFunds": float(row["MutualFundsPct"]) if pd.notna(row.get("MutualFundsPct")) else None,
+                })
+        except Exception:
+            pass
+        return out
+
+    def calendar(self, symbol: str | None = None) -> pd.DataFrame:
+        """Return upcoming Board Meetings over HTTPS."""
+        self._ensure_httpfs()
+        url = self._resolve_cdn_url(self._asset_url("actions", "upcoming_board_meetings.parquet"))
+        where = f"WHERE Symbol = '{symbol.strip().upper()}'" if symbol else ""
+        return self._safe_query(f"SELECT * FROM read_parquet('{url}') {where}")
+
+    def fo_ban_list(self) -> pd.DataFrame:
+        """Return current F&O security ban list over HTTPS."""
+        self._ensure_httpfs()
+        url = self._resolve_cdn_url(self._asset_url("derivatives", "fo_ban_list.parquet"))
+        return self._safe_query(f"SELECT * FROM read_parquet('{url}')")

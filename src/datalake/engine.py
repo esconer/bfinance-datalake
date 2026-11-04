@@ -371,7 +371,7 @@ class UnifiedLakeEngine:
         end: str | date | None = None,
         period: str | None = None,
         exchange: str | None = None,
-        auto_adjust: bool = False,
+        auto_adjust: bool = True,
     ) -> pd.DataFrame:
         """
         Fetch daily OHLCV + Delivery + Dividends + Stock Splits + Adj Close across 1995..2026
@@ -409,7 +409,7 @@ class UnifiedLakeEngine:
         end: str | date | None = None,
         period: str | None = None,
         exchange: str | None = None,
-        auto_adjust: bool = False,
+        auto_adjust: bool = True,
     ) -> dict[str, pd.DataFrame]:
         """Vectorized multi-symbol OHLCV download reading each annual Parquet file only once."""
         if not queries:
@@ -584,24 +584,39 @@ class UnifiedLakeEngine:
         if not fo_dir.exists():
             return pd.DataFrame()
 
+        fo_aliases = [sym]
+        if sym == "NIFTY":
+            fo_aliases = ["NIFTY", "S&P CNX NIFTY", "CNX NIFTY"]
+        elif sym == "BANKNIFTY":
+            fo_aliases = ["BANKNIFTY", "CNX BANK", "BANK NIFTY"]
+        elif sym in ("NIFTYIT", "CNXIT", "CNX IT"):
+            fo_aliases = ["NIFTYIT", "CNX IT", "CNXIT"]
+        elif sym in ("NIFTYMID50", "NFTYMCAP50"):
+            fo_aliases = ["NIFTYMID50", "NFTYMCAP50"]
+        else:
+            try:
+                fo_aliases = list(self.resolve(sym).aliases)
+            except Exception:
+                fo_aliases = [sym]
+
         if trade_date:
             dt = pd.Timestamp(trade_date).normalize()
             yearly = fo_dir / f"{exch}_fo_{dt.year}.parquet"
             monthly = fo_dir / f"{exch}_fo_{dt.year}_{dt.month:02d}.parquet"
             files = [yearly] if yearly.exists() else [monthly]
-            filters = [("Symbol", "==", sym), ("Date", "==", dt)]
+            filters = [("Symbol", "in", fo_aliases), ("Date", "==", dt)]
         else:
             files = sorted(fo_dir.glob(f"{exch}_fo_*.parquet"), key=lambda p: p.stem.split("_")[2:])[-1:]
             if not files or not files[0].exists():
                 return pd.DataFrame()
             try:
-                date_df = pd.read_parquet(files[0], columns=["Date"], filters=[("Symbol", "==", sym)])
+                date_df = pd.read_parquet(files[0], columns=["Date"], filters=[("Symbol", "in", fo_aliases)])
                 if date_df.empty:
                     return pd.DataFrame()
                 max_dt = pd.to_datetime(date_df["Date"]).max()
-                filters = [("Symbol", "==", sym), ("Date", "==", max_dt)]
+                filters = [("Symbol", "in", fo_aliases), ("Date", "==", max_dt)]
             except Exception:
-                filters = [("Symbol", "==", sym)]
+                filters = [("Symbol", "in", fo_aliases)]
 
         frames = [self._read_filtered_parquet(f, filters=filters) for f in files if f.exists()]
         if not frames:
@@ -677,6 +692,139 @@ class UnifiedLakeEngine:
         if end:
             df = df[df["Date"] <= pd.Timestamp(end)]
         return df.sort_values("Date").drop_duplicates(subset=["Date"], keep="first").reset_index(drop=True)
+
+    def trading_days(
+        self,
+        start: str | date = "1995-11-03",
+        end: str | date | None = None,
+    ) -> pd.DatetimeIndex:
+        """Return authoritative NSE trading session dates (derived from NIFTY 50 index history)."""
+        idx_df = self.index_history("NIFTY 50", start=start, end=end)
+        if not idx_df.empty and "Date" in idx_df.columns:
+            return pd.DatetimeIndex(pd.to_datetime(idx_df["Date"]).dt.normalize().unique()).sort_values()
+        return pd.DatetimeIndex([])
+
+    def info(self, query: str | int) -> dict[str, Any]:
+        """
+        Return a yfinance-compatible summary dictionary combining SecurityIdentity metadata,
+        latest price/52W technicals, TTM valuation multiples, and shareholding breakdown.
+        """
+        ident = self.resolve(query)
+        out: dict[str, Any] = {
+            "symbol": ident.symbol,
+            "bseCode": ident.bse_code,
+            "isin": ident.isin,
+            "longName": ident.company_name or ident.symbol,
+            "industry": ident.industry,
+            "faceValue": ident.face_value,
+            "listingDate": ident.listing_date,
+            "exchange": ident.primary_exchange,
+        }
+        try:
+            scr = self.screener(f"Symbol = '{ident.symbol}'")
+            if not scr.empty:
+                row = scr.iloc[0]
+                close_p = float(row["Close"]) if pd.notna(row.get("Close")) else None
+                out.update({
+                    "regularMarketPrice": close_p,
+                    "fiftyDayAverage": float(row["SMA_50"]) if pd.notna(row.get("SMA_50")) else None,
+                    "twoHundredDayAverage": float(row["SMA_200"]) if pd.notna(row.get("SMA_200")) else None,
+                    "fiftyTwoWeekHigh": float(row["High_52W"]) if pd.notna(row.get("High_52W")) else None,
+                    "fiftyTwoWeekLow": float(row["Low_52W"]) if pd.notna(row.get("Low_52W")) else None,
+                    "volume": int(row["Volume"]) if pd.notna(row.get("Volume")) else None,
+                    "trailingPE": float(row["PE"]) if pd.notna(row.get("PE")) else None,
+                    "trailingEps": float(row["BasicEPS_Rs"]) if pd.notna(row.get("BasicEPS_Rs")) else None,
+                    "totalRevenueCr": float(row["Sales_Cr"]) if pd.notna(row.get("Sales_Cr")) else None,
+                    "netIncomeCr": float(row["NetProfit_Cr"]) if pd.notna(row.get("NetProfit_Cr")) else None,
+                    "returnOnEquityPct": float(row["ROE_Pct"]) if pd.notna(row.get("ROE_Pct")) else None,
+                    "debtToEquity": float(row["DebtToEquity"]) if pd.notna(row.get("DebtToEquity")) else None,
+                    "heldPercentPromoters": float(row["PromoterPct"]) if pd.notna(row.get("PromoterPct")) else None,
+                    "promoterPledgedPct": float(row["PromoterPledgedPct"]) if pd.notna(row.get("PromoterPledgedPct")) else None,
+                    "heldPercentFPI": float(row["FPI_Pct"]) if pd.notna(row.get("FPI_Pct")) else None,
+                    "heldPercentMutualFunds": float(row["MutualFundsPct"]) if pd.notna(row.get("MutualFundsPct")) else None,
+                })
+        except Exception:
+            pass
+        return out
+
+    def factor_returns(
+        self,
+        start: str | date = "2005-01-01",
+        end: str | date | None = None,
+    ) -> pd.DataFrame:
+        """
+        Compute daily Indian institutional risk factor returns from the 30Y Indices table:
+        - `MKT`: NIFTY 500 (or NIFTY 50) TRI daily return
+        - `RF`: Daily risk-free return (from NIFTY 1D RATE INDEX, fallback 6.6% p.a.)
+        - `MKT_RF`: Excess market return (MKT - RF)
+        - `SMB`: Size factor (0.5 * (Midcap 150 + Smallcap 250) - Nifty 50)
+        - Sector excess returns (`BANK`, `IT`, `PHARMA`, `AUTO`, `FMCG`, `METAL`, `ENERGY`, `REALTY`)
+        - `INDIA_VIX`: Implied volatility level
+        """
+        p_bulk = self.root / "indices" / "nifty_30y_ohlc_tri_pe.parquet"
+        if not p_bulk.exists():
+            return pd.DataFrame()
+        df = read_table_safe(p_bulk)
+        if df.empty:
+            return pd.DataFrame()
+
+        df["Date"] = pd.to_datetime(df["Date"]).dt.normalize()
+        if start:
+            df = df[df["Date"] >= pd.Timestamp(start)]
+        if end:
+            df = df[df["Date"] <= pd.Timestamp(end)]
+
+        # Prefer TRI where available, falling back to Close
+        df["_Val"] = df["TRI"].where(df.get("TRI", pd.Series(dtype=float)).notna(), df["Close"])
+        piv = df.pivot_table(index="Date", columns="IndexName", values="_Val", aggfunc="last").sort_index()
+        rets = piv.pct_change(fill_method=None)
+
+        out = pd.DataFrame(index=rets.index)
+        mkt_col = "NIFTY 500" if "NIFTY 500" in rets.columns else "NIFTY 50"
+        if mkt_col not in rets.columns:
+            return pd.DataFrame()
+
+        out["MKT"] = rets[mkt_col]
+        if "NIFTY 1D RATE INDEX" in rets.columns:
+            out["RF"] = rets["NIFTY 1D RATE INDEX"].fillna((1.0 + 0.066) ** (1.0 / 252.0) - 1.0)
+        else:
+            out["RF"] = (1.0 + 0.066) ** (1.0 / 252.0) - 1.0
+        out["MKT_RF"] = out["MKT"] - out["RF"]
+
+        if "NIFTY 50" in rets.columns and "NIFTY MIDCAP 150" in rets.columns:
+            sm_leg = (
+                0.5 * (rets["NIFTY MIDCAP 150"] + rets["NIFTY SMALLCAP 250"])
+                if "NIFTY SMALLCAP 250" in rets.columns
+                else rets["NIFTY MIDCAP 150"]
+            )
+            out["SMB"] = sm_leg - rets["NIFTY 50"]
+
+        for sec in ("BANK", "IT", "PHARMA", "AUTO", "FMCG", "METAL", "ENERGY", "REALTY"):
+            col = f"NIFTY {sec}"
+            if col in rets.columns:
+                out[f"SEC_{sec}"] = rets[col] - out["MKT"]
+
+        if "INDIA VIX" in piv.columns:
+            out["INDIA_VIX"] = piv["INDIA VIX"]
+
+        return out.dropna(subset=["MKT"]).round(6)
+
+    def calendar(self, query: str | int | None = None) -> pd.DataFrame:
+        """Return upcoming Board Meetings (earnings/dividends) and future Ex-Dates."""
+        p = self.root / "actions" / "upcoming_board_meetings.parquet"
+        if not p.exists():
+            return pd.DataFrame()
+        if query is None:
+            return read_table_safe(p)
+        ident = self.resolve(query)
+        return self._read_filtered_parquet(p, filters=[("Symbol", "in", list(ident.aliases))])
+
+    def fo_ban_list(self) -> pd.DataFrame:
+        """Return current F&O security ban list."""
+        p = self.root / "derivatives" / "fo_ban_list.parquet"
+        if not p.exists():
+            return pd.DataFrame()
+        return read_table_safe(p)
 
     def dossier(self, query: str | int) -> dict[str, pd.DataFrame]:
         """Return 360-degree company dossier combining all 8 non-price datasets for a symbol."""
@@ -948,6 +1096,21 @@ class UnifiedLakeEngine:
         if not fo_dir.exists():
             return pd.DataFrame()
 
+        fo_aliases = [sym]
+        if sym == "NIFTY":
+            fo_aliases = ["NIFTY", "S&P CNX NIFTY", "CNX NIFTY"]
+        elif sym == "BANKNIFTY":
+            fo_aliases = ["BANKNIFTY", "CNX BANK", "BANK NIFTY"]
+        elif sym in ("NIFTYIT", "CNXIT", "CNX IT"):
+            fo_aliases = ["NIFTYIT", "CNX IT", "CNXIT"]
+        elif sym in ("NIFTYMID50", "NFTYMCAP50"):
+            fo_aliases = ["NIFTYMID50", "NFTYMCAP50"]
+        else:
+            try:
+                fo_aliases = list(self.resolve(sym).aliases)
+            except Exception:
+                fo_aliases = [sym]
+
         s_dt = pd.Timestamp(start) if start else pd.Timestamp("2000-06-12")
         e_dt = pd.Timestamp(end) if end else pd.Timestamp.now().normalize()
 
@@ -955,8 +1118,9 @@ class UnifiedLakeEngine:
         for yr in range(s_dt.year, e_dt.year + 1):
             p = fo_dir / f"{exch}_fo_{yr}.parquet"
             if p.exists():
-                sub = self._read_filtered_parquet(p, filters=[("Symbol", "==", sym), ("OptionType", "==", "XX")])
+                sub = self._read_filtered_parquet(p, filters=[("Symbol", "in", fo_aliases), ("OptionType", "==", "XX")])
                 if not sub.empty:
+                    sub["Symbol"] = sym
                     frames.append(sub)
         if not frames:
             return pd.DataFrame()
@@ -1182,7 +1346,7 @@ class LakeTicker:
         end: str | date | None = None,
         period: str | None = None,
         exchange: str | None = None,
-        auto_adjust: bool = False,
+        auto_adjust: bool = True,
     ) -> pd.DataFrame:
         exch = exchange or self.default_exchange
         return self.engine.history(
@@ -1208,6 +1372,14 @@ class LakeTicker:
     @property
     def institutional_holders(self) -> pd.DataFrame:
         return self.engine.named_holders(self.identity.symbol)
+
+    @property
+    def info(self) -> dict[str, Any]:
+        return self.engine.info(self.identity.symbol)
+
+    @property
+    def calendar(self) -> pd.DataFrame:
+        return self.engine.calendar(self.identity.symbol)
 
     @property
     def actions(self) -> pd.DataFrame:

@@ -14,6 +14,16 @@ from datalake.storage import upsert_parquet_partition
 
 logger = logging.getLogger("datalake.fo_eod")
 
+_FO_SYMBOL_MAP = {
+    "S&P CNX NIFTY": "NIFTY",
+    "CNX NIFTY": "NIFTY",
+    "CNX BANK": "BANKNIFTY",
+    "BANK NIFTY": "BANKNIFTY",
+    "CNX IT": "NIFTYIT",
+    "CNXIT": "NIFTYIT",
+    "NFTYMCAP50": "NIFTYMID50",
+}
+
 
 class DerivativesEODScraper:
     """
@@ -137,7 +147,7 @@ class DerivativesEODScraper:
             "Date": pd.Timestamp(day),
             "Exchange": "NSE",
             "InstrumentType": df["INSTRUMENT"].astype(str).str.strip(),
-            "Symbol": df["SYMBOL"].astype(str).str.strip(),
+            "Symbol": df["SYMBOL"].astype(str).str.strip().str.upper().map(lambda s: _FO_SYMBOL_MAP.get(s, s)),
             "ExpiryDate": pd.to_datetime(df["EXPIRY_DT"].astype(str).str.strip(), format="mixed", dayfirst=True, errors="coerce"),
             "StrikePrice": pd.to_numeric(df["STRIKE_PR"], errors="coerce").fillna(0.0).astype("float64"),
             "OptionType": df[opt_col].fillna("XX").astype(str).str.strip(),
@@ -183,7 +193,7 @@ class DerivativesEODScraper:
             "Date": pd.Timestamp(day),
             "Exchange": exchange,
             "InstrumentType": df["FinInstrmTp"].astype(str).str.strip(),
-            "Symbol": df["TckrSymb"].astype(str).str.strip(),
+            "Symbol": df["TckrSymb"].astype(str).str.strip().str.upper().map(lambda s: _FO_SYMBOL_MAP.get(s, s)),
             "ExpiryDate": pd.to_datetime(df["XpryDt"], errors="coerce"),
             "StrikePrice": pd.to_numeric(df["StrkPric"], errors="coerce").fillna(0.0).astype("float64"),
             "OptionType": df["OptnTp"].fillna("XX").astype(str).str.strip(),

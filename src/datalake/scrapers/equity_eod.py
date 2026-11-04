@@ -346,62 +346,72 @@ class EquityEODScraper:
     async def backfill_nse_symbol_via_historical_or(
         self, symbol: str, start_year: int = 1995, end_year: int = 2015
     ) -> None:
-        sym = symbol.strip().upper()
+        from datalake.symbols import SymbolRenameResolver
+        resolver = SymbolRenameResolver.from_lake(self.cfg.root_dir)
+        canon_sym = symbol.strip().upper()
+
         for year in range(start_year, end_year + 1):
-            key = f"{sym}:{year}"
-            if self.state.is_completed("nse_historical_or_symbol", key):
-                continue
-            url = (
-                "https://www.nseindia.com/api/historicalOR/generateSecurityWiseHistoricalData"
-                f"?from=01-01-{year}&to=31-12-{year}&symbol={sym}"
-                "&type=priceVolumeDeliverable&series=ALL&csv=true"
-            )
-            resp = await self.http.get(url, headers=NSE_API_HEADERS, prime_nse=True)
-            if resp.status_code != 200 or not resp.text.strip() or resp.text.lstrip().startswith("<"):
-                continue
-            df = pd.read_csv(io.StringIO(resp.text), on_bad_lines="skip")
-            df.columns = [c.strip() for c in df.columns]
-            if df.empty or "Date" not in df.columns:
-                self.state.record("nse_historical_or_symbol", key, "HOLIDAY", source_url=url)
-                continue
-            out = pd.DataFrame({
-                "Date": pd.to_datetime(df["Date"].astype(str).str.strip(), format="mixed", dayfirst=True, errors="coerce"),
-                "Exchange": "NSE",
-                "InstrumentId": df["Symbol"].astype(str).str.strip(),
-                "Symbol": df["Symbol"].astype(str).str.strip(),
-                "Series": df["Series"].astype(str).str.strip(),
-                "ISIN": pd.NA,
-                "Open": pd.to_numeric(df["Open Price"].astype(str).str.replace(",", ""), errors="coerce"),
-                "High": pd.to_numeric(df["High Price"].astype(str).str.replace(",", ""), errors="coerce"),
-                "Low": pd.to_numeric(df["Low Price"].astype(str).str.replace(",", ""), errors="coerce"),
-                "Close": pd.to_numeric(df["Close Price"].astype(str).str.replace(",", ""), errors="coerce"),
-                "Last": pd.to_numeric(df["Last Price"].astype(str).str.replace(",", ""), errors="coerce"),
-                "PrevClose": pd.to_numeric(df["Prev Close"].astype(str).str.replace(",", ""), errors="coerce"),
-                "Volume": pd.to_numeric(df["Total Traded Quantity"].astype(str).str.replace(",", ""), errors="coerce"),
-                "TurnoverValue": pd.to_numeric(
-                    df.get("Turnover ₹", df.get("Turnover", pd.Series(dtype=str))).astype(str).str.replace(",", ""),
-                    errors="coerce",
-                ),
-                "Trades": pd.to_numeric(
-                    df.get("No. of Trades", pd.Series(dtype=str)).astype(str).str.replace(",", "").replace("-", pd.NA),
-                    errors="coerce",
-                ),
-                "DeliverableQty": pd.to_numeric(
-                    df.get("Deliverable Qty", pd.Series(dtype=str)).astype(str).str.replace(",", "").replace("-", pd.NA),
-                    errors="coerce",
-                ),
-                "DeliveryPct": pd.to_numeric(
-                    df.get("% Dly Qt to Traded Qty", pd.Series(dtype=str)).astype(str).str.replace(",", "").replace("-", pd.NA),
-                    errors="coerce",
-                ),
-            }).dropna(subset=["Date"])
-            out = repair_ohlc(out)
-            target = self.cfg.root_dir / "equities" / f"nse_cm_{year}.parquet"
-            upsert_parquet_partition(
-                out, target, dedup_cols=["Date", "Exchange", "InstrumentId", "Series"], sort_cols=["Symbol", "Date"]
-            )
-            self.state.record("nse_historical_or_symbol", key, "OK", len(out), resp.content, url)
-            await asyncio.sleep(0.35)
+            # Check both Jan 1 and Dec 31 in case a rename occurred mid-year
+            active_syms = list(dict.fromkeys([
+                resolver.traded_as_on(canon_sym, date(year, 1, 1)),
+                resolver.traded_as_on(canon_sym, date(year, 12, 31)),
+                canon_sym,
+            ]))
+            for sym in active_syms:
+                key = f"{sym}:{year}"
+                if self.state.is_completed("nse_historical_or_symbol", key):
+                    continue
+                url = (
+                    "https://www.nseindia.com/api/historicalOR/generateSecurityWiseHistoricalData"
+                    f"?from=01-01-{year}&to=31-12-{year}&symbol={sym}"
+                    "&type=priceVolumeDeliverable&series=ALL&csv=true"
+                )
+                resp = await self.http.get(url, headers=NSE_API_HEADERS, prime_nse=True)
+                if resp.status_code != 200 or not resp.text.strip() or resp.text.lstrip().startswith("<"):
+                    continue
+                df = pd.read_csv(io.StringIO(resp.text), on_bad_lines="skip")
+                df.columns = [c.strip() for c in df.columns]
+                if df.empty or "Date" not in df.columns:
+                    self.state.record("nse_historical_or_symbol", key, "HOLIDAY", source_url=url)
+                    continue
+                out = pd.DataFrame({
+                    "Date": pd.to_datetime(df["Date"].astype(str).str.strip(), format="mixed", dayfirst=True, errors="coerce"),
+                    "Exchange": "NSE",
+                    "InstrumentId": df["Symbol"].astype(str).str.strip(),
+                    "Symbol": df["Symbol"].astype(str).str.strip(),
+                    "Series": df["Series"].astype(str).str.strip(),
+                    "ISIN": pd.NA,
+                    "Open": pd.to_numeric(df["Open Price"].astype(str).str.replace(",", ""), errors="coerce"),
+                    "High": pd.to_numeric(df["High Price"].astype(str).str.replace(",", ""), errors="coerce"),
+                    "Low": pd.to_numeric(df["Low Price"].astype(str).str.replace(",", ""), errors="coerce"),
+                    "Close": pd.to_numeric(df["Close Price"].astype(str).str.replace(",", ""), errors="coerce"),
+                    "Last": pd.to_numeric(df["Last Price"].astype(str).str.replace(",", ""), errors="coerce"),
+                    "PrevClose": pd.to_numeric(df["Prev Close"].astype(str).str.replace(",", ""), errors="coerce"),
+                    "Volume": pd.to_numeric(df["Total Traded Quantity"].astype(str).str.replace(",", ""), errors="coerce"),
+                    "TurnoverValue": pd.to_numeric(
+                        df.get("Turnover ₹", df.get("Turnover", pd.Series(dtype=str))).astype(str).str.replace(",", ""),
+                        errors="coerce",
+                    ),
+                    "Trades": pd.to_numeric(
+                        df.get("No. of Trades", pd.Series(dtype=str)).astype(str).str.replace(",", "").replace("-", pd.NA),
+                        errors="coerce",
+                    ),
+                    "DeliverableQty": pd.to_numeric(
+                        df.get("Deliverable Qty", pd.Series(dtype=str)).astype(str).str.replace(",", "").replace("-", pd.NA),
+                        errors="coerce",
+                    ),
+                    "DeliveryPct": pd.to_numeric(
+                        df.get("% Dly Qt to Traded Qty", pd.Series(dtype=str)).astype(str).str.replace(",", "").replace("-", pd.NA),
+                        errors="coerce",
+                    ),
+                }).dropna(subset=["Date"])
+                out = repair_ohlc(out)
+                target = self.cfg.root_dir / "equities" / f"nse_cm_{year}.parquet"
+                upsert_parquet_partition(
+                    out, target, dedup_cols=["Date", "Exchange", "InstrumentId", "Series"], sort_cols=["Symbol", "Date"]
+                )
+                self.state.record("nse_historical_or_symbol", key, "OK", len(out), resp.content, url)
+                await asyncio.sleep(0.35)
 
     async def _fetch_nse_sec_bhavdata_full(self, day: date) -> tuple[pd.DataFrame | None, bytes | None, str]:
         url = f"https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{day:%d%m%Y}.csv"

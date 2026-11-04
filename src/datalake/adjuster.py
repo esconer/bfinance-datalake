@@ -40,9 +40,10 @@ class OHLCVAdjuster:
             return self._bse_actions
 
     def get_symbol_actions(self, symbol_or_scrip: str, exchange: str = "NSE") -> pd.DataFrame:
+        cols = ["ExDate", "ActionType", "DividendPerShareRs", "ShareMultiplier"]
         act_df = self._load_actions(exchange)
         if act_df.empty:
-            return pd.DataFrame(columns=["ExDate", "DividendPerShareRs", "ShareMultiplier"])
+            return pd.DataFrame(columns=cols)
 
         exch = exchange.upper()
         key = str(symbol_or_scrip).strip().upper()
@@ -59,13 +60,15 @@ class OHLCVAdjuster:
                 mask = mask | (act_df["short_name"].astype(str).str.strip().str.upper() == key)
             sub = act_df[mask].copy()
         else:
-            return pd.DataFrame(columns=["ExDate", "DividendPerShareRs", "ShareMultiplier"])
+            return pd.DataFrame(columns=cols)
 
         if sub.empty:
-            return pd.DataFrame(columns=["ExDate", "DividendPerShareRs", "ShareMultiplier"])
+            return pd.DataFrame(columns=cols)
 
         if "ActionType" in sub.columns:
             sub = sub[sub["ActionType"] != "SKIP_NON_EQUITY"].copy()
+        else:
+            sub["ActionType"] = "OTHER"
 
         sub["ExDate"] = pd.to_datetime(sub["ExDate"], errors="coerce").dt.normalize()
         sub["DividendPerShareRs"] = pd.to_numeric(sub["DividendPerShareRs"], errors="coerce").fillna(0.0)
@@ -75,7 +78,7 @@ class OHLCVAdjuster:
 
         return (
             sub.groupby("ExDate", as_index=False)
-            .agg({"DividendPerShareRs": "sum", "ShareMultiplier": "prod"})
+            .agg({"ActionType": "first", "DividendPerShareRs": "sum", "ShareMultiplier": "prod"})
             .sort_values("ExDate")
             .reset_index(drop=True)
         )
@@ -179,7 +182,7 @@ class OHLCVAdjuster:
         out["Adj Close"] = np.round(out["Close"] * total_price_factor, 4)
 
         if auto_adjust:
-            for col in ("Open", "High", "Low", "Close"):
+            for col in ("Open", "High", "Low", "Close", "Last", "PrevClose"):
                 if col in out.columns:
                     out[col] = np.round(out[col] * total_price_factor, 4)
             for vcol in ("Volume", "DeliverableQty"):

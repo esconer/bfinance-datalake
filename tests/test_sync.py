@@ -213,6 +213,24 @@ class TestSyncEngine(unittest.TestCase):
             self.assertIn("hist", bse_idx["tickers"]["500325"])
             self.assertIn("curr", bse_idx["tickers"]["500325"])
 
+    def test_screener_snapshot_in_manifest_files(self):
+        with tempfile.TemporaryDirectory() as src_dir, tempfile.TemporaryDirectory() as stg_dir:
+            src = Path(src_dir)
+            stg = Path(stg_dir)
+            eq_dir = src / "equities"
+            eq_dir.mkdir(parents=True)
+            df = pd.DataFrame([
+                {"Symbol": "TCS", "Date": pd.to_datetime("2026-01-01"), "Close": 3500.0, "Volume": 1000, "Series": "EQ"}
+            ])
+            df.to_parquet(eq_dir / "nse_cm_2026.parquet")
+
+            prepare_release_staging(src, stg)
+            m_path = src / "manifest.json"
+            self.assertTrue(m_path.exists())
+            manifest = json.loads(m_path.read_text(encoding="utf-8"))
+            self.assertIn("snapshots/market_screener_latest.parquet", manifest["files"])
+            self.assertIn("snapshots__market_screener_latest.parquet", [p.name for p in stg.glob("*")])
+
 
 if __name__ == "__main__":
     unittest.main()

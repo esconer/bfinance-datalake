@@ -35,6 +35,24 @@ CORE_NIFTY_INDICES = (
     "NIFTY 1D RATE INDEX",
 )
 
+_LEGACY_INDEX_MAP = {
+    "S&P CNX NIFTY": "NIFTY 50",
+    "CNX NIFTY": "NIFTY 50",
+    "CNX NIFTY JUNIOR": "NIFTY NEXT 50",
+    "CNX 100": "NIFTY 100",
+    "CNX 200": "NIFTY 200",
+    "CNX 500": "NIFTY 500",
+    "S&P CNX 500": "NIFTY 500",
+    "CNX BANK": "NIFTY BANK",
+    "CNX IT": "NIFTY IT",
+    "CNX AUTO": "NIFTY AUTO",
+    "CNX PHARMA": "NIFTY PHARMA",
+    "CNX FMCG": "NIFTY FMCG",
+    "CNX METAL": "NIFTY METAL",
+    "CNX REALTY": "NIFTY REALTY",
+    "CNX ENERGY": "NIFTY ENERGY",
+}
+
 
 class IndicesScraper:
     """
@@ -293,7 +311,7 @@ class IndicesScraper:
 
                         out = pd.DataFrame({
                             "Date": pd.Timestamp(d),
-                            "IndexName": df["Index Name"].astype(str).str.strip(),
+                            "IndexName": df["Index Name"].astype(str).str.strip().map(lambda s: _LEGACY_INDEX_MAP.get(s.upper(), s)),
                             "Open": _num_col("Open Index Value"),
                             "High": _num_col("High Index Value"),
                             "Low": _num_col("Low Index Value"),
