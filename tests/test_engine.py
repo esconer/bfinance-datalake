@@ -639,6 +639,201 @@ class TestUnifiedLakeEngine(unittest.TestCase):
             self.assertEqual(row0["PrevClose"], 1990.0)
             self.assertEqual(row0["Volume"], 2000)
 
+    def test_finengine_and_bfinance_bridge(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            p = Path(tmp_dir)
+            for d in ("universe", "equities", "fundamentals", "shareholding", "flows", "documents"):
+                (p / d).mkdir(parents=True, exist_ok=True)
+            pd.DataFrame([
+                {
+                    "SYMBOL": "TCS",
+                    "NAME OF COMPANY": "Tata Consultancy Services Limited",
+                    "SERIES": "EQ",
+                    "ISIN NUMBER": "INE467B01029",
+                    "FACE VALUE": 1.0,
+                }
+            ]).to_parquet(p / "universe" / "nse_equity_master.parquet", index=False)
+
+            dates = pd.bdate_range("2025-11-01", periods=35)
+            eq_rows = []
+            for idx_d, d in enumerate(dates):
+                deliv_pct = 82.0 if idx_d == len(dates) - 1 else (48.0 + (idx_d % 5))
+                vol = 2000000
+                close_p = 4000.0 + idx_d * 5.0
+                eq_rows.append({
+                    "Date": d,
+                    "Symbol": "TCS",
+                    "Series": "EQ",
+                    "Open": close_p - 10.0,
+                    "High": close_p + 20.0,
+                    "Low": close_p - 15.0,
+                    "Close": close_p,
+                    "PrevClose": close_p - 5.0,
+                    "VWAP": close_p + 2.0,
+                    "Volume": vol,
+                    "TurnoverValue": close_p * vol,
+                    "Trades": 85000,
+                    "DeliverableQty": int(vol * deliv_pct / 100.0),
+                    "DeliveryPct": deliv_pct,
+                })
+            pd.DataFrame(eq_rows).to_parquet(p / "equities" / f"nse_cm_{dates[-1].year}.parquet", index=False)
+
+            pd.DataFrame([
+                {
+                    "Symbol": "TCS",
+                    "NatureOfReport": "Consolidated",
+                    "PeriodType": "Annual",
+                    "PeriodStart": "2023-04-01",
+                    "PeriodEnd": "2024-03-31",
+                    "Sales_Cr": 240893.0,
+                    "OtherIncome_Cr": 4422.0,
+                    "TotalIncome_Cr": 245315.0,
+                    "RawMaterials_Cr": 0.0,
+                    "EmployeeCost_Cr": 140131.0,
+                    "Interest_Cr": 778.0,
+                    "Depreciation_Cr": 4985.0,
+                    "TotalExpenses_Cr": 183990.0,
+                    "PBT_Cr": 61325.0,
+                    "Tax_Cr": 15417.0,
+                    "NetProfit_Cr": 45908.0,
+                    "BasicEPS_Rs": 125.88,
+                    "DilutedEPS_Rs": 125.88,
+                    "EquityCapital_Cr": 362.0,
+                    "Reserves_Cr": 90127.0,
+                    "TotalAssets_Cr": 146449.0,
+                    "TotalLiabilities_Cr": 55960.0,
+                    "TotalBorrowings_Cr": 8021.0,
+                    "TotalCashAndBank_Cr": 13286.0,
+                    "CurrentAssets_Cr": 112984.0,
+                    "CurrentLiabilities_Cr": 46104.0,
+                    "CFO_Cr": 44338.0,
+                    "CFI_Cr": -2145.0,
+                    "CFF_Cr": -42870.0,
+                    "NetCashFlow_Cr": -677.0,
+                },
+                {
+                    "Symbol": "TCS",
+                    "NatureOfReport": "Consolidated",
+                    "PeriodType": "Annual",
+                    "PeriodStart": "2024-04-01",
+                    "PeriodEnd": "2025-03-31",
+                    "Sales_Cr": 255324.0,
+                    "OtherIncome_Cr": 4600.0,
+                    "TotalIncome_Cr": 259924.0,
+                    "RawMaterials_Cr": 0.0,
+                    "EmployeeCost_Cr": 145000.0,
+                    "Interest_Cr": 750.0,
+                    "Depreciation_Cr": 5200.0,
+                    "TotalExpenses_Cr": 193000.0,
+                    "PBT_Cr": 66924.0,
+                    "Tax_Cr": 17000.0,
+                    "NetProfit_Cr": 49924.0,
+                    "BasicEPS_Rs": 138.0,
+                    "DilutedEPS_Rs": 138.0,
+                    "EquityCapital_Cr": 362.0,
+                    "Reserves_Cr": 98000.0,
+                    "TotalAssets_Cr": 158000.0,
+                    "TotalLiabilities_Cr": 59638.0,
+                    "TotalBorrowings_Cr": 7500.0,
+                    "TotalCashAndBank_Cr": 18500.0,
+                    "CurrentAssets_Cr": 124000.0,
+                    "CurrentLiabilities_Cr": 47000.0,
+                    "CFO_Cr": 51200.0,
+                    "CFI_Cr": -3100.0,
+                    "CFF_Cr": -44000.0,
+                    "NetCashFlow_Cr": 4100.0,
+                },
+                {
+                    "Symbol": "TCS",
+                    "NatureOfReport": "Consolidated",
+                    "PeriodType": "Quarterly",
+                    "PeriodStart": "2025-07-01",
+                    "PeriodEnd": "2025-09-30",
+                    "Sales_Cr": 65000.0,
+                    "PBT_Cr": 17000.0,
+                    "NetProfit_Cr": 12800.0,
+                    "BasicEPS_Rs": 35.5,
+                    "Interest_Cr": 180.0,
+                    "Depreciation_Cr": 1300.0,
+                    "OtherIncome_Cr": 1100.0,
+                    "EquityCapital_Cr": 362.0,
+                    "Reserves_Cr": 98000.0,
+                    "TotalBorrowings_Cr": 7500.0,
+                    "TotalCashAndBank_Cr": 18500.0,
+                },
+            ]).to_parquet(p / "fundamentals" / "xbrl_financials.parquet", index=False)
+
+            pd.DataFrame([
+                {
+                    "Symbol": "TCS",
+                    "QuarterEnd": "2025-09-30",
+                    "PromoterPct": 71.77,
+                    "PromoterPledgedPct": 0.0,
+                    "MutualFundsPct": 11.2,
+                    "FPI_Pct": 12.4,
+                    "RetailPct": 4.63,
+                    "TotalShares": 3618087518.0,
+                }
+            ]).to_parquet(p / "shareholding" / "nse_shareholding_summary.parquet", index=False)
+
+            pd.DataFrame([
+                {"Date": pd.Timestamp("2025-12-19"), "category": "FII/FPI", "buy_cr": 12500.0, "sell_cr": 11000.0, "net_cr": 1500.0},
+                {"Date": pd.Timestamp("2025-12-19"), "category": "DII", "buy_cr": 9800.0, "sell_cr": 8600.0, "net_cr": 1200.0},
+            ]).to_parquet(p / "flows" / "cash_fii_dii_flows.parquet", index=False)
+
+            engine = UnifiedLakeEngine(p)
+            t = engine.ticker("TCS")
+
+            # 1. Transposed statements (bfinance / yfinance compatibility)
+            inc = t.income_stmt
+            bs = t.balance_sheet
+            cf = t.cashflow
+            self.assertFalse(inc.empty)
+            self.assertIn("Total Revenue", inc.index)
+            self.assertIn("Net Income", inc.index)
+            self.assertIn("Stockholders Equity", bs.index)
+            self.assertIn("Operating Cash Flow", cf.index)
+
+            # 2. Forensic ratios & honesty contract
+            ratios = t.custom_ratios
+            self.assertIsNotNone(ratios["piotroski_score"])
+            self.assertGreaterEqual(ratios["piotroski_score"], 7)
+            self.assertIsNotNone(ratios["graham_number"])
+            self.assertIsNone(ratios["peg_ratio"])
+            self.assertIn("peg_ratio", ratios["bfinance_omitted_metrics"])
+
+            # 3. 360-degree FinEngine EquityResearchService profile & shareholding trends
+            prof = engine.research_profile("TCS")
+            self.assertEqual(prof["symbol"], "TCS")
+            self.assertEqual(prof["ticker"], "TCS.NS")
+            self.assertGreater(len(prof["analysis"]["pros"]), 0)
+            shp_trends = engine.shareholding_trends("TCS")
+            self.assertIn("quarterly", shp_trends)
+            self.assertIn("chart_series", shp_trends["quarterly"])
+
+            # 4. Pre-built institutional screens
+            scr_df = engine.run_screen("coffee_can")
+            self.assertFalse(scr_df.empty)
+            self.assertIn("ROCE_Pct", scr_df.columns)
+
+            # 5. IndiaDataService bhavcopy + delivery anomalies + liquidity limits + ai_context_india
+            bhav = engine.bhavcopy_records()
+            self.assertEqual(len(bhav), 1)
+            self.assertEqual(bhav[0]["symbol"], "TCS")
+            self.assertIn("turnover_lacs", bhav[0])
+
+            ctx = engine.ai_context_india(
+                positions=[{"symbol": "TCS", "quantity": 1000, "market_value": 4170000.0}],
+                symbols=["TCS"],
+            )
+            self.assertEqual(ctx["composite_coverage_status"], "complete")
+            self.assertEqual(ctx["institutional_flows"]["coverage_status"], "complete")
+            self.assertEqual(ctx["delivery_anomalies"]["anomaly_count"], 1)
+            pos_liq = ctx["liquidity_limits"]["positions"][0]
+            self.assertEqual(pos_liq["liquidity_tier"], "liquid")
+            self.assertIsNotNone(pos_liq["amihud_illiquidity"])
+            self.assertIsNotNone(pos_liq["days_to_liquidate_10pct_adv"])
+
 
 if __name__ == "__main__":
     unittest.main()

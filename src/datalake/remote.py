@@ -1299,6 +1299,170 @@ class RemoteLakeClient:
         url = self._resolve_cdn_url(self._asset_url("derivatives", "fo_ban_list.parquet"))
         return self._safe_query(f"SELECT * FROM read_parquet('{url}')")
 
+    def income_stmt(self, symbol: str, period_type: str = "Quarterly") -> pd.DataFrame:
+        """Stream transposed Income Statement (`bfinance`/`yfinance` format) over HTTPS."""
+        from datalake.finengine_bridge import transpose_financials_to_statement
+        df = self.financials(symbol, period_type=period_type)
+        if df.empty and period_type == "Annual":
+            df = self.financials(symbol, period_type="Quarterly")
+        return transpose_financials_to_statement(df, "income_stmt")
+
+    def balance_sheet(self, symbol: str, period_type: str = "Quarterly") -> pd.DataFrame:
+        """Stream transposed Balance Sheet (`bfinance`/`yfinance` format) over HTTPS."""
+        from datalake.finengine_bridge import transpose_financials_to_statement
+        df = self.financials(symbol, period_type=period_type)
+        if df.empty and period_type == "Annual":
+            df = self.financials(symbol, period_type="Quarterly")
+        return transpose_financials_to_statement(df, "balance_sheet")
+
+    def cashflow(self, symbol: str, period_type: str = "Quarterly") -> pd.DataFrame:
+        """Stream transposed Cash Flow Statement (`bfinance`/`yfinance` format) over HTTPS."""
+        from datalake.finengine_bridge import transpose_financials_to_statement
+        df = self.financials(symbol, period_type=period_type)
+        if df.empty and period_type == "Annual":
+            df = self.financials(symbol, period_type="Quarterly")
+        return transpose_financials_to_statement(df, "cashflow")
+
+    def custom_ratios(self, symbol: str) -> dict[str, Any]:
+        """Compute `bfinance` & `finengine` forensic ratios from remote Dossier + Screener."""
+        from datalake.finengine_bridge import compute_forensic_ratios
+
+        sym = self._clean_sym(symbol)
+        dos = self.dossier(sym)
+        fin_df = dos.get("financials", pd.DataFrame())
+        if fin_df.empty:
+            fin_df = self.financials(sym, period_type="Quarterly")
+        scr_row = None
+        try:
+            scr = self.screener(f"Symbol = '{sym}'")
+            if not scr.empty:
+                scr_row = scr.iloc[0].to_dict()
+        except Exception:
+            pass
+        return compute_forensic_ratios(
+            fin_df,
+            current_price=scr_row.get("Close") if scr_row else None,
+            market_cap_cr=scr_row.get("MarketCap_Cr") if scr_row else None,
+            total_shares=scr_row.get("TotalShares") if scr_row else None,
+        )
+
+    def shareholding_trends(self, symbol: str) -> dict[str, Any]:
+        """Stream FinEngine quarterly/yearly shareholding tables & Recharts series."""
+        from datalake.finengine_bridge import format_shareholding_for_finengine
+        sym = self._clean_sym(symbol)
+        return format_shareholding_for_finengine(self.shareholding(sym), sym)
+
+    def research_profile(self, symbol: str) -> dict[str, Any]:
+        """Stream a 360-degree FinEngine EquityResearchService profile in 1 Dossier + 1 Screener call."""
+        from datalake.finengine_bridge import build_research_profile
+
+        sym = self._clean_sym(symbol)
+        idx_data = self._load_ticker_index("NSE") or {}
+        canon = self._resolve_for_exchange(sym, "NSE")
+        meta = idx_data.get("tickers", {}).get(canon, {}).get("meta", {})
+        dos = self.dossier(canon)
+        fin_df = dos.get("financials", pd.DataFrame())
+        shp_df = self.shareholding(canon)
+        concalls_df = dos.get("concalls", pd.DataFrame())
+        scr_row = None
+        try:
+            scr = self.screener(f"Symbol = '{canon}'")
+            if not scr.empty:
+                scr_row = scr.iloc[0].to_dict()
+        except Exception:
+            pass
+        return build_research_profile(
+            symbol=canon,
+            company_name=meta.get("name") or canon,
+            bse_code=meta.get("bse_code"),
+            isin=meta.get("isin"),
+            industry=meta.get("industry"),
+            face_value=meta.get("face_value"),
+            screener_row=scr_row,
+            fin_df=fin_df,
+            shp_df=shp_df,
+            concalls_df=concalls_df,
+        )
+
+    def run_screen(self, strategy: str = "coffee_can") -> pd.DataFrame:
+        """Run a pre-built institutional screen (`coffee_can`, `magic_formula`, `debt_free`, etc.) over remote snapshot."""
+        from datalake.finengine_bridge import INSTITUTIONAL_SCREENS
+
+        key = strategy.strip().lower()
+        spec = INSTITUTIONAL_SCREENS.get(key)
+        if not spec:
+            raise ValueError(f"Unknown screen strategy '{strategy}'. Available: {list(INSTITUTIONAL_SCREENS.keys())}")
+        base = self.screener(spec["sql_filter"])
+        if base.empty:
+            return base
+        order_by = spec.get("order_by")
+        if order_by:
+            cur = self.con.cursor()
+            cur.register("_rem_scr_sub", base)
+            return cur.execute(f"SELECT * FROM _rem_scr_sub ORDER BY {order_by}").df()
+        return base
+
+    def delivery_anomalies(
+        self,
+        symbols: list[str] | None = None,
+        lookback_sessions: int = 30,
+        z_threshold: float = 1.5,
+    ) -> dict[str, Any]:
+        """Compute symbol-scoped delivery-% z-score anomalies over remote pack slices."""
+        from datalake.finengine_bridge import compute_delivery_anomalies_from_frames
+
+        syms = symbols or ["RELIANCE", "TCS", "HDFCBANK", "INFY"]
+        cur_yr = pd.Timestamp.now().year
+        price_frames = {s: self.history(s, start_year=cur_yr - 1, end_year=cur_yr, auto_adjust=False) for s in syms}
+        return compute_delivery_anomalies_from_frames(
+            price_frames, lookback_sessions=lookback_sessions, z_threshold=z_threshold
+        )
+
+    def liquidity_limits(
+        self,
+        positions: list[dict[str, Any]],
+        lookback_sessions: int = 30,
+        base_currency: str = "INR",
+    ) -> dict[str, Any]:
+        """Compute 30-day ADV, Amihud illiquidity, and days-to-liquidate over remote pack slices."""
+        from datalake.finengine_bridge import compute_portfolio_liquidity_limits
+
+        cur_yr = pd.Timestamp.now().year
+        syms = [
+            self._clean_sym(str(p.get("symbol") or p.get("ticker") or ""))
+            for p in positions
+            if p.get("symbol") or p.get("ticker")
+        ]
+        price_frames = {s: self.history(s, start_year=cur_yr - 1, end_year=cur_yr, auto_adjust=False) for s in syms if s}
+        return compute_portfolio_liquidity_limits(
+            positions=positions,
+            price_frames=price_frames,
+            lookback_sessions=lookback_sessions,
+            base_currency=base_currency,
+        )
+
+    def ai_context_india(
+        self,
+        positions: list[dict[str, Any]] | None = None,
+        symbols: list[str] | None = None,
+        lookback_sessions: int = 30,
+    ) -> dict[str, Any]:
+        """Assemble the 3-component `finengine` `ai_context_india` payload from remote data lake."""
+        from datalake.finengine_bridge import build_ai_context_india
+
+        pos_list = positions or [
+            {"symbol": s, "quantity": 1000, "market_value": 2500000.0}
+            for s in (symbols or ["RELIANCE", "TCS", "HDFCBANK", "INFY"])
+        ]
+        target_syms = symbols or [
+            self._clean_sym(str(p.get("symbol") or p.get("ticker") or ""))
+            for p in pos_list
+        ]
+        flows_df = self.fii_dii_flows()
+        deliv = self.delivery_anomalies(symbols=target_syms, lookback_sessions=lookback_sessions)
+        liq = self.liquidity_limits(positions=pos_list, lookback_sessions=lookback_sessions)
+        return build_ai_context_india(flows_df=flows_df, delivery_payload=deliv, liquidity_payload=liq)
+
 
 # Alias for compatibility with UnifiedLakeEngine naming convention
 RemoteLakeEngine = RemoteLakeClient

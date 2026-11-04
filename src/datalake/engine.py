@@ -891,12 +891,15 @@ class UnifiedLakeEngine:
             ),
             ttm_fin AS (
                 SELECT Symbol, PeriodEnd AS FinQuarter,
+                    COUNT(Sales_Cr) OVER (PARTITION BY Symbol ORDER BY PeriodEnd ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS q_cnt,
                     SUM(Sales_Cr) OVER (PARTITION BY Symbol ORDER BY PeriodEnd ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS Sales_Cr,
                     SUM(PBT_Cr) OVER (PARTITION BY Symbol ORDER BY PeriodEnd ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS PBT_Cr,
                     SUM(NetProfit_Cr) OVER (PARTITION BY Symbol ORDER BY PeriodEnd ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS NetProfit_Cr,
                     SUM(BasicEPS_Rs) OVER (PARTITION BY Symbol ORDER BY PeriodEnd ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS BasicEPS_Rs,
                     SUM( COALESCE(PBT_Cr, 0) + COALESCE(Interest_Cr, 0) + COALESCE(Depreciation_Cr, 0) - COALESCE(OtherIncome_Cr, 0) )
                         OVER (PARTITION BY Symbol ORDER BY PeriodEnd ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS EBITDA_Cr,
+                    SUM( COALESCE(PBT_Cr, 0) + COALESCE(Interest_Cr, 0) )
+                        OVER (PARTITION BY Symbol ORDER BY PeriodEnd ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS EBIT_Cr,
                     (COALESCE(EquityCapital_Cr, 0) + COALESCE(Reserves_Cr, 0)) AS BookValue_Cr,
                     COALESCE(TotalBorrowings_Cr, 0) AS TotalBorrowings_Cr,
                     COALESCE(TotalCashAndBank_Cr, 0) AS TotalCashAndBank_Cr,
@@ -905,7 +908,8 @@ class UnifiedLakeEngine:
             ),
             latest_fin AS (
                 SELECT *,
-                    CASE WHEN BookValue_Cr > 0 THEN ROUND((NetProfit_Cr / BookValue_Cr) * 100.0, 2) ELSE NULL END AS ROE_Pct,
+                    CASE WHEN BookValue_Cr > 0 THEN ROUND(((NetProfit_Cr * (CASE WHEN q_cnt BETWEEN 1 AND 3 THEN 4.0 / q_cnt ELSE 1.0 END)) / BookValue_Cr) * 100.0, 2) ELSE NULL END AS ROE_Pct,
+                    CASE WHEN (BookValue_Cr + TotalBorrowings_Cr) > 0 THEN ROUND(((EBIT_Cr * (CASE WHEN q_cnt BETWEEN 1 AND 3 THEN 4.0 / q_cnt ELSE 1.0 END)) / (BookValue_Cr + TotalBorrowings_Cr)) * 100.0, 2) ELSE NULL END AS ROCE_Pct,
                     CASE WHEN BookValue_Cr > 0 THEN ROUND(TotalBorrowings_Cr / BookValue_Cr, 2) ELSE NULL END AS DebtToEquity
                 FROM ttm_fin WHERE rn = 1
             )
@@ -935,7 +939,7 @@ class UnifiedLakeEngine:
 
         fin_cols = """
             , f.FinQuarter, f.Sales_Cr, f.EBITDA_Cr, f.PBT_Cr, f.NetProfit_Cr, f.BasicEPS_Rs,
-            f.BookValue_Cr, f.TotalBorrowings_Cr, f.TotalCashAndBank_Cr, f.ROE_Pct, f.DebtToEquity,
+            f.BookValue_Cr, f.TotalBorrowings_Cr, f.TotalCashAndBank_Cr, f.ROE_Pct, f.ROCE_Pct, f.DebtToEquity,
             CASE WHEN f.BasicEPS_Rs > 0 THEN ROUND(e.Close / f.BasicEPS_Rs, 2) ELSE NULL END AS PE
         """ if has_fin else ""
 
@@ -995,6 +999,214 @@ class UnifiedLakeEngine:
             con.register("_snap", base_df)
             return con.execute(f"SELECT * FROM _snap {where}").df()
         return base_df
+
+    def run_screen(self, strategy: str = "coffee_can") -> pd.DataFrame:
+        """
+        Execute a pre-built institutional screen (`coffee_can`, `magic_formula`, `debt_free`,
+        `undervalued_growth`, `institutional_accumulation`) compatible with `bfinance.screens`
+        and `finengine`'s `ScreenerService`.
+        """
+        from datalake.finengine_bridge import INSTITUTIONAL_SCREENS
+
+        key = strategy.strip().lower()
+        spec = INSTITUTIONAL_SCREENS.get(key)
+        if not spec:
+            raise ValueError(f"Unknown screen strategy '{strategy}'. Available: {list(INSTITUTIONAL_SCREENS.keys())}")
+        base = self.screener(spec["sql_filter"])
+        if base.empty:
+            return base
+        order_by = spec.get("order_by")
+        if order_by and HAS_DUCKDB and duckdb is not None:
+            con = duckdb.connect(":memory:")
+            con.register("_scr_sub", base)
+            return con.execute(f"SELECT * FROM _scr_sub ORDER BY {order_by}").df()
+        return base
+
+    def custom_ratios(self, query: str | int) -> dict[str, Any]:
+        """
+        Return `bfinance` & `finengine` forensic ratios (Piotroski F-Score, Graham Number,
+        EV/EBITDA, Interest Coverage, CFO/PAT) adhering to the strict honesty contract.
+        """
+        from datalake.finengine_bridge import compute_forensic_ratios
+
+        ident = self.resolve(query)
+        fin_df = self.fundamentals(ident.symbol, consolidated=True)
+        scr_row = None
+        try:
+            scr = self.screener(f"Symbol = '{ident.symbol}'")
+            if not scr.empty:
+                scr_row = scr.iloc[0].to_dict()
+        except Exception:
+            pass
+        current_price = scr_row.get("Close") if scr_row else None
+        market_cap_cr = scr_row.get("MarketCap_Cr") if scr_row else None
+        total_shares = scr_row.get("TotalShares") if scr_row else None
+        if current_price is None:
+            hist = self.history(ident.symbol, period="1mo")
+            if not hist.empty and "Close" in hist.columns:
+                current_price = float(hist.iloc[-1]["Close"])
+        if total_shares is None:
+            shp = self.shareholding(ident.symbol)
+            if not shp.empty and "TotalShares" in shp.columns:
+                valid_sh = shp["TotalShares"].dropna()
+                if not valid_sh.empty:
+                    total_shares = float(valid_sh.iloc[-1])
+        return compute_forensic_ratios(
+            fin_df,
+            current_price=current_price,
+            market_cap_cr=market_cap_cr,
+            total_shares=total_shares,
+        )
+
+    def shareholding_trends(self, query: str | int) -> dict[str, Any]:
+        """Return quarterly and yearly shareholding tables + chart_series for FinEngine EquityResearchService."""
+        from datalake.finengine_bridge import format_shareholding_for_finengine
+
+        ident = self.resolve(query)
+        shp_df = self.shareholding(ident.symbol)
+        return format_shareholding_for_finengine(shp_df, ident.symbol)
+
+    def research_profile(self, query: str | int) -> dict[str, Any]:
+        """
+        Return a complete 360-degree Equity Research payload matching `finengine`'s
+        `EquityResearchService.get_full_profile(ticker)` and `bfinance`'s `CompanyProfile`.
+        """
+        from datalake.finengine_bridge import build_research_profile
+
+        ident = self.resolve(query)
+        fin_df = self.fundamentals(ident.symbol, consolidated=True)
+        shp_df = self.shareholding(ident.symbol)
+        concalls_df = self.concalls(ident.bse_code or ident.symbol)
+        scr_row = None
+        try:
+            scr = self.screener(f"Symbol = '{ident.symbol}'")
+            if not scr.empty:
+                scr_row = scr.iloc[0].to_dict()
+        except Exception:
+            pass
+        if (not scr_row or scr_row.get("Close") is None):
+            hist = self.history(ident.symbol, period="1y")
+            if not hist.empty and "Close" in hist.columns:
+                scr_row = dict(scr_row or {})
+                scr_row["Close"] = float(hist.iloc[-1]["Close"])
+                scr_row["High_52W"] = float(hist["Close"].max())
+                scr_row["Low_52W"] = float(hist["Close"].min())
+        return build_research_profile(
+            symbol=ident.symbol,
+            company_name=ident.company_name,
+            bse_code=ident.bse_code,
+            isin=ident.isin,
+            industry=ident.industry,
+            face_value=ident.face_value,
+            screener_row=scr_row,
+            fin_df=fin_df,
+            shp_df=shp_df,
+            concalls_df=concalls_df,
+        )
+
+    def bhavcopy_records(self, trade_date: str | date | None = None, exchange: str = "NSE") -> list[dict[str, Any]]:
+        """
+        Return standardized `finengine` `IndiaDataService.get_bhavcopy` records for a session date
+        (or latest session if `trade_date` is omitted).
+        """
+        from datalake.finengine_bridge import format_bhavcopy_records
+
+        exch = exchange.strip().upper()
+        prefix = "nse_cm_" if exch == "NSE" else "bse_cm_"
+        eq_dir = self.root / "equities"
+        if not eq_dir.exists():
+            return []
+        if trade_date:
+            dt = pd.Timestamp(trade_date).normalize()
+            pq = eq_dir / f"{prefix}{dt.year}.parquet"
+            if not pq.exists():
+                return []
+            df = self._read_filtered_parquet(pq, filters=[("Date", "==", dt)])
+        else:
+            files = sorted(eq_dir.glob(f"{prefix}*.parquet"))
+            if not files:
+                return []
+            df = read_table_safe(files[-1])
+            if not df.empty and "Date" in df.columns:
+                max_dt = pd.to_datetime(df["Date"]).max()
+                df = df[pd.to_datetime(df["Date"]) == max_dt]
+        if df.empty:
+            return []
+        if exch == "NSE":
+            df = self._dedup_nse_equity_series(df)
+        return format_bhavcopy_records(df)
+
+    def delivery_anomalies(
+        self,
+        symbols: list[str] | None = None,
+        lookback_sessions: int = 30,
+        z_threshold: float = 1.5,
+    ) -> dict[str, Any]:
+        """
+        Compute symbol-scoped delivery-percentage z-score anomalies across recent NSE sessions,
+        matching `finengine`'s `ai_context_india` delivery anomalies component.
+        """
+        from datalake.finengine_bridge import compute_delivery_anomalies_from_frames
+
+        if not symbols:
+            scr = self.screener()
+            symbols = scr["Symbol"].head(20).tolist() if not scr.empty and "Symbol" in scr.columns else ["RELIANCE", "TCS", "HDFCBANK", "INFY"]
+        price_frames = {sym: self.history(sym, period="6mo", auto_adjust=False) for sym in symbols}
+        return compute_delivery_anomalies_from_frames(
+            price_frames, lookback_sessions=lookback_sessions, z_threshold=z_threshold
+        )
+
+    def liquidity_limits(
+        self,
+        positions: list[dict[str, Any]],
+        lookback_sessions: int = 30,
+        base_currency: str = "INR",
+    ) -> dict[str, Any]:
+        """
+        Compute 30-day ADV, Amihud (2002) illiquidity, days-to-liquidate at 10%/20% ADV participation,
+        and `max_sane_position_value` (5% ADV) for a portfolio of Indian equity positions.
+        """
+        from datalake.finengine_bridge import compute_portfolio_liquidity_limits
+
+        syms = [
+            str(p.get("symbol") or p.get("ticker") or "").strip().upper().split(".")[0]
+            for p in positions
+            if p.get("symbol") or p.get("ticker")
+        ]
+        price_frames = {s: self.history(s, period="6mo", auto_adjust=False) for s in syms if s}
+        return compute_portfolio_liquidity_limits(
+            positions=positions,
+            price_frames=price_frames,
+            lookback_sessions=lookback_sessions,
+            base_currency=base_currency,
+        )
+
+    def ai_context_india(
+        self,
+        positions: list[dict[str, Any]] | None = None,
+        symbols: list[str] | None = None,
+        lookback_sessions: int = 30,
+    ) -> dict[str, Any]:
+        """
+        Assemble the 3-component `finengine` `ai_context_india` payload:
+        1. `institutional_flows` (FII/FPI & DII cash flows)
+        2. `delivery_anomalies` (delivery-% z-scores)
+        3. `liquidity_limits` (30d ADV, Amihud illiquidity, days-to-liquidate)
+        """
+        from datalake.finengine_bridge import build_ai_context_india
+
+        pos_list = positions or [
+            {"symbol": s, "quantity": 1000, "market_value": 2500000.0}
+            for s in (symbols or ["RELIANCE", "TCS", "HDFCBANK", "INFY"])
+        ]
+        target_syms = symbols or [
+            str(p.get("symbol") or p.get("ticker") or "").strip().upper().split(".")[0]
+            for p in pos_list
+        ]
+        flows_df = self.fii_dii_flows()
+        deliv = self.delivery_anomalies(symbols=target_syms, lookback_sessions=lookback_sessions)
+        liq = self.liquidity_limits(positions=pos_list, lookback_sessions=lookback_sessions)
+        return build_ai_context_india(flows_df=flows_df, delivery_payload=deliv, liquidity_payload=liq)
 
     def etfs(self) -> pd.DataFrame:
         """Return the NSE ETF Master catalog (Symbol, Underlying, SecurityName, ISIN, ListingDate)."""
@@ -1330,7 +1542,7 @@ class UnifiedLakeEngine:
 
 
 class LakeTicker:
-    """Unified yfinance-like Ticker facade backed by UnifiedLakeEngine (sub-millisecond cached access)."""
+    """Unified yfinance/bfinance-like Ticker facade backed by UnifiedLakeEngine (sub-millisecond cached access)."""
 
     def __init__(self, engine: UnifiedLakeEngine, identity: SecurityIdentity, default_exchange: str | None = None):
         self.engine = engine
@@ -1373,6 +1585,68 @@ class LakeTicker:
     @property
     def quarterly_financials(self) -> pd.DataFrame:
         return self.engine.fundamentals(self.identity.symbol, period_type="Quarterly")
+
+    @property
+    def income_stmt(self) -> pd.DataFrame:
+        """Return bfinance/yfinance transposed Annual Income Statement (line items as index, period dates as columns)."""
+        from datalake.finengine_bridge import transpose_financials_to_statement
+        adf = self.financials
+        return transpose_financials_to_statement(adf if not adf.empty else self.quarterly_financials, "income_stmt")
+
+    @property
+    def quarterly_income_stmt(self) -> pd.DataFrame:
+        """Return bfinance/yfinance transposed Quarterly Income Statement."""
+        from datalake.finengine_bridge import transpose_financials_to_statement
+        return transpose_financials_to_statement(self.quarterly_financials, "income_stmt")
+
+    @property
+    def balance_sheet(self) -> pd.DataFrame:
+        """Return bfinance/yfinance transposed Balance Sheet (in Rs Crores)."""
+        from datalake.finengine_bridge import transpose_financials_to_statement
+        adf = self.financials
+        return transpose_financials_to_statement(adf if not adf.empty else self.quarterly_financials, "balance_sheet")
+
+    @property
+    def quarterly_balance_sheet(self) -> pd.DataFrame:
+        """Return bfinance/yfinance transposed Quarterly Balance Sheet (in Rs Crores)."""
+        from datalake.finengine_bridge import transpose_financials_to_statement
+        return transpose_financials_to_statement(self.quarterly_financials, "balance_sheet")
+
+    @property
+    def cashflow(self) -> pd.DataFrame:
+        """Return bfinance/yfinance transposed Cash Flow Statement (in Rs Crores)."""
+        from datalake.finengine_bridge import transpose_financials_to_statement
+        adf = self.financials
+        return transpose_financials_to_statement(adf if not adf.empty else self.quarterly_financials, "cashflow")
+
+    @property
+    def quarterly_cashflow(self) -> pd.DataFrame:
+        """Return bfinance/yfinance transposed Quarterly Cash Flow Statement (in Rs Crores)."""
+        from datalake.finengine_bridge import transpose_financials_to_statement
+        return transpose_financials_to_statement(self.quarterly_financials, "cashflow")
+
+    @property
+    def custom_ratios(self) -> dict[str, Any]:
+        """Return forensic ratios (Piotroski F-Score, Graham Number, EV/EBITDA, CFO/PAT) with honesty contract."""
+        return self.engine.custom_ratios(self.identity.symbol)
+
+    @property
+    def piotroski_score(self) -> int | None:
+        return self.custom_ratios.get("piotroski_score")
+
+    @property
+    def graham_number(self) -> float | None:
+        return self.custom_ratios.get("graham_number")
+
+    @property
+    def research_profile(self) -> dict[str, Any]:
+        """Return full FinEngine EquityResearchService 360-degree profile dict."""
+        return self.engine.research_profile(self.identity.symbol)
+
+    @property
+    def shareholding_trends(self) -> dict[str, Any]:
+        """Return FinEngine quarterly/yearly shareholding tables & Recharts series."""
+        return self.engine.shareholding_trends(self.identity.symbol)
 
     @property
     def shareholding(self) -> pd.DataFrame:
@@ -1446,6 +1720,7 @@ class LakeTicker:
             "pb_ratio": None,
             "ev_ebitda": None,
             "roe_pct": None,
+            "roce_pct": None,
             "debt_to_equity": None,
             "sma_50": None,
             "sma_200": None,
@@ -1463,6 +1738,7 @@ class LakeTicker:
                     "pb_ratio": row.get("PB"),
                     "ev_ebitda": row.get("EV_EBITDA"),
                     "roe_pct": row.get("ROE_Pct"),
+                    "roce_pct": row.get("ROCE_Pct"),
                     "debt_to_equity": row.get("DebtToEquity"),
                     "sma_50": row.get("SMA_50"),
                     "sma_200": row.get("SMA_200"),
