@@ -8,8 +8,18 @@ Every feed in this repository has been rigorously verified via empirical live ne
 
 ## 1. Documentation Catalog
 
+### A. Core Architecture & Engineering Specifications
+| Document | Focus Area | Contents & Purpose |
+| :--- | :--- | :--- |
+| [**Architecture & System Design**](architecture_and_design.md) | System Architecture & Storage | 3-tier batch architecture, storage invariants, atomic replacement loops, network resilience, self-healing doctor engine, and two-tier packfile remote query protocol. |
+| [**Core Codebase Reference**](codebase_reference.md) | Core Python Implementation | Line-by-line, module-by-module reference for all modules in `src/datalake/` (`config`, `http_client`, `storage`, `state`, `symbols`, `adjuster`, `doctor`, `sync`, `remote`, `engine`, `cli`). |
+| [**Scrapers Implementation Reference**](scrapers_reference.md) | Ingestion & Parser Pipelines | Complete technical guide to all 7 scraper modules in `src/datalake/scrapers/` (`equity_eod`, `fo_eod`, `indices`, `universe_actions`, `deals_docs`, `funds_flows`, `xbrl`). |
+| [**CLI & Operational Runbook**](cli_and_operations.md) | Operations & CI/CD | Comprehensive CLI guide across all 10 subcommands, GitHub Actions automated cloud sync, Cloudflare WARP bypass, and disaster recovery runbook. |
+| [**Developer & Testing Guide**](developer_and_testing_guide.md) | Testing & Quality Assurance | Testing framework, offline unit suites (`app.py`), invariant assertions, live smoke test harness, latency benchmarks, and contributing standards. |
+
+### B. Upstream Feed & Domain Integration Specifications
 | Document | Primary Datasets Covered | Source Authorities | Protocol / Format | Temporal Boundary | Update Frequency |
-| :--- | :--- | :--- | :--- | :---: | :---: |
+| :--- | :--- | :--- | :--- | :--- | :---: |
 | [**Upstox V2 Historical Candle CDN**](upstox_data_integration.md) | NSE & BSE Cash Equities (Pre-2016 Cloud Seeding), Sectoral & Major Indices | Upstox Public CDN | Unauthenticated HTTP JSON | **`2000-01-03` to Present** | On-demand Historical Seeding |
 | [**Equity EOD Integration**](equity_eod_data_integration.md) | NSE & BSE Cash Equities: Modern UDIFF, Full Bhavdata, Legacy Bhavcopies, MTO Gross Delivery, Pre-2016 Symbol Fallback | NSE Archives, BSE Downloads, NSE HistoricalOR | HTTPS Zip/CSV, Fixed Width DAT | **`1995-01-03` to Present** | Daily EOD (~18:30 IST) |
 | [**Derivatives F&O Integration**](derivatives_fo_data_integration.md) | NSE & BSE Equity Derivatives: Index/Stock Futures (`FUTIDX`, `FUTSTK`), Index/Stock Options Chains (`OPTIDX`, `OPTSTK`), Strikes, Expiries, Settle Price, OI, Change in OI (Yearly Parquet `nse_fo_YYYY.parquet`) | NSE Archives, BSE Downloads | HTTPS Zip/CSV (UDIFF + Legacy) | **`2000-06-12` to Present** | Daily EOD (~19:00 IST) |
@@ -63,7 +73,6 @@ To download multi-decade historical archives and real-time feeds reliably withou
    - Dual UTF-8 and Windows-1252 (`cp1252`) decoding to handle typographical symbols and accents in AMFI flat files and legacy BSE records.
 5. **Atomic Storage & File Lock Protection**:
    - Unique temporary file generation (`.{uuid}.tmp`) with exponential retry loops and explicit garbage collection (`gc.collect()`) to prevent Windows OS `PermissionError` file-locking deadlocks during Parquet partition upserts.
-
 
 ---
 

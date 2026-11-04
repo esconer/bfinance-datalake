@@ -12,6 +12,11 @@ Automated point-in-time (PIT) historical backfill & daily EOD data lake for Indi
 Comprehensive technical specifications, schema definitions, live empirical probe verifications, and multi-decade temporal boundaries are documented in [`docs/`](docs/README.md):
 
 * [**Documentation Master Index & Historical Timeline**](docs/README.md) - High-level architectural overview, 30-year market evolution timeline, and network resilience.
+* [**Architecture & System Design**](docs/architecture_and_design.md) - Deep architectural specification: Lambda batch layer, storage invariants, network resilience, self-healing doctor, and packfile protocol.
+* [**Core Codebase Reference**](docs/codebase_reference.md) - Line-by-line technical reference for all core modules (`config`, `http_client`, `storage`, `state`, `symbols`, `adjuster`, `doctor`, `sync`, `remote`, `engine`, `cli`).
+* [**Scrapers Implementation Reference**](docs/scrapers_reference.md) - Deep-dive guide to all 7 scraper engines (`equity_eod`, `fo_eod`, `indices`, `universe_actions`, `deals_docs`, `funds_flows`, `xbrl`).
+* [**CLI & Operational Runbook**](docs/cli_and_operations.md) - Comprehensive command-line guide, GitHub Actions automation, Cloudflare WARP bypass, and disaster recovery runbook.
+* [**Developer & Testing Guide**](docs/developer_and_testing_guide.md) - Testing architecture, offline unit verification suite (`app.py`), invariant assertions, live smoke test harness, and benchmarks.
 * [**Upstox Historical Candle CDN Integration**](docs/upstox_data_integration.md) - Public unauthenticated CDN endpoints, OHLCV schemas, split/bonus adjustment proof, and 2000–2015 cloud seeding.
 * [**Equity EOD Integration (NSE & BSE Cash Equities)**](docs/equity_eod_data_integration.md) - Modern UDIFF cutover (2024), Full Bhavdata (2020–2024), Legacy Bhavcopies (1995–2024), MTO Gross Delivery (2002–2024), and NSE HistoricalOR fallback.
 * [**Derivatives F&O Integration (NSE & BSE)**](docs/derivatives_fo_data_integration.md) - Inception of Index Futures (June 12, 2000), Stock Futures/Options, modern UDIFF format, settlement prices, strike grids, open interest (OI), and yearly Parquet partitioning (`nse_fo_YYYY.parquet`).
