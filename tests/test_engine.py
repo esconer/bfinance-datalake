@@ -202,6 +202,20 @@ class TestUnifiedLakeEngine(unittest.TestCase):
         self.assertIsNone(p4["DividendPerShareRs"])
         self.assertEqual(p4["ActionType"], "OTHER")
 
+        # ETF split with "Per Unit"
+        p_etf = parse_action_purpose("Face Value Split (Sub-Division) - From Rs 10/- Per Unit To Re 1/- Per Unit")
+        self.assertEqual(p_etf["ActionType"], "SPLIT")
+        self.assertEqual(p_etf["SplitFromFV"], 10.0)
+        self.assertEqual(p_etf["SplitToFV"], 1.0)
+        self.assertEqual(p_etf["ShareMultiplier"], 10.0)
+
+        # ETF / Security split with "Per Security"
+        p_sec = parse_action_purpose("Split from Rs 10 Per Security into Re 1 Per Security")
+        self.assertEqual(p_sec["ActionType"], "SPLIT")
+        self.assertEqual(p_sec["SplitFromFV"], 10.0)
+        self.assertEqual(p_sec["SplitToFV"], 1.0)
+        self.assertEqual(p_sec["ShareMultiplier"], 10.0)
+
     def test_auto_adjust_dividend_scaling(self):
         from datalake.adjuster import OHLCVAdjuster
         adj = OHLCVAdjuster(self.lake.root)
@@ -372,6 +386,19 @@ class TestUnifiedLakeEngine(unittest.TestCase):
 
         t_nse = self.lake.ticker("RELIANCE.NS")
         self.assertEqual(t_nse.default_exchange, "NSE")
+
+    def test_etfs_catalog_method(self):
+        etf_df = pd.DataFrame([
+            {"Symbol": "NIFTYBEES", "Underlying": "NIFTY 50", "SecurityName": "Nippon India ETF Nifty 50 BeES"},
+            {"Symbol": "GOLDBEES", "Underlying": "Gold", "SecurityName": "Nippon India ETF Gold BeES"},
+        ])
+        etf_path = self.lake.root / "universe" / "nse_etf_master.parquet"
+        etf_path.parent.mkdir(parents=True, exist_ok=True)
+        etf_df.to_parquet(etf_path, index=False)
+
+        res = self.lake.etfs()
+        self.assertEqual(len(res), 2)
+        self.assertIn("NIFTYBEES", res["Symbol"].values)
 
 
 if __name__ == "__main__":

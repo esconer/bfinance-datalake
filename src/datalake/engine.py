@@ -783,6 +783,11 @@ class UnifiedLakeEngine:
             return con.execute(f"SELECT * FROM _snap {where}").df()
         return base_df
 
+    def etfs(self) -> pd.DataFrame:
+        """Return the NSE ETF Master catalog (Symbol, Underlying, SecurityName, ISIN, ListingDate)."""
+        p = self.root / "universe" / "nse_etf_master.parquet"
+        return read_table_safe(p) if p.exists() else pd.DataFrame()
+
     def fii_dii_flows(self, start: str | date | None = None, end: str | date | None = None) -> pd.DataFrame:
         """Return daily Cash Market FII/FPI and DII net inflows/outflows (in Rs Crores)."""
         p = self.root / "flows" / "cash_fii_dii_flows.parquet"

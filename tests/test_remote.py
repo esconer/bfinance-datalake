@@ -290,6 +290,16 @@ class TestRemoteAndStorageLayout(unittest.TestCase):
         if client._http_pool is not None:
             self.assertNotIn("authorization", {k.lower() for k in client._http_pool.headers.keys()})
 
+    def test_remote_etfs_method(self):
+        client = RemoteLakeClient("user/bfinance-datalake", load_httpfs=False)
+        client._safe_query = lambda query, params=None: pd.DataFrame([
+            {"Symbol": "NIFTYBEES", "Underlying": "NIFTY 50"},
+            {"Symbol": "GOLDBEES", "Underlying": "Gold"},
+        ])
+        res = client.etfs()
+        self.assertEqual(len(res), 2)
+        self.assertEqual(res.iloc[0]["Symbol"], "NIFTYBEES")
+
 
 if __name__ == "__main__":
     unittest.main()

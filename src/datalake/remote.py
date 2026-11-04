@@ -996,6 +996,12 @@ class RemoteLakeClient:
         where = f"WHERE {sql_filter}" if sql_filter else ""
         return self._safe_query(f"SELECT * FROM read_parquet('{url}') {where}")
 
+    def etfs(self) -> pd.DataFrame:
+        """Stream the NSE ETF Master catalog (NIFTYBEES, GOLDBEES, LIQUIDBEES, etc.) over HTTPS."""
+        self._ensure_httpfs()
+        url = self._resolve_cdn_url(self._asset_url("universe", "nse_etf_master.parquet"))
+        return self._safe_query(f"SELECT * FROM read_parquet('{url}')")
+
     def option_chain(
         self,
         symbol: str,

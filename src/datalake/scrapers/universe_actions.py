@@ -31,7 +31,7 @@ _FV_EXTRACT_RE = re.compile(
     re.I,
 )
 _FV_NOISE_RE = re.compile(
-    r"\(?[,\s]*(?:\b(?:on|of)\s+)?\b(?:face\s*value|fv|f\.v\.)\b\s*(?:of\s+)?(?:rs\.?|re\.?|₹|inr)?\s*[-:]?\s*\d+(?:\.\d+)?(?:\s*/-)?(?:\s*(?:each|per\s+share))?\s*\)?",
+    r"\(?[,\s]*(?:\b(?:on|of)\s+)?\b(?:face\s*value|fv|f\.v\.)\b\s*(?:of\s+)?(?:rs\.?|re\.?|₹|inr)?\s*[-:]?\s*\d+(?:\.\d+)?(?:\s*/-)?(?:\s*(?:each|per\s+(?:share|unit|security)))?\s*\)?",
     re.I,
 )
 _PCT_DIV_RE = re.compile(
@@ -44,7 +44,7 @@ _DIV_RE = re.compile(
 )
 _BONUS_RE = re.compile(r"\bbonus\b.*?(\d+)\s*:\s*(\d+)", re.I)
 _SPLIT_RE = re.compile(
-    r"(?:split|sub[-\s]*division).*?(?:from\s+)?(?:rs\.?|re\.?|₹|inr)?\s*(\d+(?:\.\d+)?)\s*(?:/-)?(?:\s*(?:per\s+share|each))?\s*(?:to|into)\s*(?:rs\.?|re\.?|₹|inr)?\s*(\d+(?:\.\d+)?)",
+    r"(?:split|sub[-\s]*division).*?(?:from\s+)?(?:rs\.?|re\.?|₹|inr)?\s*(\d+(?:\.\d+)?)\s*(?:/-)?(?:\s*(?:per\s+(?:share|unit|security)|each))?\s*(?:to|into)\s*(?:rs\.?|re\.?|₹|inr)?\s*(\d+(?:\.\d+)?)",
     re.I,
 )
 _RIGHTS_RE = re.compile(r"\brights?\b.*?(\d+)\s*:\s*(\d+)", re.I)

@@ -215,20 +215,41 @@ class EquityEODScraper:
         and filters to EQ-series stocks that were actually listed on or before the window.
         """
         master_path = self.cfg.root_dir / "universe" / "nse_equity_master.parquet"
-        if not master_path.exists():
+        etf_path = self.cfg.root_dir / "universe" / "nse_etf_master.parquet"
+        if not master_path.exists() and not etf_path.exists():
             logger.warning("Run sync_security_masters() first so ISINs are available.")
             return
 
-        mdf = read_table_safe(master_path).copy()
-        mdf.columns = [c.strip() for c in mdf.columns]
+        frames_m = []
+        if master_path.exists():
+            df_eq = read_table_safe(master_path).copy()
+            df_eq.columns = [c.strip() for c in df_eq.columns]
+            if "SERIES" in df_eq.columns:
+                df_eq = df_eq[df_eq["SERIES"].astype(str).str.strip().str.upper() == "EQ"].copy()
+            frames_m.append(df_eq)
+
+        if etf_path.exists():
+            df_etf = read_table_safe(etf_path).copy()
+            df_etf.columns = [c.strip() for c in df_etf.columns]
+            sym_c = next((c for c in df_etf.columns if "SYMBOL" in c.upper()), None)
+            isin_c = next((c for c in df_etf.columns if "ISIN" in c.upper()), None)
+            list_c = next((c for c in df_etf.columns if "LISTING" in c.upper() or "DATE" in c.upper()), None)
+            if sym_c and isin_c:
+                etf_norm = pd.DataFrame({
+                    "SYMBOL": df_etf[sym_c].astype(str).str.strip(),
+                    "SERIES": "EQ",
+                    "ISIN NUMBER": df_etf[isin_c].astype(str).str.strip(),
+                    "DATE OF LISTING": df_etf[list_c] if list_c else pd.NA,
+                })
+                frames_m.append(etf_norm)
+
+        if not frames_m:
+            return
+        mdf = pd.concat(frames_m, ignore_index=True)
         isin_col = next((c for c in mdf.columns if "ISIN" in c.upper()), None)
         list_col = next((c for c in mdf.columns if "LISTING" in c.upper()), None)
         if not isin_col:
             return
-
-        # Filter to EQ series only (Upstox uses NSE_BE| for BE series and rejects NSE_EQ| with 400)
-        if "SERIES" in mdf.columns:
-            mdf = mdf[mdf["SERIES"].astype(str).str.strip().str.upper() == "EQ"].copy()
 
         # Filter out IPOs that listed after end_year
         if list_col:
