@@ -117,12 +117,16 @@ async def run_daily_update(cfg: LakeConfig, lookback_days: int = 7, include_fo: 
             await fo.sync_range(fo_bse_start, today, exchanges=("BSE",))
 
         await indices.sync_daily_snapshots(idx_start, today)
+        await indices.backfill_30y_bulk(start_date=default_start, end_date=today)
+        indices.sync_vix_and_1d_rate_from_snapshots()
         await ff.sync_participant_oi(oi_start, today)
         await dd.sync_cash_fii_dii_daily()
         await dd.sync_bulk_and_block_deals()
         await dd.sync_insider_trading_pit(default_start, today)
         await dd.sync_concalls_and_presentations(default_start, today)
         await ff.sync_amfi_daily()
+        xbrl = XBRLScraper(http, state, cfg)
+        await xbrl.sync_recent_market_financials_nse()
 
     LakeDoctor(cfg).run_full_check_and_repair()
 

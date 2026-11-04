@@ -20,6 +20,15 @@ NIFTY_CONSTITUENT_URLS = {
     "NIFTY 200": "https://nsearchives.nseindia.com/content/indices/ind_nifty200list.csv",
     "NIFTY 500": "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv",
     "NIFTY MIDCAP 150": "https://nsearchives.nseindia.com/content/indices/ind_niftymidcap150list.csv",
+    "NIFTY SMALLCAP 250": "https://nsearchives.nseindia.com/content/indices/ind_niftysmallcap250list.csv",
+    "NIFTY BANK": "https://nsearchives.nseindia.com/content/indices/ind_niftybanklist.csv",
+    "NIFTY IT": "https://nsearchives.nseindia.com/content/indices/ind_niftyitlist.csv",
+    "NIFTY PHARMA": "https://nsearchives.nseindia.com/content/indices/ind_niftypharmalist.csv",
+    "NIFTY AUTO": "https://nsearchives.nseindia.com/content/indices/ind_niftyautolist.csv",
+    "NIFTY FMCG": "https://nsearchives.nseindia.com/content/indices/ind_niftyfmcglist.csv",
+    "NIFTY METAL": "https://nsearchives.nseindia.com/content/indices/ind_niftymetallist.csv",
+    "NIFTY ENERGY": "https://nsearchives.nseindia.com/content/indices/ind_niftyenergylist.csv",
+    "NIFTY REALTY": "https://nsearchives.nseindia.com/content/indices/ind_niftyrealtylist.csv",
 }
 
 _RS_DASH_GAP_RE = re.compile(r"((?:rs|re|inr|₹)\.?)[\s]*-[\s]*(?=\d)", re.I)

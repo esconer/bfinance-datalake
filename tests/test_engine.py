@@ -400,6 +400,128 @@ class TestUnifiedLakeEngine(unittest.TestCase):
         self.assertEqual(len(res), 2)
         self.assertIn("NIFTYBEES", res["Symbol"].values)
 
+    def test_nifty_constituent_urls_coverage(self):
+        from datalake.scrapers.universe_actions import NIFTY_CONSTITUENT_URLS
+        required = [
+            "NIFTY 50", "NIFTY NEXT 50", "NIFTY 100", "NIFTY 200", "NIFTY 500", "NIFTY MIDCAP 150",
+            "NIFTY SMALLCAP 250", "NIFTY BANK", "NIFTY IT", "NIFTY PHARMA", "NIFTY AUTO",
+            "NIFTY FMCG", "NIFTY METAL", "NIFTY ENERGY", "NIFTY REALTY"
+        ]
+        for idx in required:
+            self.assertIn(idx, NIFTY_CONSTITUENT_URLS)
+
+    def test_index_history_merges_recent_snapshots(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            p = Path(tmp_dir)
+            idx_dir = p / "indices"
+            idx_dir.mkdir(parents=True, exist_ok=True)
+            # Older bulk file with bar on 2026-01-02
+            pd.DataFrame([{
+                "Date": pd.Timestamp("2026-01-02"),
+                "IndexName": "NIFTY 50",
+                "Open": 24000.0, "High": 24100.0, "Low": 23900.0, "Close": 24050.0
+            }]).to_parquet(idx_dir / "nifty_30y_ohlc_tri_pe.parquet", index=False)
+            # Newer daily snapshot file with bar on 2026-01-05
+            pd.DataFrame([{
+                "Date": pd.Timestamp("2026-01-05"),
+                "IndexName": "NIFTY 50",
+                "Open": 24100.0, "High": 24200.0, "Low": 24000.0, "Close": 24150.0
+            }]).to_parquet(idx_dir / "ind_close_all_2026.parquet", index=False)
+
+            engine = UnifiedLakeEngine(p)
+            df = engine.index_history("NIFTY 50")
+            self.assertEqual(len(df), 2)
+            dates = [d.strftime("%Y-%m-%d") for d in df["Date"]]
+            self.assertIn("2026-01-02", dates)
+            self.assertIn("2026-01-05", dates)
+
+    def test_screener_valuation_ratios_and_fast_info(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            p = Path(tmp_dir)
+            for d in ("universe", "equities", "fundamentals", "shareholding"):
+                (p / d).mkdir(parents=True, exist_ok=True)
+            pd.DataFrame([{"SYMBOL": "TCS", "NAME OF COMPANY": "Tata Consultancy Services", "SERIES": "EQ", "ISIN NUMBER": "INE467B01029"}]).to_parquet(p / "universe" / "nse_equity_master.parquet", index=False)
+            pd.DataFrame([{
+                "Date": pd.Timestamp("2026-01-02"),
+                "Symbol": "TCS",
+                "Series": "EQ",
+                "Close": 4000.0,
+                "Volume": 500000,
+            }]).to_parquet(p / "equities" / "nse_cm_2026.parquet", index=False)
+            pd.DataFrame([{
+                "Symbol": "TCS",
+                "NatureOfReport": "Consolidated",
+                "PeriodType": "Quarterly",
+                "PeriodStart": "2025-07-01",
+                "PeriodEnd": "2025-09-30",
+                "Sales_Cr": 60000.0,
+                "PBT_Cr": 16000.0,
+                "NetProfit_Cr": 12000.0,
+                "BasicEPS_Rs": 100.0,
+                "Interest_Cr": 200.0,
+                "Depreciation_Cr": 1000.0,
+                "OtherIncome_Cr": 500.0,
+                "EquityCapital_Cr": 360.0,
+                "Reserves_Cr": 90000.0,
+                "TotalBorrowings_Cr": 5000.0,
+                "TotalCashAndBank_Cr": 15000.0,
+            }]).to_parquet(p / "fundamentals" / "xbrl_financials.parquet", index=False)
+            pd.DataFrame([{
+                "Symbol": "TCS",
+                "QuarterEnd": "2025-09-30",
+                "PromoterPct": 72.0,
+                "PromoterPledgedPct": 0.0,
+                "MutualFundsPct": 10.0,
+                "FPI_Pct": 12.0,
+                "RetailPct": 6.0,
+                "TotalShares": 3600000000.0,
+            }]).to_parquet(p / "shareholding" / "nse_shareholding_summary.parquet", index=False)
+
+            engine = UnifiedLakeEngine(p)
+            scr = engine.screener()
+            self.assertFalse(scr.empty)
+            row = scr[scr["Symbol"] == "TCS"].iloc[0]
+            self.assertIn("PE", scr.columns)
+            self.assertIn("MarketCap_Cr", scr.columns)
+            self.assertIn("PB", scr.columns)
+            self.assertIn("EV_EBITDA", scr.columns)
+            self.assertIn("ROE_Pct", scr.columns)
+            self.assertIn("DebtToEquity", scr.columns)
+            self.assertEqual(row["PE"], 40.0)
+            self.assertEqual(row["MarketCap_Cr"], 1440000.0)
+
+            t = engine.ticker("TCS")
+            fi = t.fast_info
+            self.assertEqual(fi.market_cap, 1440000.0)
+            self.assertEqual(fi.pe_ratio, 40.0)
+            self.assertEqual(fi.last_price, 4000.0)
+
+    def test_shp_xbrl_total_shares(self):
+        from datalake.scrapers.xbrl import XBRLScraper
+        xml = b"""<?xml version="1.0" encoding="utf-8"?>
+        <xbrli:xbrl xmlns:xbrli="http://www.xbrl.org/2003/instance" xmlns:in-bse-shp="http://www.bseindia.com/xbrl/shp/2015-12-31/in-bse-shp">
+            <xbrli:context id="OneD">
+                <xbrli:entity><xbrli:identifier scheme="http://www.bseindia.com/scrip">500325</xbrli:identifier></xbrli:entity>
+                <xbrli:period><xbrli:instant>2025-12-31</xbrli:instant></xbrli:period>
+            </xbrli:context>
+            <xbrli:context id="Promo">
+                <xbrli:entity><xbrli:segment><xbrli:explicitMember dimension="in-bse-shp:ShareholdingAxis">in-bse-shp:PromoterAndPromoterGroupMember</xbrli:explicitMember></xbrli:segment></xbrli:entity>
+                <xbrli:period><xbrli:instant>2025-12-31</xbrli:instant></xbrli:period>
+            </xbrli:context>
+            <xbrli:context id="Pub">
+                <xbrli:entity><xbrli:segment><xbrli:explicitMember dimension="in-bse-shp:ShareholdingAxis">in-bse-shp:PublicShareholdingMember</xbrli:explicitMember></xbrli:segment></xbrli:entity>
+                <xbrli:period><xbrli:instant>2025-12-31</xbrli:instant></xbrli:period>
+            </xbrli:context>
+            <in-bse-shp:NumberOfShares contextRef="Promo">5000000</in-bse-shp:NumberOfShares>
+            <in-bse-shp:PercentageOfTotalNumberOfShares contextRef="Promo">50.0</in-bse-shp:PercentageOfTotalNumberOfShares>
+            <in-bse-shp:NumberOfShares contextRef="Pub">5000000</in-bse-shp:NumberOfShares>
+            <in-bse-shp:PercentageOfTotalNumberOfShares contextRef="Pub">50.0</in-bse-shp:PercentageOfTotalNumberOfShares>
+        </xbrli:xbrl>"""
+        res = XBRLScraper.parse_full_shp_xbrl(xml)
+        self.assertIsNotNone(res)
+        summary = res.get("summary", {})
+        self.assertEqual(summary.get("TotalShares"), 10000000.0)
+
 
 if __name__ == "__main__":
     unittest.main()

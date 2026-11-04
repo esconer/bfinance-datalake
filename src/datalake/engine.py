@@ -5,6 +5,7 @@ from datetime import date
 from functools import lru_cache
 from pathlib import Path
 import threading
+from types import SimpleNamespace
 from typing import Any
 import pandas as pd
 
@@ -648,21 +649,26 @@ class UnifiedLakeEngine:
         p_bulk = self.root / "indices" / "nifty_30y_ohlc_tri_pe.parquet"
         clean_idx = index_name.strip().upper()
         df = self._read_filtered_parquet(p_bulk, filters=[("IndexName", "==", clean_idx)])
-        if df.empty:
-            idx_dir = self.root / "indices"
-            if idx_dir.exists():
-                files = sorted(idx_dir.glob("ind_close_all_*.parquet"))
-                frames = []
-                for f in files:
-                    if not f.exists():
-                        continue
-                    idf = read_table_safe(f)
-                    if not idf.empty and "IndexName" in idf.columns:
-                        sub = idf[idf["IndexName"].astype(str).str.strip().str.upper() == clean_idx]
-                        if not sub.empty:
-                            frames.append(sub)
-                if frames:
-                    df = pd.concat(frames, ignore_index=True)
+
+        # Also check recent ind_close_all_*.parquet for either non-bulk indices or newer daily bars
+        idx_dir = self.root / "indices"
+        if idx_dir.exists():
+            max_bulk_dt = pd.to_datetime(df["Date"]).max() if not df.empty else pd.Timestamp("1990-01-01")
+            files = sorted(idx_dir.glob("ind_close_all_*.parquet"))
+            if not df.empty:
+                files = [f for f in files if f.stem.split("_")[-1].isdigit() and int(f.stem.split("_")[-1]) >= max_bulk_dt.year]
+            snap_frames = []
+            for f in files:
+                idf = read_table_safe(f)
+                if not idf.empty and "IndexName" in idf.columns:
+                    sub = idf[idf["IndexName"].astype(str).str.strip().str.upper() == clean_idx].copy()
+                    if not sub.empty:
+                        sub["IndexName"] = clean_idx
+                        snap_frames.append(sub)
+            if snap_frames:
+                snap_df = pd.concat(snap_frames, ignore_index=True)
+                df = pd.concat([df, snap_df], ignore_index=True) if not df.empty else snap_df
+
         if df.empty:
             return df
         df["Date"] = pd.to_datetime(df["Date"])
@@ -670,7 +676,7 @@ class UnifiedLakeEngine:
             df = df[df["Date"] >= pd.Timestamp(start)]
         if end:
             df = df[df["Date"] <= pd.Timestamp(end)]
-        return df.sort_values("Date").drop_duplicates(subset=["Date"], keep="last").reset_index(drop=True)
+        return df.sort_values("Date").drop_duplicates(subset=["Date"], keep="first").reset_index(drop=True)
 
     def dossier(self, query: str | int) -> dict[str, pd.DataFrame]:
         """Return 360-degree company dossier combining all 8 non-price datasets for a symbol."""
@@ -704,9 +710,22 @@ class UnifiedLakeEngine:
         has_fin = (self.root / "fundamentals" / "xbrl_financials.parquet").exists()
         has_shp = (self.root / "shareholding" / "nse_shareholding_summary.parquet").exists()
 
-        fin_cte = """
+        fin_cols_available = set()
+        if has_fin:
+            try:
+                cols_df = self.sql("DESCRIBE financials")
+                fin_cols_available = set(cols_df["column_name"].tolist())
+            except Exception:
+                pass
+
+        def _fin_col(name: str) -> str:
+            return name if name in fin_cols_available else f"CAST(NULL AS DOUBLE) AS {name}"
+
+        fin_cte = f"""
             , dedup_fin AS (
                 SELECT Symbol, PeriodEnd, Sales_Cr, PBT_Cr, NetProfit_Cr, BasicEPS_Rs,
+                    {_fin_col("Interest_Cr")}, {_fin_col("Depreciation_Cr")}, {_fin_col("OtherIncome_Cr")},
+                    {_fin_col("EquityCapital_Cr")}, {_fin_col("Reserves_Cr")}, {_fin_col("TotalBorrowings_Cr")}, {_fin_col("TotalCashAndBank_Cr")},
                     ROW_NUMBER() OVER (
                         PARTITION BY Symbol, PeriodEnd
                         ORDER BY CASE WHEN LOWER(CAST(NatureOfReport AS VARCHAR)) LIKE '%consolidated%' THEN 1 ELSE 0 END DESC
@@ -719,14 +738,37 @@ class UnifiedLakeEngine:
                     SUM(PBT_Cr) OVER (PARTITION BY Symbol ORDER BY PeriodEnd ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS PBT_Cr,
                     SUM(NetProfit_Cr) OVER (PARTITION BY Symbol ORDER BY PeriodEnd ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS NetProfit_Cr,
                     SUM(BasicEPS_Rs) OVER (PARTITION BY Symbol ORDER BY PeriodEnd ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS BasicEPS_Rs,
+                    SUM( COALESCE(PBT_Cr, 0) + COALESCE(Interest_Cr, 0) + COALESCE(Depreciation_Cr, 0) - COALESCE(OtherIncome_Cr, 0) )
+                        OVER (PARTITION BY Symbol ORDER BY PeriodEnd ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS EBITDA_Cr,
+                    (COALESCE(EquityCapital_Cr, 0) + COALESCE(Reserves_Cr, 0)) AS BookValue_Cr,
+                    COALESCE(TotalBorrowings_Cr, 0) AS TotalBorrowings_Cr,
+                    COALESCE(TotalCashAndBank_Cr, 0) AS TotalCashAndBank_Cr,
                     ROW_NUMBER() OVER (PARTITION BY Symbol ORDER BY PeriodEnd DESC) AS rn
                 FROM dedup_fin WHERE fn_rn = 1
             ),
-            latest_fin AS (SELECT * EXCLUDE (rn) FROM ttm_fin WHERE rn = 1)
+            latest_fin AS (
+                SELECT *,
+                    CASE WHEN BookValue_Cr > 0 THEN ROUND((NetProfit_Cr / BookValue_Cr) * 100.0, 2) ELSE NULL END AS ROE_Pct,
+                    CASE WHEN BookValue_Cr > 0 THEN ROUND(TotalBorrowings_Cr / BookValue_Cr, 2) ELSE NULL END AS DebtToEquity
+                FROM ttm_fin WHERE rn = 1
+            )
         """ if has_fin else ""
-        shp_cte = """
+
+        shp_cols_available = set()
+        if has_shp:
+            try:
+                cols_df = self.sql("DESCRIBE shareholding")
+                shp_cols_available = set(cols_df["column_name"].tolist())
+            except Exception:
+                pass
+
+        def _shp_col(name: str) -> str:
+            return name if name in shp_cols_available else f"CAST(NULL AS DOUBLE) AS {name}"
+
+        shp_cte = f"""
             , latest_shp AS (
-                SELECT Symbol, QuarterEnd AS ShpQuarter, PromoterPct, PromoterPledgedPct, MutualFundsPct, FPI_Pct, RetailPct
+                SELECT Symbol, QuarterEnd AS ShpQuarter, PromoterPct, PromoterPledgedPct, MutualFundsPct, FPI_Pct, RetailPct,
+                    {_shp_col("TotalShares")}
                 FROM (
                     SELECT *, ROW_NUMBER() OVER (PARTITION BY Symbol ORDER BY QuarterEnd DESC) AS rn
                     FROM shareholding
@@ -734,8 +776,22 @@ class UnifiedLakeEngine:
             )
         """ if has_shp else ""
 
-        fin_cols = ", f.FinQuarter, f.Sales_Cr, f.PBT_Cr, f.NetProfit_Cr, f.BasicEPS_Rs" if has_fin else ""
-        shp_cols = ", s.ShpQuarter, s.PromoterPct, s.PromoterPledgedPct, s.MutualFundsPct, s.FPI_Pct, s.RetailPct" if has_shp else ""
+        fin_cols = """
+            , f.FinQuarter, f.Sales_Cr, f.EBITDA_Cr, f.PBT_Cr, f.NetProfit_Cr, f.BasicEPS_Rs,
+            f.BookValue_Cr, f.TotalBorrowings_Cr, f.TotalCashAndBank_Cr, f.ROE_Pct, f.DebtToEquity,
+            CASE WHEN f.BasicEPS_Rs > 0 THEN ROUND(e.Close / f.BasicEPS_Rs, 2) ELSE NULL END AS PE
+        """ if has_fin else ""
+
+        shp_cols = """
+            , s.ShpQuarter, s.PromoterPct, s.PromoterPledgedPct, s.MutualFundsPct, s.FPI_Pct, s.RetailPct, s.TotalShares,
+            CASE WHEN s.TotalShares > 0 THEN ROUND((e.Close * s.TotalShares) / 10000000.0, 2) ELSE NULL END AS MarketCap_Cr
+        """ if has_shp else ""
+
+        val_cols = """
+            , CASE WHEN f.BookValue_Cr > 0 AND s.TotalShares > 0 THEN ROUND(((e.Close * s.TotalShares) / 10000000.0) / f.BookValue_Cr, 2) ELSE NULL END AS PB
+            , CASE WHEN f.EBITDA_Cr > 0 AND s.TotalShares > 0 THEN ROUND((((e.Close * s.TotalShares) / 10000000.0) + COALESCE(f.TotalBorrowings_Cr, 0) - COALESCE(f.TotalCashAndBank_Cr, 0)) / f.EBITDA_Cr, 2) ELSE NULL END AS EV_EBITDA
+        """ if (has_fin and has_shp) else ""
+
         fin_join = "LEFT JOIN latest_fin f USING (Symbol)" if has_fin else ""
         shp_join = "LEFT JOIN latest_shp s USING (Symbol)" if has_shp else ""
 
@@ -761,7 +817,7 @@ class UnifiedLakeEngine:
             latest_eq AS (SELECT * EXCLUDE (rn) FROM recent_eq WHERE rn = 1)
             {fin_cte}
             {shp_cte}
-            SELECT e.* {fin_cols} {shp_cols}
+            SELECT e.* {fin_cols} {shp_cols} {val_cols}
             FROM latest_eq e
             {fin_join}
             {shp_join}
@@ -1198,3 +1254,40 @@ class LakeTicker:
         qdf["OPM_Pct"] = ((qdf["EBITDA_Cr"] / qdf["Sales_Cr"].replace(0, float("nan"))) * 100.0).round(2)
         qdf["NPM_Pct"] = ((qdf["NetProfit_Cr"] / qdf["Sales_Cr"].replace(0, float("nan"))) * 100.0).round(2)
         return qdf
+
+    @property
+    def fast_info(self) -> SimpleNamespace:
+        """Quick summary of key valuation and technical metrics accessible via dot notation."""
+        res: dict[str, Any] = {
+            "last_price": None,
+            "market_cap": None,
+            "pe_ratio": None,
+            "pb_ratio": None,
+            "ev_ebitda": None,
+            "roe_pct": None,
+            "debt_to_equity": None,
+            "sma_50": None,
+            "sma_200": None,
+            "high_52w": None,
+            "low_52w": None,
+        }
+        try:
+            scr = self.engine.screener(f"Symbol = '{self.identity.symbol}'")
+            if not scr.empty:
+                row = scr.iloc[0].to_dict()
+                res.update({
+                    "last_price": row.get("Close"),
+                    "market_cap": row.get("MarketCap_Cr"),
+                    "pe_ratio": row.get("PE"),
+                    "pb_ratio": row.get("PB"),
+                    "ev_ebitda": row.get("EV_EBITDA"),
+                    "roe_pct": row.get("ROE_Pct"),
+                    "debt_to_equity": row.get("DebtToEquity"),
+                    "sma_50": row.get("SMA_50"),
+                    "sma_200": row.get("SMA_200"),
+                    "high_52w": row.get("High_52W"),
+                    "low_52w": row.get("Low_52W"),
+                })
+        except Exception:
+            pass
+        return SimpleNamespace(**res)

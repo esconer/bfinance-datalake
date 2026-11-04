@@ -128,18 +128,21 @@ class XBRLScraper:
             synced_syms = syms
             if syms:
                 logger.info("[XBRL All-Market] Syncing NSE Financials + Shareholding for %d symbols...", len(syms))
-                for sym in syms:
-                    if force or sym not in done_fin:
-                        try:
-                            await self.sync_symbol_financials_nse(sym)
-                        except Exception as exc:
-                            logger.warning("[XBRL All-Market] NSE Financials failed for %s: %s", sym, exc)
-                    if force or sym not in done_shp:
-                        try:
-                            await self.sync_symbol_shareholding_nse(sym)
-                        except Exception as exc:
-                            logger.warning("[XBRL All-Market] NSE Shareholding failed for %s: %s", sym, exc)
-                    await asyncio.sleep(self.cfg.polite_delay_sec)
+                sem = asyncio.Semaphore(4)
+                async def _sync_one_sym(s: str) -> None:
+                    async with sem:
+                        if force or s not in done_fin:
+                            try:
+                                await self.sync_symbol_financials_nse(s)
+                            except Exception as exc:
+                                logger.warning("[XBRL All-Market] NSE Financials failed for %s: %s", s, exc)
+                        if force or s not in done_shp:
+                            try:
+                                await self.sync_symbol_shareholding_nse(s)
+                            except Exception as exc:
+                                logger.warning("[XBRL All-Market] NSE Shareholding failed for %s: %s", s, exc)
+                        await asyncio.sleep(self.cfg.polite_delay_sec)
+                await asyncio.gather(*[_sync_one_sym(s) for s in syms])
             else:
                 logger.info("[XBRL All-Market] All %d NSE symbols already completed in state.db.", len(all_syms))
 
@@ -154,16 +157,81 @@ class XBRLScraper:
             synced_scrips = scrips
             if scrips:
                 logger.info("[XBRL All-Market] Syncing BSE Shareholding for %d scrips...", len(scrips))
-                for scrip in scrips:
-                    try:
-                        await self.sync_bse_shareholding(scrip)
-                    except Exception as exc:
-                        logger.warning("[XBRL All-Market] BSE Shareholding failed for %s: %s", scrip, exc)
-                    await asyncio.sleep(self.cfg.polite_delay_sec)
+                sem_bse = asyncio.Semaphore(4)
+                async def _sync_one_scrip(sc: str) -> None:
+                    async with sem_bse:
+                        try:
+                            await self.sync_bse_shareholding(sc)
+                        except Exception as exc:
+                            logger.warning("[XBRL All-Market] BSE Shareholding failed for %s: %s", sc, exc)
+                        await asyncio.sleep(self.cfg.polite_delay_sec)
+                await asyncio.gather(*[_sync_one_scrip(sc) for sc in scrips])
             else:
                 logger.info("[XBRL All-Market] All %d BSE scrips already completed in state.db.", len(all_scrips))
 
         return synced_syms, synced_scrips
+
+    async def sync_recent_market_financials_nse(self, max_new_xmls: int = 100) -> int:
+        """
+        Fetches NSE's market-wide recent financial results manifest in 1 HTTP call and
+        ingests any new quarterly/annual XBRL filings not yet in `state.db`.
+        """
+        rows: list[dict] = []
+        sem = asyncio.Semaphore(4)
+        for period in ("Quarterly", "Annual"):
+            url = f"https://www.nseindia.com/api/corporates-financial-results?index=equities&period={period}"
+            try:
+                resp = await self.http.get(url, headers=NSE_API_HEADERS, prime_nse=True)
+                if resp.status_code != 200 or not resp.text.strip().startswith("["):
+                    continue
+                filings = resp.json()
+            except Exception:
+                continue
+            if not isinstance(filings, list):
+                continue
+
+            pending = []
+            for item in filings:
+                sym = str(item.get("symbol") or "").strip().upper()
+                if not sym:
+                    continue
+                xbrl_url = item.get("xbrl")
+                filing_dt = item.get("filingDate") or item.get("re_create_dt") or item.get("broadcastDate")
+                if _is_valid_xbrl_url(xbrl_url):
+                    f_key = f"{sym}:{xbrl_url.split('/')[-1]}"
+                    if not self.state.is_completed("xbrl_financials", f_key):
+                        pending.append((sym, period, item, xbrl_url, f_key, filing_dt))
+
+            async def _dl_xml(entry):
+                sym, per, item, x_url, f_key, f_dt = entry
+                async with sem:
+                    try:
+                        xml_resp = await self.http.get(x_url, headers=ARCHIVE_HEADERS, prime_nse=True)
+                        await asyncio.sleep(0.1)
+                        if xml_resp.status_code == 200 and b"<" in xml_resp.content[:200]:
+                            parsed = self.parse_indas_xbrl(xml_resp.content, default_symbol=sym, source_url=x_url, filing_date=f_dt)
+                            if parsed:
+                                self.state.record("xbrl_financials", f_key, "OK", len(parsed), xml_resp.content, x_url)
+                                return parsed
+                    except Exception:
+                        pass
+                fb = self._extract_json_financial_row(item, sym, per, filing_date=f_dt)
+                return [fb] if fb else []
+
+            if pending[:max_new_xmls]:
+                batches = await asyncio.gather(*[_dl_xml(e) for e in pending[:max_new_xmls]])
+                for b in batches:
+                    rows.extend(b)
+
+        if rows:
+            target = self.cfg.root_dir / "fundamentals" / "xbrl_financials.parquet"
+            upsert_parquet_partition(
+                pd.DataFrame(rows),
+                target,
+                dedup_cols=["Symbol", "NatureOfReport", "PeriodType", "PeriodStart", "PeriodEnd"],
+                sort_cols=["Symbol", "PeriodEnd", "PeriodType", "FilingDate"],
+            )
+        return len(rows)
 
     async def sync_symbol_financials_nse(self, symbol: str) -> None:
         sym = symbol.strip().upper()
@@ -664,16 +732,25 @@ class XBRLScraper:
                     return by_member[m]["PctOfTotal"]
             return None
 
-        promo = by_member.get("ShareholdingOfPromoterAndPromoterGroupMember", {})
+        promo = (
+            by_member.get("ShareholdingOfPromoterAndPromoterGroupMember")
+            or by_member.get("PromoterAndPromoterGroupMember")
+            or by_member.get("PromoterMember")
+            or {}
+        )
         fpi_pct = (
             _get_pct("ForeignPortfolioInvestorsCategoryIMember", "ForeignPortfolioInvestorsMember") or 0.0
         ) + (_get_pct("ForeignPortfolioInvestorsCategoryIIMember") or 0.0)
+
+        pub_entry = by_member.get("PublicShareholdingMember", {})
+        tot_sh = (promo.get("Shares") or 0.0) + (pub_entry.get("Shares") or 0.0)
 
         summary = {
             "PromoterPct": promo.get("PctOfTotal"),
             "PromoterPledgedShares": promo.get("PledgedShares"),
             "PromoterPledgedPct": promo.get("PledgedPct"),
             "PublicPct": _get_pct("PublicShareholdingMember"),
+            "TotalShares": tot_sh if tot_sh > 0 else None,
             "MutualFundsPct": _get_pct("MutualFundsOrUTIMember", "MutualFundsMember"),
             "FPI_Pct": round(fpi_pct, 4) if fpi_pct > 0 else _get_pct("ForeignInstitutionsMember"),
             "InsurancePct": _get_pct("InsuranceCompaniesMember"),
