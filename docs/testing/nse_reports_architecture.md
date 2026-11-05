@@ -283,3 +283,65 @@ async def check_eod_publication_status(http: ResilientHTTPClient, target_date: d
 | **Short Selling Disclosures** | `data/deals/short_selling.parquet` | `shortselling_DDMMYYYY.csv` | Institutional and retail short positioning intelligence. |
 | **Daily Volatility Matrix** | `data/analytics/equity_volatility.parquet` | `CMVOLT_DDMMYYYY.CSV` | Official exchange annualized & daily volatility for risk modeling. |
 | **Tri-Party Repo Rates** | `data/fixed_income/treps_repo.parquet` | `TRM_BCDDMMYYYY.csv` | Daily money market short-term lending rates and collateral volumes. |
+
+---
+
+## 8. Exhaustive API Catalog: All Discovered & Empirically Probed Endpoints
+
+During our JavaScript bundle reverse-engineering and live network testing, we extracted and verified **38+ internal endpoints** hosted on `www.nseindia.com`. The complete catalog below provides specifications, empirical payload sizes, response formats, and architectural use cases for each API.
+
+### Category 1: Report Catalogs & Server-Side Proxies
+| Endpoint | Method & Params | Payload Size | Format | Description & Strategic Value |
+| :--- | :--- | :--- | :--- | :--- |
+| `/api/zipem` | `GET ?fileURLs=[<JSON_ARRAY>]&type=daily` | Up to 10 MB | `application/zip` | **Official internal archive proxy.** Fetches any static file(s) on `nsearchives.nseindia.com` via NSE's internal VPC, immune to external IP blocks. Supports batch multi-file bundling. |
+| `/api/reports` | `GET ?archives=[<OBJ_ARRAY>]&date=DD-MM-YYYY&type=Archives` | 200 KB - 5 MB | `application/zip` | Historical archive bundler used by the interactive calendar date-picker. |
+| `/api/merged-daily-reports` | `GET ?key={CM\|FO}` | 12 KB | `application/json` | Real-time catalog indexed by canonical `fileKey`. Serves as the authoritative Publication Oracle to verify if today's EOD Bhavcopy is published. |
+| `/api/daily-reports` | `GET ?key={SEGMENT}` | 10 KB - 45 KB | `application/json` | Daily report manifest for 11 market segments (`CM`, `FO`, `INDEX`, `SLBS`, `SME`, `COM`, `CD`, `WDM`, `CBM`, `TRI-PARTY`, `EGR`) partitioned into `CurrentDay`, `PreviousDay`, and `FutureDay`. |
+| `/api/monthly-reports` | `GET ?key={SEGMENT}` | 5 KB - 25 KB | `application/json` | Monthly position limits, settlement statistics, mode of trading, and impact cost files across 10 segments. |
+| `/products/content/sec_bhavdata_full_{DDMMYYYY}.csv` | `GET` direct path | ~400 KB | `text/csv` | Direct mirrored static path on `www.nseindia.com` for Full Bhavcopy & Deliverables, bypassing `nsearchives` completely. |
+
+### Category 2: Historical Deal & Trading Analytics
+| Endpoint | Method & Params | Payload Size | Format | Description & Strategic Value |
+| :--- | :--- | :--- | :--- | :--- |
+| `/api/historicalOR/bulk-block-short-deals` | `GET ?optionType=bulk_deals&from=d&to=d&csv=true` | 20 KB - 3 MB | `text/csv` | Streams date-filtered bulk deals across any date range with UTF-8 BOM encoding. |
+| `/api/historicalOR/bulk-block-short-deals` | `GET ?optionType=block_deals&from=d&to=d&csv=true` | 5 KB - 1 MB | `text/csv` | Streams date-filtered block deals across any date range. |
+| `/api/historicalOR/bulk-block-short-deals` | `GET ?optionType=short_deals&from=d&to=d&csv=true` | 5 KB - 500 KB | `text/csv` | Streams date-filtered institutional short selling disclosures. |
+| `/api/historicalOR/generateSecurityWiseHistoricalData` | `GET ?from=d&to=d&symbol=s&type=priceVolumeDeliverable&series=ALL&csv=true` | 50 KB - 1.5 MB | `text/csv` | Streams up to **5 full years (1,826 days)** of daily continuous OHLCV, weighted average price, volume, trades, and delivery percentage for any stock in a single request. |
+| `/api/historicalOR/SASeries` | `GET` | 2 KB | `application/json` | Resolves all currently active trading series (`EQ`, `BE`, `SM`, `BZ`, `ST`) for input into historical queries. |
+
+### Category 3: Market Universe & Master Resolution
+| Endpoint | Method & Params | Payload Size | Format | Description & Strategic Value |
+| :--- | :--- | :--- | :--- | :--- |
+| `/api/market-data-pre-open` | `GET ?key=ALL` | **2.33 MB** | `application/json` | Comprehensive active equity universe snapshot (2,400+ securities) including symbol, ISIN identifier, industry sector, 52-week high/low, last price, and pre-open volume. |
+| `/api/smart-search/equity` | `GET ?q={QUERY}` | 2 KB | `application/json` | Symbol and scrip auto-complete resolver returning official company names, series, and trading segments. |
+| `/api/smart-search/eqEtf` | `GET ?q={QUERY}` | 14 KB | `application/json` | ETF universe search resolving underlying benchmark index, issuer, and active trading symbol. |
+
+### Category 4: Real-Time Indices & Intraday Tick Time-Series
+| Endpoint | Method & Params | Payload Size | Format | Description & Strategic Value |
+| :--- | :--- | :--- | :--- | :--- |
+| `/api/equity-stock-indices` | `GET ?index={INDEX_NAME}` (e.g. `NIFTY 50`) | **36.8 KB** | `application/json` | Complete index breakdown: provides every constituent security with live OHLC, P/E, P/B, index weighting, total traded value, and advances/declines. |
+| `/api/equity-stockIndex` | `GET ?index={INDEX_NAME}` | ~1 KB | `application/json` | High-level index summary statistics (current level, open, high, low, previous close, percentage change). |
+| `/api/chart-databyindex-dynamic` | `GET ?index={INDEX}&indices=true` | **705 KB** | `application/json` | **Second-by-second live intraday tick chart** for the entire trading day (`grapthData: [[timestamp_ms, price, session_code], ...]`). |
+| `/api/chart-databyindex-preopen-fo` | `GET ?index={INDEX}` | 10 KB - 50 KB | `application/json` | F&O underlying index pre-open price trajectory. |
+| `/api/chart-databyindex-spos-preopen` | `GET ?index={SYMBOL}` | 5 KB - 25 KB | `application/json` | Special Pre-Open session intraday graph data for newly listed or re-listed securities. |
+
+### Category 5: Market Status, Turnover & Macro Aggregates
+| Endpoint | Method & Params | Payload Size | Format | Description & Strategic Value |
+| :--- | :--- | :--- | :--- | :--- |
+| `/api/marketStatus` | `GET` | 2.1 KB | `application/json` | High-level status (Open, Closed, Pre-Open, Post-Close) for Capital Market, Currency, Commodity, and Debt segments. |
+| `/api/allMarketStatus` | `GET` | 3.9 KB | `application/json` | Detailed status across all 11 market segments (`CM`, `FO`, `CD`, `COM`, `CBM`, `WDM`, `SLBS`, `EGR`, `TRI-PARTY`, etc.) with official trade dates and opening/closing timestamps. |
+| `/api/market-turnover` | `GET` | 1.5 KB | `application/json` | Aggregate traded volume, traded value (in INR), and open interest comparing today vs yesterday across Equities and F&O. |
+| `/api/market-turnover-popup` | `GET` | 12.5 KB | `application/json` | Granular turnover breakdown by instrument: Cash Equities, Index Futures, Stock Futures, Index Options, Stock Options, Currency, Interest Rate Derivatives, and Commodities. |
+
+### Category 6: Corporate Disclosures, Filings & Governance
+| Endpoint | Method & Params | Payload Size | Format | Description & Strategic Value |
+| :--- | :--- | :--- | :--- | :--- |
+| `/api/quick-links-corporate` | `GET ?symbol={SYMBOL}` | **1.35 MB** | `application/json` | Comprehensive corporate governance stream: returns all historical financial results, board meetings, announcements, shareholding disclosures, and dividend history for a specific company. |
+| `/api/eventnotification` | `GET` | 1.4 KB | `application/json` | Corporate announcements calendar (upcoming board meetings, dividend declaration dates, earnings releases). |
+| `/api/circulars` | `GET` | **84.9 KB** | `application/json` | Complete feed of exchange regulatory circulars with issue dates, departments (Surveillance, Trading, Clearing), circular numbers, and direct PDF download links. |
+| `/api/latest-circular` | `GET` | 1 KB - 5 KB | `application/json` | Breaking exchange notices and urgent notifications. |
+| `/api/contingency-drill-calender` | `GET` | 5.7 KB | `application/json` | Disaster Recovery (DR) and mock-trading drill calendar dates and operational guidelines across market segments. |
+| `/api/corp-bond-details` | `GET ?isin={ISIN}` | ~200 B | `application/json` | Corporate debt instrument lookup (coupon rate, issue size, redemption date, credit rating agency). |
+| `/api/negotiated-trade-details` | `GET ?isin={ISIN}` | ~200 B | `application/json` | Secondary market reporting on negotiated corporate debt transactions. |
+| `/api/download_xbrl` | `GET ?fileUrl={URL}` | Varies | `text/xml` | Direct extraction gateway for XBRL financial statements. |
+
