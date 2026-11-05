@@ -7,12 +7,13 @@ import tempfile
 import zipfile
 from datetime import date
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 import pandas as pd
 
 from datalake.adjuster import OHLCVAdjuster
 from datalake.config import LakeConfig
 from datalake.doctor import LakeDoctor
-from datalake.http_client import SimpleHTTPResponse
+from datalake.http_client import ResilientHTTPClient, SimpleHTTPResponse
 from datalake.scrapers.deals_docs import DealsAndDocumentsScraper, _normalize_deals_frame
 from datalake.scrapers.equity_eod import EquityEODScraper, filter_bse_equity_only, repair_ohlc
 from datalake.scrapers.fo_eod import DerivativesEODScraper
@@ -25,10 +26,11 @@ from datalake.storage import read_table_safe, sanitize_for_parquet, write_parque
 from datalake.symbols import SymbolRenameResolver
 
 
-def _make_zip(filename: str, text_content: str) -> bytes:
+def _make_zip(filename: str, content: str | bytes) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr(filename, text_content.encode("utf-8"))
+        raw = content.encode("utf-8") if isinstance(content, str) else content
+        zf.writestr(filename, raw)
     return buf.getvalue()
 
 
@@ -635,17 +637,17 @@ def test_nsearchives_resilience_and_uncaught_guards():
     # Trigger failures until streak hits 8
     client._nsearchives_fail_streak = 7
     # One more non-200/404 response
-    asyncio.run(client.get(url))
+    asyncio.run(client.get(url, fallback_proxy=False))
     assert client._nsearchives_fail_streak >= 8
 
-    # Next call must raise RuntimeError circuit breaker
+    # Next call must raise RuntimeError circuit breaker when fallback_proxy=False
     tripped = False
     try:
-        asyncio.run(client.get(url))
+        asyncio.run(client.get(url, fallback_proxy=False))
     except RuntimeError as exc:
         tripped = True
         assert "unreachable from this runner IP" in str(exc)
-    assert tripped, "Circuit breaker should trip when _nsearchives_fail_streak >= 8"
+    assert tripped, "Circuit breaker should trip when _nsearchives_fail_streak >= 8 and fallback_proxy=False"
 
     # 2. Verify DealsAndDocumentsScraper.sync_bulk_and_block_deals survives unreachable archive host
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -676,6 +678,47 @@ def test_nsearchives_resilience_and_uncaught_guards():
         asyncio.run(univ_html.sync_security_masters())
 
 
+def test_nsearchives_proxy_fallback_and_extraction():
+    client = ResilientHTTPClient()
+
+    # 1. Test zip outer packaging and inner zip extraction
+    csv_bytes = b"SYMBOL,SERIES,OPEN\nRELIANCE,EQ,2500.0\n"
+    inner_zip = _make_zip("BhavCopy_NSE_CM_0_0_0_20261104_F_0000.csv", csv_bytes)
+    outer_zip = _make_zip("BhavCopy_NSE_CM_0_0_0_20261104_F_0000.csv.zip", inner_zip)
+
+    mock_proxy_resp = SimpleHTTPResponse(
+        status_code=200,
+        content=outer_zip,
+        headers={"content-type": "application/zip"}
+    )
+    client.get = AsyncMock(return_value=mock_proxy_resp)
+
+    res = asyncio.run(client.fetch_archive_via_proxy("https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_20261104_F_0000.csv.zip"))
+    assert res.status_code == 200
+    assert res.content == inner_zip
+
+    # 2. Test extraction of a raw CSV file from outer zip
+    bulk_csv = b"Date,Symbol,Price\n05-Nov-2026,TCS,3950.0\n"
+    outer_zip_csv = _make_zip("bulk.csv", bulk_csv)
+    client.get = AsyncMock(return_value=SimpleHTTPResponse(
+        status_code=200,
+        content=outer_zip_csv,
+        headers={"content-type": "application/zip"}
+    ))
+    res_csv = asyncio.run(client.fetch_archive_via_proxy("https://nsearchives.nseindia.com/content/equities/bulk.csv"))
+    assert res_csv.status_code == 200
+    assert res_csv.content == bulk_csv
+
+    # 3. Test 500 "Files not available" translated to 404
+    client.get = AsyncMock(return_value=SimpleHTTPResponse(
+        status_code=500,
+        content=b'{"error":"Files not available","show":true}',
+        headers={"content-type": "application/json"}
+    ))
+    res_missing = asyncio.run(client.fetch_archive_via_proxy("https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_20261108_F_0000.csv.zip"))
+    assert res_missing.status_code == 404
+
+
 if __name__ == "__main__":
     test_corporate_action_regex_parser()
     test_repair_ohlc_and_bse_debt_filter()
@@ -691,4 +734,5 @@ if __name__ == "__main__":
     test_pass_3_audit_suite()
     test_after_fix_2_audit_suite()
     test_nsearchives_resilience_and_uncaught_guards()
+    test_nsearchives_proxy_fallback_and_extraction()
     print("ALL OFFLINE UNIT & INTEGRATION TESTS PASSED!")

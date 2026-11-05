@@ -109,6 +109,15 @@ async def run_daily_update(cfg: LakeConfig, lookback_days: int = 7, include_fo: 
         idx_start = state.max_ok_date("indices_daily_all") or default_start
         oi_start = state.max_ok_date("nse_participant_oi") or default_start
 
+        try:
+            m_resp = await http.get("https://www.nseindia.com/api/merged-daily-reports?key=CM", prime_nse=True, timeout=10.0)
+            if m_resp.status_code == 200:
+                actl_name = m_resp.json().get("CM-UDIFF-BHAVCOPY-CSV", {}).get("fileActlName", "")
+                if today.strftime("%Y%m%d") not in actl_name and today.strftime("%d%m%Y") not in actl_name:
+                    logger.info("NSE EOD Bhavcopy for %s is not published yet on exchange (typical release is ~18:30 IST).", today)
+        except Exception as exc:
+            logger.debug("Publication check skipped: %s", exc)
+
         await eq.sync_range(nse_start, today, exchanges=("NSE",))
         await eq.sync_range(bse_start, today, exchanges=("BSE",))
 

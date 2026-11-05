@@ -12,190 +12,186 @@ This document details the reverse-engineering, empirical network probing, and ar
 
 ## 1. Executive Summary & Research Context
 
-Many automated data lakes and CI runners experience intermittent or total failures when requesting data from `nsearchives.nseindia.com` (e.g. `HTTP 403 Forbidden`, TCP resets, or timeouts). To address this, we conducted an empirical investigation into the architecture of `www.nseindia.com`'s frontend report portals to answer three core questions:
+Many automated data lakes, analytics pipelines, and CI runners experience intermittent or total failures when requesting data from `nsearchives.nseindia.com` (e.g. `HTTP 403 Forbidden`, TCP resets, or timeouts). To address this, we conducted an empirical investigation into the architecture of `www.nseindia.com`'s frontend report portals to answer core architectural questions:
 
 1. **How does the official web portal discover and serve reports?**
 2. **What underlying APIs power these pages, and can they be scraped directly?**
-3. **What alternative, high-reliability channels exist to source data when `nsearchives` is unreachable?**
+3. **What alternative, high-reliability channels exist to source data when `nsearchives` is unreachable or blocked?**
+4. **Can `www.nseindia.com` act as a gateway/proxy to retrieve files stored on `nsearchives`?**
 
 ### Key Findings
 1. **Dynamic Single-Page Application (SPA) Architecture**:  
    The front-facing pages are not static HTML directories. They are client-side web applications powered by **hidden JSON manifest APIs** hosted directly on `www.nseindia.com`.
-2. **Three Master Scraping Channels Discovered**:
-   - **Daily Manifest API (`/api/daily-reports?key={SEGMENT}`)**: Covers 11 distinct market segments and publishes a real-time index of ~100 daily files with exact file sizes, dates, and direct download links.
-   - **Monthly Manifest API (`/api/monthly-reports?key={SEGMENT}`)**: Indexes monthly position limits, settlement statistics, mode of trading, and impact cost files across 10 segments.
-   - **Security-Wise Historical API (`/api/historicalOR/generateSecurityWiseHistoricalData`)**: Directly streams up to **5 continuous years** of daily OHLCV + Delivery + Trades per stock directly from `www.nseindia.com`, with **zero reliance on `nsearchives`**.
-3. **Root Cause of `nsearchives` Access Failures**:
-   - `nsearchives.nseindia.com` is hosted on a separate Akamai CDN edge that enforces geographic and IP-reputation rate limits independently of `www.nseindia.com`.
-   - Local client libraries often trip on an aggressive timeout limit (e.g., 6 seconds) for multi-megabyte ZIP/DAT archives, triggering false-positive circuit breakers.
+2. **Internal Server-Side Proxy Channel (`/api/zipem`)**:  
+   Discovered in `quick-links.js`, `www.nseindia.com` hosts an internal proxy `/api/zipem?fileURLs=[...]&type=daily` that accepts arbitrary URLs pointing to `nsearchives.nseindia.com`. The NSE web server fetches the requested files over its internal private network (bypassing external runner IP blocks, geo-fencing, and CDN limits), bundles them into a ZIP archive, and streams them back over `www.nseindia.com`.
+3. **Multi-File Batch Bundling**:  
+   Rather than making 5 separate HTTP connections for CM Bhavcopy, FO Bhavcopy, MTO Deliverables, Ban list, and Participant OI, `/api/zipem` can fetch all 5 in **a single 4-second request**, dramatically accelerating ingestion speed.
+4. **Real-Time Publication Oracles (`/api/daily-reports` & `/api/merged-daily-reports`)**:  
+   Covers 11 distinct market segments with real-time JSON catalogs indexed by `fileKey`. They confirm whether today's files are live before scraping, eliminating 404 false alarms.
+5. **Security-Wise Historical API (`/api/historicalOR/generateSecurityWiseHistoricalData`)**:  
+   Directly streams up to **5 continuous years** (1,826 days) of daily OHLCV + Delivery + Trades per stock directly from `www.nseindia.com`, with **zero reliance on `nsearchives`**.
+6. **Client-Side Timeout and Substring Trap in `http_client.py`**:  
+   Requests to `nsearchives` were constrained by an overly aggressive 6.0s timeout. Furthermore, `is_nsearchives = "nsearchives.nseindia.com" in url` checked substring matching across the whole query string, accidentally clamping `/api/zipem` requests that contained archive URLs as parameters.
 
 ---
 
 ## 2. Reverse-Engineering Methodology & Runtime Architecture
 
-We downloaded and analyzed the JavaScript bundles loaded by these pages, specifically:
+We downloaded and analyzed the JavaScript bundles loaded by these pages:
 - [`all-reports.js`](file:///e:/dev/code/bfinance-datalake/.scratch/probe_results/scripts/all-reports.js) (77.4 KB, version `30102026`)
+- [`quick-links.js`](file:///e:/dev/code/bfinance-datalake/.scratch/probe_results/scripts/quick-links.js) (32.1 KB, version `30102026`)
 - [`security-wise-archives.js`](file:///e:/dev/code/bfinance-datalake/.scratch/probe_results/scripts/security-wise-archives.js) (14.8 KB, version `30102026`)
 - [`common.js`](file:///e:/dev/code/bfinance-datalake/.scratch/probe_results/scripts/common.js) (280.3 KB, version `30102026`)
 
 ### System Architecture Flow
 ```
                            +----------------------------+
-                           |     www.nseindia.com       |
+                           |      User / CI Runner      |
                            +--------------+-------------+
                                           |
                 +-------------------------+-------------------------+
                 |                                                   |
-      [JSON Manifest APIs]                                 [Dynamic Data APIs]
+    [Direct Web Gateway]                                  [Dynamic History API]
+    Host: www.nseindia.com                                Host: www.nseindia.com
+    TLS 1.3 / Chrome Impersonation                        TLS 1.3 / Chrome Impersonation
                 |                                                   |
-   /api/daily-reports?key={SEGMENT}           /api/historicalOR/generateSecurityWiseHistoricalData
-   /api/monthly-reports?key={SEGMENT}                               |
-                |                                          (Direct CSV stream up to 5 years,
-    (Provides real-time file catalog:                       zero reliance on nsearchives)
-     CurrentDay, PreviousDay, FutureDay)
-                |
-                v
-   +----------------------------+
-   |  nsearchives.nseindia.com  |
-   +----------------------------+
-     (Underlying static asset
-      storage: CSV, ZIP, DAT)
-```
-
-### Decompiled JavaScript Logic: Report Discovery Loop
-In `all-reports.js` (lines 40–85), when a user loads `/all-reports` or `/all-reports-derivatives`, the page initializes market statuses and dispatches concurrent GET calls:
-
-```javascript
-var symbol = ["CM", "INDEX", "SLBS", "SME", "FO", "COM", "CD", "NBF", "WDM", "CBM", "TRI-PARTY", "EGR"];
-symbol.forEach(function (name) {
-    B.get('/api/daily-reports?key=' + name).then(function (resp) {
-        var respJSON = JSON.parse(resp);
-        // Binds CurrentDay, PreviousDay, FutureDay to the DOM
-        dailyReports = ReportCard({ 
-            data: respJSON.CurrentDay || [], 
-            info: { name: "capital-market", section: name.toLowerCase(), type: "daily-reports" } 
-        });
-        B.render(dailyReports, B.findOne('#cr_' + name.toLowerCase() + '_daily_Current'));
-    });
-});
+        +-------+-------------------------+                         v
+        |                                 |             /api/historicalOR/generateSecurityWiseHistoricalData
+        v                                 v             (Up to 5 years per stock, zero archive dependency)
+ [Manifest & Status APIs]      [Server-Side Zip Proxy]
+ /api/daily-reports?key=...    /api/zipem?fileURLs=[...]
+ /api/merged-daily-reports             |
+        |                      (NSE Internal VPC Fetch)
+        |                                 |
+        v                                 v
++-----------------------------------------------+
+|      Underlying Static Storage Engine         |
+|         nsearchives.nseindia.com              |
++-----------------------------------------------+
 ```
 
 ---
 
-## 3. Channel 1: The Master Daily Reports Manifest API
+## 3. Channel 1: The Internal Server-Side Proxy (`/api/zipem`)
+
+### Decompiled JavaScript Logic:
+In [`quick-links.js`](file:///e:/dev/code/bfinance-datalake/.scratch/probe_results/scripts/quick-links.js), lines 420–465 define how official web downloads are initiated:
+
+```javascript
+function fileDownload(data, type, id, mode) {
+    var downloadData = data;
+    if (downloadData.length) {
+        var zipUrl = void 0, archiveNames = void 0;
+        if (type && (type.toLowerCase() === "daily" || type.toLowerCase() === "monthly")) {
+            archiveNames = downloadData.map(function (e) {
+                return e.link;
+            });
+            zipUrl = "/api/zipem?fileURLs=" + encodeURIComponent(JSON.stringify(archiveNames));
+        } else {
+            archiveNames = downloadData;
+            zipUrl = '/api/reports?archives=' + encodeURIComponent(JSON.stringify(archiveNames));
+            ...
+        }
+        zipUrl += '&type=' + type;
+        if (mode && mode === "single") {
+            zipUrl += '&mode=' + mode;
+        }
+        window.open(zipUrl, '_blank');
+    }
+}
+```
 
 ### Endpoint Specification
 ```http
-GET https://www.nseindia.com/api/daily-reports?key={MARKET_KEY} HTTP/1.1
+GET https://www.nseindia.com/api/zipem?fileURLs={ENCODED_JSON_ARRAY}&type=daily HTTP/1.1
 Host: www.nseindia.com
-Accept: application/json
+Accept: application/zip, */*
 User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36
 Referer: https://www.nseindia.com/all-reports
 ```
 
-### Complete Segment Catalog & Itemized Files
-The API accepts 11 segment keys. Each call returns an explicit JSON object partitioned into `CurrentDay`, `PreviousDay`, and `FutureDay`.
+### Empirical Test Verification
+We systematically tested `/api/zipem` against all major datalake datasets. The results confirmed **100% success** across all categories:
 
+| Target Dataset | Input `nsearchives` URL Passed to `zipem` | HTTP Status | Response Size | Extracted File Inside ZIP |
+| :--- | :--- | :--- | :--- | :--- |
+| **CM UDiFF Bhavcopy** | `.../content/cm/BhavCopy_NSE_CM_0_0_0_20261104_F_0000.csv.zip` | `200 OK` | 207.9 KB | `BhavCopy_NSE_CM_...csv.zip` |
+| **FO UDiFF Bhavcopy** | `.../content/fo/BhavCopy_NSE_FO_0_0_0_20261104_F_0000.csv.zip` | `200 OK` | 1.16 MB | `BhavCopy_NSE_FO_...csv.zip` |
+| **Security Deliverables**| `.../archives/equities/mto/MTO_04112026.DAT` | `200 OK` | 130.1 KB | `MTO_04112026.DAT` |
+| **F&O Security Ban** | `.../archives/fo/sec_ban/fo_secban_05112026.csv` | `200 OK` | 204 B | `fo_secban_05112026.csv` |
+| **Participant-wise OI** | `.../content/nsccl/fao_participant_oi_04112026.csv` | `200 OK` | 1.1 KB | `fao_participant_oi_...csv` |
+| **Listed Equities Master** | `.../content/equities/EQUITY_L.csv` | `200 OK` | 185.9 KB | `EQUITY_L.csv` |
+| **Delisted Equities** | `.../content/equities/delisted.csv` | `200 OK` | 24.8 KB | `delisted.csv` |
+| **Symbol Changes** | `.../content/equities/symbolchange.csv` | `200 OK` | 70.2 KB | `symbolchange.csv` |
+| **Bulk Deals** | `.../content/equities/bulk.csv` | `200 OK` | 8.6 KB | `bulk.csv` |
+| **Block Deals** | `.../content/equities/block.csv` | `200 OK` | 227 B | `block.csv` |
+| **NIFTY Constituents** | `.../content/indices/ind_nifty50list.csv` | `200 OK` | 5.3 KB | `ind_nifty50list.csv` (batch) |
+| **Legacy Bhavcopy (2024)**| `.../content/historical/EQUITIES/2024/JAN/cm05JAN2024bhav.csv.zip` | `200 OK` | 201.2 KB | `cm05JAN2024bhav.csv.zip` |
+| **Legacy Bhavcopy (2023)**| `.../content/historical/EQUITIES/2023/JAN/cm05JAN2023bhav.csv.zip` | `200 OK` | 195.4 KB | `cm05JAN2023bhav.csv.zip` |
+
+### Multi-File Daily Batch Ingestion Benchmark
+When bundling all 5 core daily datasets into a single `/api/zipem` call:
 ```json
-{
-  "currentDate": "05-Nov-2026",
-  "previousDate": "04-Nov-2026",
-  "futureDate": "06-Nov-2026",
-  "CurrentDay": [
-    {
-      "fileHashKey": "CM-FULL-BHAVCOPY-SECURITY-DELIVERABLE-DATA-2",
-      "fileKey": "CM-FULL-BHAVCOPY-SECURITY-DELIVERABLE-DATA",
-      "fileSegment": "CM",
-      "displayName": "Full Bhavcopy and Security Deliverable data",
-      "fileActlName": "sec_bhavdata_full_05112026.csv",
-      "filePath": "https://nsearchives.nseindia.com/products/content/",
-      "tradingDate": "05-Nov-2026",
-      "filePosition": 24,
-      "fileSize": "395.68 KB"
-    }
-  ]
-}
+[
+  "https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_20261105_F_0000.csv.zip",
+  "https://nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_20261105_F_0000.csv.zip",
+  "https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_05112026.csv",
+  "https://nsearchives.nseindia.com/archives/equities/mto/MTO_05112026.DAT",
+  "https://nsearchives.nseindia.com/content/nsccl/fao_participant_oi_05112026.csv"
+]
 ```
+- **Execution Time**: **4.07 seconds** total.
+- **Payload**: 1.99 MB single ZIP archive containing all 5 files.
+- **Zero reliance** on external IP access to `nsearchives.nseindia.com`.
 
-### Itemized Breakdown Across All 11 Segments
-
-#### 1. Capital Market Equities (`key=CM`) — 37 Daily Files
-- **Full Bhavcopy + Delivery**: `sec_bhavdata_full_DDMMYYYY.csv` (~400 KB) — Complete OHLCV, weighted average price, total trades, deliverable quantity, and delivery percentage for all listed equities.
-- **CM UDiFF Common Bhavcopy Final**: `BhavCopy_NSE_CM_0_0_0_YYYYMMDD_F_0000.csv.zip` (~210 KB) — SEBI-mandated standard format.
-- **Security-wise Delivery Positions**: `MTO_DDMMYYYY.DAT` (~130 KB) — Gross delivery quantity and client turnover statistics.
-- **Daily Scrip Volatility**: `CMVOLT_DDMMYYYY.CSV` (~295 KB) — Annualized and daily volatility computed per equity symbol.
-- **Bulk & Block Deals**: `bulk.csv`, `block.csv` — Static snapshots of all transactions exceeding SEBI disclosure thresholds.
-- **Institutional Short Selling**: `shortselling_DDMMYYYY.csv` (~10 KB) — Scrip-wise short positions by institutional and non-institutional participants.
-- **52-Week High / Low**: `CM_52_wk_High_low_DDMMYYYY.csv` (~320 KB) — Historical price extremes.
-- **Price Bands & Circuit Filters**: `sec_list_DDMMYYYY.csv` (~175 KB), `eq_band_changes_DDMMYYYY.csv` — Full tick sizes, upper/lower circuit limits, and dynamic band revisions.
-- **Intra-Day VaR Margin Profiles**: `C_VAR1_DDMMYYYY_1.DAT` to `_6.DAT` (~1.06 MB each) — Begin-of-day through end-of-day Value-at-Risk margins.
-- **Market Activity Report**: `MA_DDMMYY.csv` (~235 KB) — Consolidated exchange turnover statistics.
-
-#### 2. Futures & Options Derivatives (`key=FO`) — 32 Daily Files
-- **F&O UDiFF Common Bhavcopy**: `BhavCopy_NSE_FO_0_0_0_YYYYMMDD_F_0000.csv.zip` (~1.2 MB) — All active Futures and Options contracts, settlement prices, open interest, and turnover.
-- **Participant-wise Open Interest**: `fao_participant_oi_DDMMYYYY.csv` (~1 KB) — Long/short contract breakdowns for `Client`, `DII`, `FII`, and `Pro` across Index Futures, Stock Futures, Index Options, and Stock Options.
-- **Participant-wise Trading Volumes**: `fao_participant_vol_DDMMYYYY.csv` (~1 KB) — Gross traded volume by participant type.
-- **FII Derivatives Statistics**: `fii_stats_DD-Mon-YYYY.xls` (~9 KB) — Buy/sell contracts and value for Foreign Portfolio Investors.
-- **Security Ban Period**: `fo_secban.csv` — Securities currently in F&O ban period (exceeding 95% MWPL).
-- **Daily Settlement Prices**: `FOSett_prce_DDMMYYYY.csv` (~70 KB) — Official Mark-to-Market settlement prices.
-- **Daily Volatility**: `FOVOLT_DDMMYYYY.csv` (~40 KB) — Contract-level volatility metrics.
-- **Market-wide Position Limits & Combined OI**: `combineoi_DDMMYYYY.zip`, `combineoi_deleq_DDMMYYYY.csv`.
-- **Contract Master Files**: `NSE_FO_contract_DDMMYYYY.csv.gz` (~1.84 MB) — Full specification of all traded derivatives contracts.
-
-#### 3. Indices (`key=INDEX`) — 2 Daily Files
-- **Consolidated Indices Daily Snapshot**: `ind_close_all_DDMMYYYY.csv` (~16 KB) — Single file providing Open, High, Low, Close, P/E, P/B, Dividend Yield, and Turnover for **all 120+ Nifty indices** (NIFTY 50, Next 50, Midcap 150, Bank, IT, Sectorals, Thematic, and Strategy indices).
-- **NIFTY 50 Top 10 Holdings**: `top10nifty50_DDMMYY.csv` (~0.4 KB) — Weights and market caps of the top 10 index constituents.
-
-#### 4. Securities Lending & Borrowing (`key=SLBS`) — 5 Daily Files
-- **SLBS Bhavcopy**: `SLBM_BC_DDMMYYYY.DAT` (~42 KB) — Daily lending fees, tenors, and traded volumes.
-- **List of Eligible Securities**: `SLB_ELG_SEC_DDMMYYYY.csv` (~775 KB) — Complete universe of stocks permitted for lending/borrowing.
-- **Daily Open Positions**: `slb_openpos_DDMMYYYY.csv` (~36 KB).
-- **Foreclosure Report**: `Forclosure_SLB_YYYYMMDD.CSV`.
-
-#### 5. SME Platform (`key=SME`) — 2 Daily Files
-- **SME Bhavcopy**: `smeDDMMYYYY.csv` (~81 KB) — Daily OHLCV for SME Emerge-listed securities.
-- **SME Price Bands**: `sme_bands_complete_DDMMYYYY.csv` (~26 KB).
-
-#### 6. Corporate Bond Market (`key=CBM`) — 3 Daily Files
-- **Corporate Bond Daily Trades**: `cbm_trdYYYYMMDD.csv` (~55 KB) — Secondary market executed trades on corporate debentures.
-- **Corporate Bond Security Master**: `Corporate_bond_report_DD-Mon-YYYY.csv` (~615 KB) — Master catalog of all active corporate debt ISINs, coupon rates, maturity dates, and credit ratings.
-- **G-Sec Settlement Order Report**: `GSEC_SettlementOrderReport_DDMMYYYY.csv`.
-
-#### 7. Wholesale Debt Market (`key=WDM`) — 8 Daily Files
-- **Securities Available for Trading**: `wdmlist_DDMMYYYY.csv` (~1.18 MB) — Exhaustive universe of government bonds, treasury bills, and state development loans.
-- **Daily WDM Summary**: `dlyDDMMYYYY.zip` (~105 KB).
-- **WDM SPAN Margins**: `nsccl_d.YYYYMMDD.s.zip`.
-
-#### 8. Tri-Party Repo (`key=TRI-PARTY`) — 1 Daily File
-- **Tri-Party Repo Bhavcopy**: `TRM_BCDDMMYYYY.csv` (~10 KB) — Sovereign repo borrowing rates, collateral haircut schedules, and traded volumes.
-
-#### 9. Electronic Gold Receipts (`key=EGR`) — 7 Daily Files
-- **EGR VaR Margin Profiles**: `E_VAR1_DDMMYYYY_1.DAT` to `_7.DAT` — Daily margin schedules for dematerialized vault-backed bullion receipts.
-
-#### 10. Currency Derivatives (`key=CD`) — 23 Daily Files
-- Full intra-day SPAN margins and volatility reports across USDINR, EURINR, GBPINR, and JPYINR.
-
-#### 11. Commodity Derivatives (`key=COM`) — 11 Daily Files
-- SPAN margins and volatility profiles across Crude Oil, Natural Gas, Gold, and Silver futures and options.
+### Concurrency and Multiplexing Constraints
+Empirical load testing revealed an important operational constraint:
+- **Rapid Sequential Requests**: 5 consecutive calls with 0 delay executed in 1.9s–4.8s each with 0 errors.
+- **Concurrent Multiplexing on a Single HTTP/2 Connection**: Firing 3 separate `zipem` requests simultaneously on the same TLS session triggered Akamai HTTP/2 frame contention, timing out after 20.0s.
+- **Rule**: Always prefer batch bundling in a single `zipem` call, or execute `zipem` requests sequentially.
 
 ---
 
-## 4. Channel 2: The Monthly Reports Manifest API
+## 4. Channel 2: Real-Time Manifest & Publication Catalogs
 
-### Endpoint Specification
+### 1. The Merged Daily Reports API (`/api/merged-daily-reports`)
 ```http
-GET https://www.nseindia.com/api/monthly-reports?key={MARKET_KEY} HTTP/1.1
+GET https://www.nseindia.com/api/merged-daily-reports?key={SEGMENT} HTTP/1.1
 Host: www.nseindia.com
 Accept: application/json
 ```
-Available for `CM`, `FO`, `INDICES`, `SLBS`, `CD`, `COM`, `IRD`, `WDM`, `CBM`, and `EGR`.
+Available for `CM` (37 entries) and `FO` (34 entries). Unlike standard manifests, this endpoint keys every item by its canonical `fileKey`:
 
-### High-Value Monthly Datasets
-- **Trading Member-wise Overall Position Limits**: `tmopl_MonYYYY.csv`
-- **Market-wide Position Limits (MWPL)**: `mpl_MonYYYY.csv`
-- **FII / Mutual Fund Aggregate Exposure Limits**: `fopl_MonYYYY.csv`
-- **Stock Categorization & Impact Cost Benchmarks**: `C_CATG_MonYYYY.T01` (~450 KB)
-- **Monthly SLBS Transaction Register**: `SLB_Transaction_Data_MonYYYY.csv` (~20 KB)
+```json
+{
+  "CM-UDIFF-BHAVCOPY-CSV": {
+    "fileHashKey": "CM-UDIFF-BHAVCOPY-CSV-2",
+    "fileKey": "CM-UDIFF-BHAVCOPY-CSV",
+    "fileSegment": "CM",
+    "displayName": "CM-UDiFF Common Bhavcopy Final (zip)",
+    "fileActlName": "BhavCopy_NSE_CM_0_0_0_20261105_F_0000.csv.zip",
+    "filePath": "https://nsearchives.nseindia.com/content/cm/",
+    "tradingDate": "05-Nov-2026",
+    "fileSize": "204.63 KB"
+  },
+  "CM-BHAVDATA-FULL": {
+    "fileHashKey": "CM-BHAVDATA-FULL-2",
+    "fileKey": "CM-BHAVDATA-FULL",
+    "fileSegment": "CM",
+    "displayName": "Full Bhavcopy and Security Deliverable data",
+    "fileActlName": "sec_bhavdata_full_05112026.csv",
+    "filePath": "https://nsearchives.nseindia.com/products/content/",
+    "tradingDate": "05-Nov-2026",
+    "fileSize": "395.68 KB"
+  }
+}
+```
+
+### 2. Daily Manifest API (`/api/daily-reports?key={SEGMENT}`)
+Covers 11 segments (`CM`, `INDEX`, `SLBS`, `SME`, `FO`, `COM`, `CD`, `WDM`, `CBM`, `TRI-PARTY`, `EGR`). Partitions reports into `CurrentDay`, `PreviousDay`, and `FutureDay`.
+
+### 3. Monthly Manifest API (`/api/monthly-reports?key={SEGMENT}`)
+Provides monthly position limits, settlement statistics, mode of trading, and impact cost files across 10 segments.
 
 ---
 
@@ -231,56 +227,55 @@ Date,Series,Open Price,High Price,Low Price,Close Price,Last Price,Prev Close,To
 05-Nov-2026,EQ,3950.00,3985.00,3925.50,3960.25,3961.00,3945.10,1250430,4945823100.00,45210,782150,62.55
 ```
 
-### Why This Endpoint is Critical for Reliability
-1. **100% Bypass of `nsearchives`**:  
-   Requests terminate on `www.nseindia.com` (which readily responds to standard TLS-impersonated clients).
-2. **5-Year Continuous Ingestion**:  
-   Rather than unzipping 1,250 daily Bhavcopies, 5 years of daily OHLCV and delivery data for a security can be acquired in **one single HTTP request**.
-3. **No Unzipping Overhead**:  
-   Returns clean, pre-parsed CSV text.
-
 ---
 
-## 6. Root Cause Analysis: `nsearchives` Unreachability & Mitigation
+## 6. Root Cause Analysis: `nsearchives` Unreachability & Bugs Identified
 
-Our empirical network probes revealed two distinct reasons why scrapers fail against `nsearchives.nseindia.com`:
+Our empirical testing isolated three distinct failure modes:
 
-### 1. Akamai CDN Edge Geo-Fencing
-- `www.nseindia.com` and `nsearchives.nseindia.com` utilize different Akamai edge security configurations.
-- `www.nseindia.com` allows traffic once primed with standard session cookies (`_abck`, `bm_sz`, `ak_bmsc`).
-- `nsearchives.nseindia.com` enforces strict IP-reputation checks and occasional non-Indian geo-blocking, returning `HTTP 403 Forbidden` or TCP resets on unrecognized cloud IPs.
+### 1. False-Positive Circuit Breaker on Normal `HTTP 404`
+- When running daily pipelines before evening publication (~18:30 IST), `nsearchives.nseindia.com` legitimately responds with `HTTP 404 Not Found`.
+- In `http_client.py`, lines 225–228 incremented `_nsearchives_fail_streak += 1` on any non-200 status code, falsely treating expected 404s as host outages and throwing `RuntimeError("nsearchives.nseindia.com is unreachable from this runner IP")`.
+- **Resolution**: Reset fail streak to 0 on both `200` and `404`.
 
-### 2. Aggressive Timeout Traps on Multi-Megabyte Archives
-- In `http_client.py`, requests to `nsearchives` were constrained by:
+### 2. URL Substring Matching Bug Clamping Timeouts
+- In `http_client.py`:
   ```python
-  if is_nsearchives:
-      timeout = min(timeout, 6.0)
+  is_nsearchives = "nsearchives.nseindia.com" in url
   ```
-- While small CSV files (~30 KB) download in under 500 ms, multi-megabyte files (such as F&O Bhavcopy ZIPs at 1.2 MB or intra-day DAT files at 10 MB) frequently require 7–12 seconds over international connections.
-- The 6.0-second cap caused legitimate downloads to abort with `curl: (28) Operation timed out after 6004 milliseconds`, falsely incrementing `self._nsearchives_fail_streak` and prematurely tripping the host circuit breaker.
+- When using `/api/zipem?fileURLs=["https://nsearchives.nseindia.com/..."]`, the URL string contained `nsearchives.nseindia.com` in the query parameter.
+- This caused `http_client.py` to mistake a `www.nseindia.com` request for a direct `nsearchives` request, incorrectly clamping the timeout to `min(timeout, 6.0)`. Multi-megabyte zips aborted after 6,005 ms.
+- **Resolution**: Match the actual hostname via `urllib.parse.urlsplit(url).netloc == "nsearchives.nseindia.com"`.
+
+### 3. Akamai CDN Edge Geo-Fencing on Cloud IPs
+- `nsearchives.nseindia.com` enforces independent Akamai edge policies that reject datacenter IPs (AWS, GitHub Actions, DigitalOcean).
+- By routing archive requests through `www.nseindia.com/api/zipem?fileURLs=[...]`, downloads originate from NSE's internal datacenter VPC, bypassing external CDN restrictions completely.
 
 ---
 
-## 7. Concrete Integration Architecture for `bfinance-datalake`
+## 7. Concrete Implementation Architecture for `bfinance-datalake`
 
-### Blueprint 1: The "Publication Oracle" Pattern
-To eliminate false-positive `HTTP 404` errors before evening publication (~18:30 IST), scrapers should query the daily manifest before requesting files:
+### Architecture 1: Fallback Gateway Strategy for Bhavcopies
+For daily and backfill Bhavcopy ingestion, implement dual-resolution:
+1. **Primary**: Attempt direct fetch from `nsearchives.nseindia.com`.
+2. **Fallback**: If `nsearchives` times out or returns `HTTP 403`, immediately resolve the same URL via `/api/zipem?fileURLs=[<URL>]&type=daily` on `www.nseindia.com`.
+3. **Extraction**: If fetched via `zipem`, extract the nested inner file from the outer zip stream.
 
+### Architecture 2: The Publication Oracle
+Before attempting to fetch today's EOD files in `daily` workflow:
 ```python
-async def is_eod_published_today(http: ResilientHTTPClient, target_date: date) -> bool:
-    """Check www.nseindia.com manifest to confirm if today's Bhavcopy is published."""
-    url = "https://www.nseindia.com/api/daily-reports?key=CM"
-    resp = await http.get(url, headers=NSE_API_HEADERS, prime_nse=True)
+async def check_eod_publication_status(http: ResilientHTTPClient, target_date: date) -> dict[str, bool]:
+    """Query merged-daily-reports to check if today's Bhavcopies are live."""
+    resp = await http.get("https://www.nseindia.com/api/merged-daily-reports?key=CM", prime_nse=True)
     if resp.status_code != 200:
-        return False
-    manifest = resp.json()
-    expected_str = target_date.strftime("%d-%b-%Y")
-    return manifest.get("currentDate") == expected_str
+        return {"cm": False, "fo": False}
+    data = resp.json()
+    expected_dstr = target_date.strftime("%d%m%Y")
+    cm_ready = expected_dstr in data.get("CM-UDIFF-BHAVCOPY-CSV", {}).get("fileActlName", "")
+    return {"cm": cm_ready}
 ```
 
-### Blueprint 2: Sourcing Newly Discovered High-Value Feeds
-The discovery of `daily-reports` provides access to several datasets not yet ingested into `bfinance-datalake`:
-
+### Architecture 3: High-Value New Feeds from Manifests
 | Dataset | Proposed Storage Path | Source File in Manifest | Strategic Value |
 | :--- | :--- | :--- | :--- |
 | **Corporate Bond Trades** | `data/debt/cbm_trades_YYYY.parquet` | `cbm_trdYYYYMMDD.csv` | Secondary market corporate debt pricing and liquidity metrics. |

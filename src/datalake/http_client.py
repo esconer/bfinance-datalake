@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json as _json
 import logging
+import posixpath
+import urllib.parse
+import zipfile
 from dataclasses import dataclass, field
 
 try:
@@ -152,13 +156,17 @@ class ResilientHTTPClient:
         prime_nse: bool = False,
         prime_bse: bool = False,
         timeout: float = 60.0,
+        fallback_proxy: bool = True,
     ):
-        is_nsearchives = "nsearchives.nseindia.com" in url
+        parsed_url = urllib.parse.urlsplit(url)
+        is_nsearchives = parsed_url.netloc == "nsearchives.nseindia.com"
         if is_nsearchives:
             if self._nsearchives_fail_streak >= 8:
+                if fallback_proxy:
+                    return await self.fetch_archive_via_proxy(url, timeout=timeout)
                 raise RuntimeError("nsearchives.nseindia.com is unreachable from this runner IP")
             retries = min(retries, 2)
-            timeout = min(timeout, 6.0)
+            timeout = min(timeout, 15.0)
 
         base_headers = headers or ARCHIVE_HEADERS
         is_exchange = any(k in url for k in ("nseindia.com", "bseindia.com", "niftyindices.com"))
@@ -202,6 +210,10 @@ class ResilientHTTPClient:
                     raise RuntimeError("curl_cffi or httpx required for live network calls")
 
                 if resp.status_code in (401, 403):
+                    if is_nsearchives and fallback_proxy:
+                        proxy_resp = await self.fetch_archive_via_proxy(url, timeout=timeout)
+                        if proxy_resp.status_code in (200, 404):
+                            return proxy_resp
                     if prime_nse or "nseindia.com" in url:
                         self._nse_primed = False
                         await asyncio.sleep(0.5 if is_nsearchives else 1.5 * (attempt + 1))
@@ -238,9 +250,58 @@ class ResilientHTTPClient:
                 await asyncio.sleep(0.5 if is_nsearchives else 1.5 * (2 ** attempt))
         if is_nsearchives:
             self._nsearchives_fail_streak += 1
+            if fallback_proxy:
+                try:
+                    proxy_resp = await self.fetch_archive_via_proxy(url, timeout=timeout)
+                    if proxy_resp.status_code in (200, 404):
+                        return proxy_resp
+                except Exception as proxy_exc:
+                    logger.debug("Proxy fallback error for %s: %s", url, proxy_exc)
         if last_exc:
             raise last_exc
         raise RuntimeError(f"Exhausted retries for {url}")
+
+    async def fetch_archive_via_proxy(
+        self,
+        target_url: str,
+        timeout: float = 35.0,
+    ) -> SimpleHTTPResponse:
+        """Fetch a file hosted on nsearchives.nseindia.com via www.nseindia.com/api/zipem proxy."""
+        encoded_links = urllib.parse.quote(_json.dumps([target_url]))
+        proxy_url = f"https://www.nseindia.com/api/zipem?fileURLs={encoded_links}&type=daily"
+        resp = await self.get(
+            proxy_url,
+            headers=NSE_API_HEADERS,
+            prime_nse=True,
+            timeout=max(timeout, 25.0),
+            fallback_proxy=False,
+        )
+        if resp.status_code == 200:
+            try:
+                with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                    namelist = zf.namelist()
+                    if not namelist:
+                        return SimpleHTTPResponse(404, b"Empty zip archive returned by proxy", {})
+                    target_filename = posixpath.basename(urllib.parse.urlsplit(target_url).path)
+                    matched_name = next((n for n in namelist if n == target_filename), namelist[0])
+                    inner_bytes = zf.read(matched_name)
+                    self._nsearchives_fail_streak = 0
+                    return SimpleHTTPResponse(
+                        status_code=200,
+                        content=inner_bytes,
+                        headers={"content-type": "application/octet-stream"},
+                    )
+            except zipfile.BadZipFile:
+                return resp
+        elif resp.status_code == 500:
+            try:
+                payload = _json.loads(resp.text)
+                if "Files not available" in payload.get("error", ""):
+                    self._nsearchives_fail_streak = 0
+                    return SimpleHTTPResponse(404, resp.content, resp.headers)
+            except Exception:
+                pass
+        return resp
 
     async def post(
         self,
