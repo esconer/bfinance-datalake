@@ -94,13 +94,30 @@ class DealsAndDocumentsScraper:
             ("BULK", "https://nsearchives.nseindia.com/content/equities/bulk.csv"),
             ("BLOCK", "https://nsearchives.nseindia.com/content/equities/block.csv"),
         ):
+            raw_df = pd.DataFrame()
             try:
                 resp = await self.http.get(url, headers=ARCHIVE_HEADERS)
-                if resp.status_code != 200 or resp.text.lstrip().startswith("<"):
-                    continue
-                raw_df = pd.read_csv(io.StringIO(resp.text), on_bad_lines="skip")
+                if resp.status_code == 200 and not resp.text.lstrip().startswith("<"):
+                    raw_df = pd.read_csv(io.StringIO(resp.text), on_bad_lines="skip")
             except Exception as exc:
                 logger.warning("[NSE %s Deals] Archive fetch skipped: %s", deal_type, exc)
+
+            # Dynamic endpoint fallback if static archive CSV returned empty
+            if raw_df.empty:
+                today_str = today_ist().strftime("%d-%m-%Y")
+                opt_type = "bulk_deals" if deal_type == "BULK" else "block_deals"
+                dyn_url = (
+                    f"https://www.nseindia.com/api/historicalOR/bulk-block-short-deals"
+                    f"?optionType={opt_type}&from={today_str}&to={today_str}&csv=true"
+                )
+                try:
+                    d_resp = await self.http.get(dyn_url, headers=NSE_API_HEADERS, prime_nse=True)
+                    if d_resp.status_code == 200 and not d_resp.text.lstrip().startswith("<"):
+                        raw_df = pd.read_csv(io.StringIO(d_resp.text), on_bad_lines="skip")
+                except Exception as dyn_exc:
+                    logger.debug("[NSE %s Dynamic Deals Fallback] %s", deal_type, dyn_exc)
+
+            if raw_df.empty:
                 continue
             df = _normalize_deals_frame(raw_df, deal_type=deal_type, exchange="NSE")
             if df.empty:
@@ -112,7 +129,32 @@ class DealsAndDocumentsScraper:
                 dedup_cols=["Date", "Exchange", "DealType", "Symbol", "Client Name", "Buy/Sell", "Quantity Traded"],
                 sort_cols=["Symbol", "Date"],
             )
-            self.state.record(f"nse_{deal_type.lower()}_deals", today_ist().isoformat(), "OK", len(df), resp.content, url)
+            self.state.record(f"nse_{deal_type.lower()}_deals", today_ist().isoformat(), "OK", len(df), url=url)
+
+    async def sync_short_selling(self, target_date: date | None = None) -> None:
+        """Syncs daily NSE institutional and retail short selling disclosures."""
+        d = target_date or today_ist()
+        d_str = d.strftime("%d%m%Y")
+        url = f"https://nsearchives.nseindia.com/archives/equities/shortSelling/shortselling_{d_str}.csv"
+        try:
+            resp = await self.http.get(url, headers=ARCHIVE_HEADERS)
+            if resp.status_code != 200 or not resp.text.strip() or resp.text.lstrip().startswith("<"):
+                return
+            df = pd.read_csv(io.StringIO(resp.text), on_bad_lines="skip")
+            df.columns = [c.strip() for c in df.columns]
+            if df.empty:
+                return
+            df["Date"] = pd.Timestamp(d)
+            target = self.cfg.root_dir / "deals" / "short_selling.parquet"
+            upsert_parquet_partition(
+                df,
+                target,
+                dedup_cols=["Date", "Symbol", "Client Name"] if "Client Name" in df.columns else ["Date", "Symbol"],
+                sort_cols=["Symbol", "Date"],
+            )
+            self.state.record("nse_short_selling", d.isoformat(), "OK", len(df), resp.content, url)
+        except Exception as exc:
+            logger.debug("[NSE Short Selling %s] Skipped: %s", d, exc)
 
     async def backfill_historical_bulk_block_deals(
         self, start_year: int = 2005, end_year: int | None = None, force: bool = False

@@ -730,6 +730,93 @@ def test_nsearchives_proxy_fallback_and_extraction():
     assert res_xml.content == xml_content
 
 
+def test_nse_specific_extensions_and_bse_separation():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = LakeConfig(root_dir=Path(tmpdir))
+        cfg.ensure_dirs()
+        state = StateStore(cfg.state_db_path)
+
+        pre_open_json = json.dumps({
+            "data": [{
+                "metadata": {
+                    "symbol": "RELIANCE",
+                    "series": "EQ",
+                    "identifier": "INE002A01018",
+                    "lastPrice": 2500.5,
+                    "yearHigh": 2600.0,
+                    "yearLow": 2100.0,
+                },
+                "detail": {
+                    "preOpenMarket": {
+                        "totalTradedVolume": 50000,
+                    }
+                }
+            }]
+        }).encode("utf-8")
+
+        mock_http = MagicMock()
+        async def mock_get(url, **kwargs):
+            if "market-data-pre-open" in url:
+                return SimpleHTTPResponse(200, pre_open_json)
+            if "equity-stock-indices" in url:
+                idx_json = json.dumps({
+                    "data": [
+                        {"symbol": "NIFTY 50"},
+                        {
+                            "symbol": "TCS",
+                            "series": "EQ",
+                            "open": 3950.0,
+                            "dayHigh": 3980.0,
+                            "dayLow": 3920.0,
+                            "lastPrice": 3960.0,
+                            "totalTradedVolume": 100000,
+                            "totalTradedValue": 396000000.0,
+                            "nearWKH": 2.5,
+                            "nearWKL": -15.0,
+                        }
+                    ]
+                }).encode("utf-8")
+                return SimpleHTTPResponse(200, idx_json)
+            if "shortSelling" in url:
+                short_csv = b"Symbol,Security Name,Quantity Traded\nTCS,Tata Consultancy Services,5000\n"
+                return SimpleHTTPResponse(200, short_csv)
+            if "api.bseindia.com" in url:
+                # Assert BSE requests remain pure and unproxied
+                return SimpleHTTPResponse(200, b"[]")
+            return SimpleHTTPResponse(404, b"Not Found")
+
+        mock_http.get = AsyncMock(side_effect=mock_get)
+
+        # 1. Test Universe Pre-Open Market Sync
+        univ = UniverseAndActionsScraper(mock_http, state, cfg)
+        asyncio.run(univ.sync_security_masters())
+        po_path = cfg.root_dir / "universe" / "nse_market_universe.parquet"
+        assert po_path.exists()
+        po_df = read_table_safe(po_path)
+        assert len(po_df) == 1
+        assert po_df.iloc[0]["Symbol"] == "RELIANCE"
+        assert po_df.iloc[0]["YearHigh"] == 2600.0
+
+        # 2. Test Live Index Constituents Sync
+        indices = IndicesScraper(mock_http, state, cfg)
+        asyncio.run(indices.sync_live_index_constituents(indices=("NIFTY 50",)))
+        idx_path = cfg.root_dir / "indices" / "index_constituents_live.parquet"
+        assert idx_path.exists()
+        idx_df = read_table_safe(idx_path)
+        assert len(idx_df) == 1
+        assert idx_df.iloc[0]["Symbol"] == "TCS"
+        assert idx_df.iloc[0]["LastPrice"] == 3960.0
+
+        # 3. Test Short Selling Sync
+        dd = DealsAndDocumentsScraper(mock_http, state, cfg)
+        asyncio.run(dd.sync_short_selling(date(2026, 11, 5)))
+        ss_path = cfg.root_dir / "deals" / "short_selling.parquet"
+        assert ss_path.exists()
+        ss_df = read_table_safe(ss_path)
+        assert len(ss_df) == 1
+        assert ss_df.iloc[0]["Symbol"] == "TCS"
+
+
 if __name__ == "__main__":
     test_corporate_action_regex_parser()
     test_repair_ohlc_and_bse_debt_filter()
@@ -746,4 +833,5 @@ if __name__ == "__main__":
     test_after_fix_2_audit_suite()
     test_nsearchives_resilience_and_uncaught_guards()
     test_nsearchives_proxy_fallback_and_extraction()
+    test_nse_specific_extensions_and_bse_separation()
     print("ALL OFFLINE UNIT & INTEGRATION TESTS PASSED!")

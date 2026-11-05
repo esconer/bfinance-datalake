@@ -398,3 +398,48 @@ class IndicesScraper:
             dedup_cols=["Date", "IndexName"],
             sort_cols=["IndexName", "Date"],
         )
+
+    async def sync_live_index_constituents(
+        self, indices: tuple[str, ...] = ("NIFTY 50", "NIFTY NEXT 50", "NIFTY BANK", "NIFTY IT")
+    ) -> None:
+        """Fetches live constituent weights, valuation ratios, and pricing for key Nifty indices."""
+        frames = []
+        today = today_ist()
+        for idx in indices:
+            url = f"https://www.nseindia.com/api/equity-stock-indices?index={quote(idx)}"
+            try:
+                resp = await self.http.get(url, headers=NSE_API_HEADERS, prime_nse=True)
+                if resp.status_code != 200 or not resp.text.lstrip().startswith("{"):
+                    continue
+                data = resp.json().get("data", [])
+                if isinstance(data, list) and len(data) > 1:
+                    for it in data[1:]:
+                        sym = str(it.get("symbol") or "").strip().upper()
+                        if sym:
+                            frames.append({
+                                "IndexName": idx,
+                                "Symbol": sym,
+                                "Series": str(it.get("series") or "EQ").strip().upper(),
+                                "Open": pd.to_numeric(it.get("open"), errors="coerce"),
+                                "High": pd.to_numeric(it.get("dayHigh"), errors="coerce"),
+                                "Low": pd.to_numeric(it.get("dayLow"), errors="coerce"),
+                                "LastPrice": pd.to_numeric(it.get("lastPrice"), errors="coerce"),
+                                "TotalTradedVolume": pd.to_numeric(it.get("totalTradedVolume"), errors="coerce"),
+                                "TotalTradedValue": pd.to_numeric(it.get("totalTradedValue"), errors="coerce"),
+                                "NearWKH": pd.to_numeric(it.get("nearWKH"), errors="coerce"),
+                                "NearWKL": pd.to_numeric(it.get("nearWKL"), errors="coerce"),
+                                "Date": pd.Timestamp(today),
+                            })
+            except Exception as exc:
+                logger.debug("[Live Index Constituents %s] Skipped: %s", idx, exc)
+
+        if frames:
+            df = pd.DataFrame(frames)
+            target = self.cfg.root_dir / "indices" / "index_constituents_live.parquet"
+            upsert_parquet_partition(
+                df,
+                target,
+                dedup_cols=["Date", "IndexName", "Symbol"],
+                sort_cols=["IndexName", "Symbol", "Date"],
+            )
+            self.state.record("live_index_constituents", today.isoformat(), "OK", len(df))

@@ -195,6 +195,38 @@ class UniverseAndActionsScraper:
         except Exception as exc:
             logger.warning("[Symbol Changes] Skipped: %s", exc)
 
+        # NSE-only: Enriched market universe with 52W high/low and pre-open volumes
+        try:
+            po_resp = await self.http.get(
+                "https://www.nseindia.com/api/market-data-pre-open?key=ALL",
+                headers=NSE_API_HEADERS,
+                prime_nse=True,
+            )
+            if po_resp.status_code == 200 and po_resp.text.lstrip().startswith("{"):
+                po_data = po_resp.json().get("data", [])
+                if isinstance(po_data, list) and po_data:
+                    po_rows = []
+                    for it in po_data:
+                        meta = it.get("metadata", {})
+                        det = it.get("detail", {}).get("preOpenMarket", {})
+                        sym = str(meta.get("symbol") or "").strip().upper()
+                        if sym:
+                            po_rows.append({
+                                "Symbol": sym,
+                                "Series": str(meta.get("series") or "EQ").strip().upper(),
+                                "ISIN": str(meta.get("identifier") or "").strip().upper(),
+                                "LastPrice": pd.to_numeric(meta.get("lastPrice"), errors="coerce"),
+                                "YearHigh": pd.to_numeric(meta.get("yearHigh"), errors="coerce"),
+                                "YearLow": pd.to_numeric(meta.get("yearLow"), errors="coerce"),
+                                "PreOpenVolume": pd.to_numeric(det.get("totalTradedVolume"), errors="coerce"),
+                            })
+                    if po_rows:
+                        po_df = pd.DataFrame(po_rows)
+                        write_parquet_atomic(po_df, self.cfg.root_dir / "universe" / "nse_market_universe.parquet")
+                        self.state.record("security_master", "nse_market_universe", "OK", len(po_df))
+        except Exception as exc:
+            logger.warning("[NSE Market Universe] Skipped: %s", exc)
+
         bse_frames = []
         for status in ("Active", "Suspended"):
             bse_url = (
