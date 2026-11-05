@@ -167,27 +167,33 @@ class UniverseAndActionsScraper:
             ("nse_etf_master.parquet", "https://nsearchives.nseindia.com/content/equities/eq_etfseclist.csv"),
             ("nse_delisted_master.parquet", "https://nsearchives.nseindia.com/content/equities/delisted.csv"),
         ):
-            resp = await self.http.get(url, headers=ARCHIVE_HEADERS)
-            if resp.status_code == 200:
-                df = pd.read_csv(io.StringIO(resp.text), on_bad_lines="skip")
-                df.columns = [c.strip() for c in df.columns]
-                write_parquet_atomic(df, self.cfg.root_dir / "universe" / name)
-                self.state.record("security_master", name, "OK", len(df), resp.content, url)
+            try:
+                resp = await self.http.get(url, headers=ARCHIVE_HEADERS)
+                if resp.status_code == 200 and not resp.text.lstrip().startswith("<"):
+                    df = pd.read_csv(io.StringIO(resp.text), on_bad_lines="skip")
+                    df.columns = [c.strip() for c in df.columns]
+                    write_parquet_atomic(df, self.cfg.root_dir / "universe" / name)
+                    self.state.record("security_master", name, "OK", len(df), resp.content, url)
+            except Exception as exc:
+                logger.warning("[Security Master %s] Skipped: %s", name, exc)
 
         sym_chg_url = "https://nsearchives.nseindia.com/content/equities/symbolchange.csv"
-        sc_resp = await self.http.get(sym_chg_url, headers=ARCHIVE_HEADERS)
-        if sc_resp.status_code == 200:
-            sc_df = pd.read_csv(
-                io.StringIO(sc_resp.text),
-                names=["CompanyName", "OldSymbol", "NewSymbol", "ChangeDate"],
-                on_bad_lines="skip",
-            )
-            for c in ("OldSymbol", "NewSymbol"):
-                sc_df[c] = sc_df[c].astype(str).str.strip().str.upper()
-            sc_df["ChangeDate"] = pd.to_datetime(sc_df["ChangeDate"], format="%d-%b-%Y", errors="coerce")
-            sc_df = sc_df.dropna(subset=["ChangeDate"])
-            write_parquet_atomic(sc_df, self.cfg.root_dir / "universe" / "nse_symbol_changes.parquet")
-            self.state.record("security_master", "nse_symbol_changes", "OK", len(sc_df), sc_resp.content, sym_chg_url)
+        try:
+            sc_resp = await self.http.get(sym_chg_url, headers=ARCHIVE_HEADERS)
+            if sc_resp.status_code == 200 and not sc_resp.text.lstrip().startswith("<"):
+                sc_df = pd.read_csv(
+                    io.StringIO(sc_resp.text),
+                    names=["CompanyName", "OldSymbol", "NewSymbol", "ChangeDate"],
+                    on_bad_lines="skip",
+                )
+                for c in ("OldSymbol", "NewSymbol"):
+                    sc_df[c] = sc_df[c].astype(str).str.strip().str.upper()
+                sc_df["ChangeDate"] = pd.to_datetime(sc_df["ChangeDate"], format="%d-%b-%Y", errors="coerce")
+                sc_df = sc_df.dropna(subset=["ChangeDate"])
+                write_parquet_atomic(sc_df, self.cfg.root_dir / "universe" / "nse_symbol_changes.parquet")
+                self.state.record("security_master", "nse_symbol_changes", "OK", len(sc_df), sc_resp.content, sym_chg_url)
+        except Exception as exc:
+            logger.warning("[Symbol Changes] Skipped: %s", exc)
 
         bse_frames = []
         for status in ("Active", "Suspended"):
@@ -195,11 +201,14 @@ class UniverseAndActionsScraper:
                 "https://api.bseindia.com/BseIndiaAPI/api/ListofScripData/w"
                 f"?Group=&Scripcode=&industry=&segment=Equity&status={status}"
             )
-            b_resp = await self.http.get(bse_url, headers=BSE_API_HEADERS)
-            if b_resp.status_code == 200 and b_resp.text.lstrip().startswith("["):
-                payload = b_resp.json()
-                if isinstance(payload, list) and payload:
-                    bse_frames.append(pd.DataFrame(payload).assign(Status=status))
+            try:
+                b_resp = await self.http.get(bse_url, headers=BSE_API_HEADERS)
+                if b_resp.status_code == 200 and b_resp.text.lstrip().startswith("["):
+                    payload = b_resp.json()
+                    if isinstance(payload, list) and payload:
+                        bse_frames.append(pd.DataFrame(payload).assign(Status=status))
+            except Exception as exc:
+                logger.warning("[BSE Scrip Master %s] Skipped: %s", status, exc)
 
         if bse_frames:
             bse_df = pd.concat(bse_frames, ignore_index=True)
@@ -209,13 +218,16 @@ class UniverseAndActionsScraper:
         today = today_ist()
         const_frames = []
         for idx_name, url in NIFTY_CONSTITUENT_URLS.items():
-            c_resp = await self.http.get(url, headers=ARCHIVE_HEADERS)
-            if c_resp.status_code == 200:
-                cdf = pd.read_csv(io.StringIO(c_resp.text))
-                cdf.columns = [c.strip() for c in cdf.columns]
-                cdf["IndexName"] = idx_name
-                cdf["SnapshotDate"] = pd.Timestamp(today)
-                const_frames.append(cdf)
+            try:
+                c_resp = await self.http.get(url, headers=ARCHIVE_HEADERS)
+                if c_resp.status_code == 200 and not c_resp.text.lstrip().startswith("<"):
+                    cdf = pd.read_csv(io.StringIO(c_resp.text))
+                    cdf.columns = [c.strip() for c in cdf.columns]
+                    cdf["IndexName"] = idx_name
+                    cdf["SnapshotDate"] = pd.Timestamp(today)
+                    const_frames.append(cdf)
+            except Exception as exc:
+                logger.warning("[Nifty Constituents %s] Skipped: %s", idx_name, exc)
 
         if const_frames:
             target = self.cfg.root_dir / "universe" / "nifty_constituents_pit.parquet"

@@ -94,10 +94,14 @@ class DealsAndDocumentsScraper:
             ("BULK", "https://nsearchives.nseindia.com/content/equities/bulk.csv"),
             ("BLOCK", "https://nsearchives.nseindia.com/content/equities/block.csv"),
         ):
-            resp = await self.http.get(url, headers=ARCHIVE_HEADERS)
-            if resp.status_code != 200 or resp.text.lstrip().startswith("<"):
+            try:
+                resp = await self.http.get(url, headers=ARCHIVE_HEADERS)
+                if resp.status_code != 200 or resp.text.lstrip().startswith("<"):
+                    continue
+                raw_df = pd.read_csv(io.StringIO(resp.text), on_bad_lines="skip")
+            except Exception as exc:
+                logger.warning("[NSE %s Deals] Archive fetch skipped: %s", deal_type, exc)
                 continue
-            raw_df = pd.read_csv(io.StringIO(resp.text), on_bad_lines="skip")
             df = _normalize_deals_frame(raw_df, deal_type=deal_type, exchange="NSE")
             if df.empty:
                 continue

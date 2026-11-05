@@ -607,6 +607,75 @@ def test_after_fix_2_audit_suite():
         assert manifest["latest_dates"]["equities/nse_cm_2026.parquet"] == "2026-02-15"
 
 
+def test_nsearchives_resilience_and_uncaught_guards():
+    from unittest.mock import AsyncMock, MagicMock
+    from datalake.http_client import ResilientHTTPClient
+
+    # 1. Verify 404 responses from nsearchives reset fail streak to 0 and do not trip circuit breaker
+    client = ResilientHTTPClient()
+    mock_404 = MagicMock(status_code=404, content=b"Not Found", headers={})
+    if client.curl_session is not None:
+        client.curl_session.get = AsyncMock(return_value=mock_404)
+    if client.client is not None:
+        client.client.get = AsyncMock(return_value=mock_404)
+
+    url = "https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_05112026.csv"
+    for _ in range(7):
+        resp = asyncio.run(client.get(url))
+        assert resp.status_code == 404
+        assert client._nsearchives_fail_streak == 0, f"Expected streak 0 on 404, got {client._nsearchives_fail_streak}"
+
+    # Verify that fail streak increments on server error / network failure and trips at >= 8
+    mock_410 = MagicMock(status_code=410, content=b"Gone", headers={})
+    if client.curl_session is not None:
+        client.curl_session.get = AsyncMock(return_value=mock_410)
+    if client.client is not None:
+        client.client.get = AsyncMock(return_value=mock_410)
+
+    # Trigger failures until streak hits 8
+    client._nsearchives_fail_streak = 7
+    # One more non-200/404 response
+    asyncio.run(client.get(url))
+    assert client._nsearchives_fail_streak >= 8
+
+    # Next call must raise RuntimeError circuit breaker
+    tripped = False
+    try:
+        asyncio.run(client.get(url))
+    except RuntimeError as exc:
+        tripped = True
+        assert "unreachable from this runner IP" in str(exc)
+    assert tripped, "Circuit breaker should trip when _nsearchives_fail_streak >= 8"
+
+    # 2. Verify DealsAndDocumentsScraper.sync_bulk_and_block_deals survives unreachable archive host
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = LakeConfig(root_dir=Path(tmpdir))
+        cfg.ensure_dirs()
+        state = StateStore(cfg.state_db_path)
+
+        failing_http = MagicMock()
+        failing_http.get = AsyncMock(side_effect=RuntimeError("nsearchives.nseindia.com is unreachable from this runner IP"))
+
+        dd = DealsAndDocumentsScraper(failing_http, state, cfg)
+        # Must not raise RuntimeError
+        asyncio.run(dd.sync_bulk_and_block_deals())
+
+        # 3. Verify UniverseAndActionsScraper.sync_security_masters survives unreachable archive host & HTML error responses
+        univ = UniverseAndActionsScraper(failing_http, state, cfg)
+        # Must not raise RuntimeError
+        asyncio.run(univ.sync_security_masters())
+
+        # Also test with HTML error page response (e.g. 200 with HTML)
+        html_http = MagicMock()
+        html_http.get = AsyncMock(return_value=SimpleHTTPResponse(
+            status_code=200,
+            content=b"<!DOCTYPE html><html><body>Access Denied</body></html>",
+            headers={"Content-Type": "text/html"}
+        ))
+        univ_html = UniverseAndActionsScraper(html_http, state, cfg)
+        asyncio.run(univ_html.sync_security_masters())
+
+
 if __name__ == "__main__":
     test_corporate_action_regex_parser()
     test_repair_ohlc_and_bse_debt_filter()
@@ -621,4 +690,5 @@ if __name__ == "__main__":
     test_pass_2_audit_suite()
     test_pass_3_audit_suite()
     test_after_fix_2_audit_suite()
+    test_nsearchives_resilience_and_uncaught_guards()
     print("ALL OFFLINE UNIT & INTEGRATION TESTS PASSED!")

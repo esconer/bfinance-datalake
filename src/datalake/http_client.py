@@ -155,7 +155,7 @@ class ResilientHTTPClient:
     ):
         is_nsearchives = "nsearchives.nseindia.com" in url
         if is_nsearchives:
-            if self._nsearchives_fail_streak >= 3:
+            if self._nsearchives_fail_streak >= 8:
                 raise RuntimeError("nsearchives.nseindia.com is unreachable from this runner IP")
             retries = min(retries, 2)
             timeout = min(timeout, 6.0)
@@ -225,7 +225,7 @@ class ResilientHTTPClient:
                     )
 
                 if is_nsearchives:
-                    if resp.status_code == 200:
+                    if resp.status_code in (200, 404):
                         self._nsearchives_fail_streak = 0
                     else:
                         self._nsearchives_fail_streak += 1
