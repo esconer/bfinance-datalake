@@ -22,7 +22,7 @@ from datalake.scrapers.indices import IndicesScraper
 from datalake.scrapers.universe_actions import UniverseAndActionsScraper, parse_action_purpose
 from datalake.scrapers.xbrl import XBRLScraper
 from datalake.state import StateStore
-from datalake.storage import read_table_safe, sanitize_for_parquet, write_parquet_atomic
+from datalake.storage import read_table_safe, sanitize_for_parquet, upsert_parquet_partition, write_parquet_atomic
 from datalake.symbols import SymbolRenameResolver
 
 
@@ -799,6 +799,114 @@ def test_nse_specific_extensions_and_bse_separation():
                     "unchanged": 0,
                     "perChange30d": -0.5,
                     "perChange365d": 15.2,
+                },
+                {
+                    "key": "THEMATIC INDICES",
+                    "index": "NIFTY SME EMERGE",
+                    "indexSymbol": "NIFTY SME EMERGE",
+                    "last": 14800.0,
+                    "variation": 120.0,
+                    "percentChange": 0.82,
+                    "open": 14700.0,
+                    "high": 14850.0,
+                    "low": 14650.0,
+                    "previousClose": 14680.0,
+                    "yearHigh": 16000.0,
+                    "yearLow": 11000.0,
+                    "pe": 0,
+                    "pb": 0,
+                    "dy": 0,
+                    "advances": 40,
+                    "declines": 20,
+                    "unchanged": 5,
+                    "perChange30d": 2.5,
+                    "perChange365d": 35.0,
+                },
+                {
+                    "key": "BROAD MARKET INDICES",
+                    "index": "INDIA VIX",
+                    "indexSymbol": "INDIA VIX",
+                    "last": 15.5,
+                    "variation": -0.4,
+                    "percentChange": -2.5,
+                    "open": 15.8,
+                    "high": 16.0,
+                    "low": 15.2,
+                    "previousClose": 15.9,
+                    "yearHigh": 24.5,
+                    "yearLow": 10.1,
+                    "pe": 0,
+                    "pb": 0,
+                    "dy": 0,
+                    "advances": None,
+                    "declines": None,
+                    "unchanged": None,
+                    "perChange30d": -5.0,
+                    "perChange365d": 10.0,
+                },
+                {
+                    "key": "FIXED INCOME INDICES",
+                    "index": "NIFTY 10 YR BENCHMARK G-SEC",
+                    "indexSymbol": "NIFTY GS 10YR",
+                    "last": 2660.0,
+                    "variation": 1.5,
+                    "percentChange": 0.06,
+                    "open": 2658.0,
+                    "high": 2662.0,
+                    "low": 2657.0,
+                    "previousClose": 2658.5,
+                    "yearHigh": 2700.0,
+                    "yearLow": 2500.0,
+                    "pe": 0,
+                    "pb": 0,
+                    "dy": 0,
+                    "advances": None,
+                    "declines": None,
+                    "unchanged": None,
+                    "perChange30d": 0.5,
+                    "perChange365d": 7.2,
+                },
+                {
+                    "key": "STRATEGY INDICES",
+                    "index": "NIFTY50 TR 2X LEVERAGE",
+                    "indexSymbol": "NIFTY50 TR 2X LEV",
+                    "last": 18500.0,
+                    "variation": 150.0,
+                    "percentChange": 0.82,
+                    "open": 18400.0,
+                    "high": 18600.0,
+                    "low": 18350.0,
+                    "previousClose": 18350.0,
+                    "yearHigh": 20000.0,
+                    "yearLow": 13000.0,
+                    "pe": 0,
+                    "pb": 0,
+                    "dy": 0,
+                    "advances": None,
+                    "declines": None,
+                    "unchanged": None,
+                    "perChange30d": 2.4,
+                    "perChange365d": 45.0,
+                }
+            ]
+        }).encode("utf-8")
+
+        emerge_json = json.dumps({
+            "data": [
+                {
+                    "symbol": "AIMTRON",
+                    "series": "SM",
+                    "open": 1950.0,
+                    "dayHigh": 1995.0,
+                    "dayLow": 1844.0,
+                    "lastPrice": 1910.0,
+                    "change": -10.5,
+                    "pChange": -0.55,
+                    "previousClose": 1920.5,
+                    "totalTradedVolume": 90500,
+                    "totalTradedValue": 173652305.0,
+                    "yearHigh": 2010.0,
+                    "yearLow": 696.0,
                 }
             ]
         }).encode("utf-8")
@@ -809,7 +917,12 @@ def test_nse_specific_extensions_and_bse_separation():
                 return SimpleHTTPResponse(200, pre_open_json)
             if "allIndices" in url:
                 return SimpleHTTPResponse(200, all_indices_json)
+            if "live-analysis-emerge" in url:
+                return SimpleHTTPResponse(200, emerge_json)
             if "equity-stock-indices" in url:
+                # Returns 0 constituents for VIX, G-SEC, and Leveraged indices
+                if any(k in url for k in ["VIX", "G-SEC", "GS", "LEVERAGE", "LEV", "INVERSE", "EMERGE"]):
+                    return SimpleHTTPResponse(200, b'{"data": []}')
                 idx_json = json.dumps({
                     "data": [
                         {"symbol": "NIFTY 50"},
@@ -860,23 +973,71 @@ def test_nse_specific_extensions_and_bse_separation():
         snap_df = asyncio.run(indices.sync_all_indices_snapshot())
         snap_path = cfg.root_dir / "indices" / "all_indices_snapshot.parquet"
         assert snap_path.exists()
-        assert len(snap_df) == 2
+        assert len(snap_df) == 6
         assert "PE" in snap_df.columns and "Advances" in snap_df.columns
         assert snap_df.iloc[0]["IndexName"] == "NIFTY 50"
         assert snap_df.iloc[0]["PE"] == 20.25
 
-        # 3. Test Live Index Constituents Sync (Dynamic All-Indices Discovery)
+        # 3. Test Live Index Constituents Sync (covering Equity, SME, VIX, G-Sec, and Leveraged Math Series)
         asyncio.run(indices.sync_live_index_constituents())
         idx_path = cfg.root_dir / "indices" / "index_constituents_live.parquet"
         assert idx_path.exists()
         idx_df = read_table_safe(idx_path)
-        # 2 indices discovered * 1 constituent = 2 rows
-        assert len(idx_df) == 2
+        
+        # Verify equity constituents (TCS)
         assert "TCS" in idx_df["Symbol"].values
-        assert idx_df.iloc[0]["LastPrice"] == 3960.0
-        assert idx_df.iloc[0]["FFMC"] == 5000000000.0
+        # Verify SME Emerge constituents (AIMTRON)
+        assert "AIMTRON" in idx_df["Symbol"].values
+        sme_row = idx_df[idx_df["Symbol"] == "AIMTRON"].iloc[0]
+        assert sme_row["IndexName"] == "NIFTY SME EMERGE"
+        assert sme_row["Series"] == "SM"
+        assert sme_row["LastPrice"] == 1910.0
+        # Verify Volatility Benchmark (INDIA VIX)
+        assert "INDIA VIX" in idx_df["Symbol"].values
+        vix_row = idx_df[idx_df["Symbol"] == "INDIA VIX"].iloc[0]
+        assert vix_row["Series"] == "VOLATILITY_BENCHMARK"
+        assert vix_row["LastPrice"] == 15.5
+        # Verify Fixed Income Debt Basket (NIFTY 10 YR BENCHMARK G-SEC)
+        assert "DEBT_BASKET: NIFTY GS 10YR" in idx_df["Symbol"].values
+        fi_row = idx_df[idx_df["Symbol"] == "DEBT_BASKET: NIFTY GS 10YR"].iloc[0]
+        assert fi_row["Series"] == "FIXED_INCOME"
+        assert fi_row["LastPrice"] == 2660.0
+        # Verify Leveraged Strategy Math Series (NIFTY50 TR 2X LEVERAGE)
+        assert "UNDERLYING: NIFTY 50" in idx_df["Symbol"].values
+        lev_row = idx_df[idx_df["Symbol"] == "UNDERLYING: NIFTY 50"].iloc[0]
+        assert lev_row["Series"] == "STRATEGY_MATH_SERIES"
+        assert lev_row["LastPrice"] == 18500.0
 
-        # 4. Test Short Selling Sync
+        # 4. Test Historical Special & Fixed Income Extraction from Daily Snapshots
+        dummy_snap = pd.DataFrame({
+            "Date": [pd.Timestamp("2026-11-04")] * 4,
+            "IndexName": ["India VIX", "Nifty 10 yr Benchmark G-Sec", "Nifty50 TR 2x Leverage", "NIFTY SME EMERGE"],
+            "Open": [15.8, 2658.0, 18400.0, 14700.0],
+            "High": [16.0, 2662.0, 18600.0, 14850.0],
+            "Low": [15.2, 2657.0, 18350.0, 14650.0],
+            "Close": [15.5, 2660.0, 18500.0, 14800.0],
+            "PE": [0, 0, 0, 0],
+            "PB": [0, 0, 0, 0],
+            "DivYield": [0, 0, 0, 0],
+        })
+        upsert_parquet_partition(
+            dummy_snap,
+            cfg.root_dir / "indices" / "ind_close_all_2026.parquet",
+            dedup_cols=["Date", "IndexName"],
+            sort_cols=["IndexName", "Date"],
+        )
+        extracted_cnt = indices.sync_special_and_fixed_income_indices_from_snapshots()
+        assert extracted_cnt == 4
+        hist_target = cfg.root_dir / "indices" / "nifty_30y_ohlc_tri_pe.parquet"
+        assert hist_target.exists()
+        hist_df = read_table_safe(hist_target)
+        assert len(hist_df) == 4
+        assert "NIFTY 10 YR BENCHMARK G-SEC" in hist_df["IndexName"].values
+        assert "INDIA VIX" in hist_df["IndexName"].values
+        assert "NIFTY50 TR 2X LEVERAGE" in hist_df["IndexName"].values
+        assert "NIFTY SME EMERGE" in hist_df["IndexName"].values
+
+        # 5. Test Short Selling Sync
         dd = DealsAndDocumentsScraper(mock_http, state, cfg)
         asyncio.run(dd.sync_short_selling(date(2026, 11, 5)))
         ss_path = cfg.root_dir / "deals" / "short_selling.parquet"

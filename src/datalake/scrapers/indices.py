@@ -53,6 +53,28 @@ _LEGACY_INDEX_MAP = {
     "CNX ENERGY": "NIFTY ENERGY",
 }
 
+SPECIAL_HISTORICAL_INDEX_MAP = {
+    "INDIA VIX": "INDIA VIX",
+    "NIFTY 1D RATE INDEX": "NIFTY 1D RATE INDEX",
+    "NIFTY SME EMERGE": "NIFTY SME EMERGE",
+    "NIFTY 10 YR BENCHMARK G-SEC": "NIFTY 10 YR BENCHMARK G-SEC",
+    "NIFTY 10 YR BENCHMARK G-SEC (CLEAN PRICE)": "NIFTY 10 YR BENCHMARK G-SEC (CLEAN PRICE)",
+    "NIFTY 11-15 YR G-SEC INDEX": "NIFTY 11-15 YR G-SEC INDEX",
+    "NIFTY 15 YR AND ABOVE G-SEC INDEX": "NIFTY 15 YR AND ABOVE G-SEC INDEX",
+    "NIFTY 4-8 YR G-SEC INDEX": "NIFTY 4-8 YR G-SEC INDEX",
+    "NIFTY 8-13 YR G-SEC": "NIFTY 8-13 YR G-SEC",
+    "NIFTY BHARAT BOND INDEX - APRIL 2030": "NIFTY BHARAT BOND INDEX - APRIL 2030",
+    "NIFTY BHARAT BOND INDEX - APRIL 2031": "NIFTY BHARAT BOND INDEX - APRIL 2031",
+    "NIFTY BHARAT BOND INDEX - APRIL 2032": "NIFTY BHARAT BOND INDEX - APRIL 2032",
+    "NIFTY BHARAT BOND INDEX - APRIL 2033": "NIFTY BHARAT BOND INDEX - APRIL 2033",
+    "NIFTY COMPOSITE G-SEC INDEX": "NIFTY COMPOSITE G-SEC INDEX",
+    "NIFTY50 PR 1X INVERSE": "NIFTY50 PR 1X INVERSE",
+    "NIFTY50 PR 2X LEVERAGE": "NIFTY50 PR 2X LEVERAGE",
+    "NIFTY50 TR 1X INVERSE": "NIFTY50 TR 1X INVERSE",
+    "NIFTY50 TR 2X LEVERAGE": "NIFTY50 TR 2X LEVERAGE",
+    "NIFTY50 USD": "NIFTY50 USD",
+}
+
 
 class IndicesScraper:
     """
@@ -372,21 +394,24 @@ class IndicesScraper:
 
         self.sync_vix_and_1d_rate_from_snapshots()
 
-    def sync_vix_and_1d_rate_from_snapshots(self) -> int:
-        """Extract INDIA VIX and NIFTY 1D RATE INDEX from ind_close_all_*.parquet into nifty_30y_ohlc_tri_pe.parquet."""
+    def sync_special_and_fixed_income_indices_from_snapshots(self) -> int:
+        """
+        Extracts historical OHLC for INDIA VIX, NIFTY 1D RATE INDEX, NIFTY SME EMERGE,
+        all 11 G-Sec & Bharat Bond indices, and leveraged/inverse series from
+        ind_close_all_*.parquet into nifty_30y_ohlc_tri_pe.parquet.
+        """
         idx_dir = self.cfg.root_dir / "indices"
         if not idx_dir.exists():
             return 0
-        target_names = {"INDIA VIX": "INDIA VIX", "NIFTY 1D RATE INDEX": "NIFTY 1D RATE INDEX"}
         extracted: list[pd.DataFrame] = []
         for f in sorted(idx_dir.glob("ind_close_all_*.parquet")):
             df = read_table_safe(f)
             if df.empty or "IndexName" not in df.columns:
                 continue
             upper_names = df["IndexName"].astype(str).str.strip().str.upper()
-            sub = df[upper_names.isin(target_names)].copy()
+            sub = df[upper_names.isin(SPECIAL_HISTORICAL_INDEX_MAP)].copy()
             if not sub.empty:
-                sub["IndexName"] = upper_names[upper_names.isin(target_names)].map(target_names)
+                sub["IndexName"] = upper_names[upper_names.isin(SPECIAL_HISTORICAL_INDEX_MAP)].map(SPECIAL_HISTORICAL_INDEX_MAP)
                 keep = [c for c in ("Date", "IndexName", "Open", "High", "Low", "Close", "PE", "PB", "DivYield") if c in sub.columns]
                 extracted.append(sub[keep])
         if not extracted:
@@ -398,6 +423,10 @@ class IndicesScraper:
             dedup_cols=["Date", "IndexName"],
             sort_cols=["IndexName", "Date"],
         )
+
+    def sync_vix_and_1d_rate_from_snapshots(self) -> int:
+        """Extracts INDIA VIX, 1D Rate, Fixed Income, and special indices into nifty_30y_ohlc_tri_pe.parquet."""
+        return self.sync_special_and_fixed_income_indices_from_snapshots()
 
     async def sync_all_indices_snapshot(self) -> pd.DataFrame:
         """
@@ -468,30 +497,121 @@ class IndicesScraper:
     ) -> None:
         """
         Fetches live constituent weights, valuation ratios, free-float market cap, and pricing
-        across all indices available to NSE (120+ equity indices covering ~9,500+ constituent mappings),
-        or a specified subset of indices.
+        across all 139 indices available to NSE:
+        - 120 equity indices via /api/equity-stock-indices
+        - NIFTY SME EMERGE via /api/live-analysis-emerge (580+ SME constituent stocks)
+        - INDIA VIX sovereign volatility index benchmark
+        - 11 Fixed Income / G-Sec and Bharat Bond indices
+        - Leveraged and inverse strategy mathematical series
         """
         today = today_ist()
-        target_indices: list[tuple[str, str, str]] = []
+        target_indices: list[dict] = []
 
         if indices is not None:
             for idx in indices:
-                target_indices.append((idx, idx, "USER_SPECIFIED"))
+                target_indices.append({
+                    "IndexName": idx,
+                    "IndexSymbol": idx,
+                    "Category": "USER_SPECIFIED",
+                    "LastPrice": None,
+                    "Variation": None,
+                    "PercentChange": None,
+                    "Open": None,
+                    "High": None,
+                    "Low": None,
+                    "PreviousClose": None,
+                    "YearHigh": None,
+                    "YearLow": None,
+                })
         else:
             snap_df = await self.sync_all_indices_snapshot()
             if not snap_df.empty:
                 for _, r in snap_df.iterrows():
-                    target_indices.append((str(r["IndexName"]), str(r["IndexSymbol"]), str(r["Category"])))
+                    target_indices.append({
+                        "IndexName": str(r["IndexName"]),
+                        "IndexSymbol": str(r["IndexSymbol"]),
+                        "Category": str(r["Category"]),
+                        "LastPrice": r.get("LastPrice"),
+                        "Variation": r.get("Variation"),
+                        "PercentChange": r.get("PercentChange"),
+                        "Open": r.get("Open"),
+                        "High": r.get("High"),
+                        "Low": r.get("Low"),
+                        "PreviousClose": r.get("PreviousClose"),
+                        "YearHigh": r.get("YearHigh"),
+                        "YearLow": r.get("YearLow"),
+                    })
             else:
                 for idx in CORE_NIFTY_INDICES:
-                    target_indices.append((idx, idx, "CORE"))
+                    target_indices.append({
+                        "IndexName": idx,
+                        "IndexSymbol": idx,
+                        "Category": "CORE",
+                        "LastPrice": None,
+                        "Variation": None,
+                        "PercentChange": None,
+                        "Open": None,
+                        "High": None,
+                        "Low": None,
+                        "PreviousClose": None,
+                        "YearHigh": None,
+                        "YearLow": None,
+                    })
 
         sem = asyncio.Semaphore(max_workers)
         frames: list[dict] = []
 
-        async def fetch_constituents(idx_name: str, idx_sym: str, cat: str) -> None:
+        async def fetch_constituents(item: dict) -> None:
+            idx_name = item["IndexName"]
+            idx_sym = item["IndexSymbol"]
+            cat = item["Category"]
+
             async with sem:
+                # 1. NIFTY SME EMERGE -> direct live analysis gateway for SME equities
+                if idx_name.upper() == "NIFTY SME EMERGE":
+                    try:
+                        resp = await self.http.get(
+                            "https://www.nseindia.com/api/live-analysis-emerge",
+                            headers=NSE_API_HEADERS,
+                            prime_nse=True,
+                        )
+                        if resp.status_code == 200 and resp.text.lstrip().startswith("{"):
+                            emerge_items = resp.json().get("data", [])
+                            if isinstance(emerge_items, list) and emerge_items:
+                                for it in emerge_items:
+                                    s = str(it.get("symbol") or "").strip().upper()
+                                    if s:
+                                        frames.append({
+                                            "IndexName": idx_name,
+                                            "IndexSymbol": idx_sym,
+                                            "Category": cat,
+                                            "Symbol": s,
+                                            "Series": str(it.get("series") or "SM").strip().upper(),
+                                            "LastPrice": pd.to_numeric(it.get("lastPrice"), errors="coerce"),
+                                            "Change": pd.to_numeric(it.get("change"), errors="coerce"),
+                                            "PercentChange": pd.to_numeric(it.get("pChange"), errors="coerce"),
+                                            "Open": pd.to_numeric(it.get("open"), errors="coerce"),
+                                            "High": pd.to_numeric(it.get("dayHigh"), errors="coerce"),
+                                            "Low": pd.to_numeric(it.get("dayLow"), errors="coerce"),
+                                            "PreviousClose": pd.to_numeric(it.get("previousClose"), errors="coerce"),
+                                            "TotalTradedVolume": pd.to_numeric(it.get("totalTradedVolume"), errors="coerce"),
+                                            "TotalTradedValue": pd.to_numeric(it.get("totalTradedValue"), errors="coerce"),
+                                            "FFMC": pd.NA,
+                                            "YearHigh": pd.to_numeric(it.get("yearHigh"), errors="coerce"),
+                                            "YearLow": pd.to_numeric(it.get("yearLow"), errors="coerce"),
+                                            "NearWKH": pd.to_numeric(it.get("nearWKH"), errors="coerce"),
+                                            "NearWKL": pd.to_numeric(it.get("nearWKL"), errors="coerce"),
+                                            "PerChange30d": pd.to_numeric(it.get("perChange30d"), errors="coerce"),
+                                            "PerChange365d": pd.to_numeric(it.get("perChange365d"), errors="coerce"),
+                                            "Date": pd.Timestamp(today),
+                                        })
+                                return
+                    except Exception as exc:
+                        logger.debug("[Live Index Constituents SME] Skipped: %s", exc)
+
+                # 2. Standard Equity Indices -> queried via /api/equity-stock-indices
                 queries = [idx_sym] if idx_sym == idx_name else [idx_sym, idx_name]
+                found_constituents = False
                 for target_q in queries:
                     if not target_q:
                         continue
@@ -529,11 +649,53 @@ class IndicesScraper:
                                         "PerChange365d": pd.to_numeric(it.get("perChange365d"), errors="coerce"),
                                         "Date": pd.Timestamp(today),
                                     })
+                            found_constituents = True
                             break
                     except Exception as exc:
                         logger.debug("[Live Index Constituents %s] Skipped (%s): %s", idx_name, target_q, exc)
 
-        await asyncio.gather(*(fetch_constituents(name, sym, cat) for name, sym, cat in target_indices))
+                # 3. Fixed Income / Volatility / Leveraged Math Series without stock constituents:
+                if not found_constituents and item["LastPrice"] is not None:
+                    u_name = idx_name.upper()
+                    if u_name == "INDIA VIX":
+                        sym_label = "INDIA VIX"
+                        series_label = "VOLATILITY_BENCHMARK"
+                    elif cat == "FIXED INCOME INDICES":
+                        sym_label = f"DEBT_BASKET: {idx_sym}"
+                        series_label = "FIXED_INCOME"
+                    elif any(k in u_name for k in ("LEVERAGE", "INVERSE", "DIVIDEND POINTS", "USD")):
+                        sym_label = "UNDERLYING: NIFTY 50"
+                        series_label = "STRATEGY_MATH_SERIES"
+                    else:
+                        sym_label = idx_sym
+                        series_label = "SYNTHETIC_INDEX"
+
+                    frames.append({
+                        "IndexName": idx_name,
+                        "IndexSymbol": idx_sym,
+                        "Category": cat,
+                        "Symbol": sym_label,
+                        "Series": series_label,
+                        "LastPrice": pd.to_numeric(item["LastPrice"], errors="coerce"),
+                        "Change": pd.to_numeric(item["Variation"], errors="coerce"),
+                        "PercentChange": pd.to_numeric(item["PercentChange"], errors="coerce"),
+                        "Open": pd.to_numeric(item["Open"], errors="coerce"),
+                        "High": pd.to_numeric(item["High"], errors="coerce"),
+                        "Low": pd.to_numeric(item["Low"], errors="coerce"),
+                        "PreviousClose": pd.to_numeric(item["PreviousClose"], errors="coerce"),
+                        "TotalTradedVolume": pd.NA,
+                        "TotalTradedValue": pd.NA,
+                        "FFMC": pd.NA,
+                        "YearHigh": pd.to_numeric(item["YearHigh"], errors="coerce"),
+                        "YearLow": pd.to_numeric(item["YearLow"], errors="coerce"),
+                        "NearWKH": pd.NA,
+                        "NearWKL": pd.NA,
+                        "PerChange30d": pd.NA,
+                        "PerChange365d": pd.NA,
+                        "Date": pd.Timestamp(today),
+                    })
+
+        await asyncio.gather(*(fetch_constituents(item) for item in target_indices))
 
         if frames:
             df = pd.DataFrame(frames)
