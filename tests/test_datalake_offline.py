@@ -718,6 +718,17 @@ def test_nsearchives_proxy_fallback_and_extraction():
     res_missing = asyncio.run(client.fetch_archive_via_proxy("https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_20261108_F_0000.csv.zip"))
     assert res_missing.status_code == 404
 
+    # 4. Test XML fast path via /api/download_xbrl
+    xml_content = b'<?xml version="1.0"?><xbrli:xbrl><test/></xbrli:xbrl>'
+    client.get = AsyncMock(return_value=SimpleHTTPResponse(
+        status_code=200,
+        content=xml_content,
+        headers={"content-type": "application/xml"}
+    ))
+    res_xml = asyncio.run(client.fetch_archive_via_proxy("https://nsearchives.nseindia.com/corporate/xbrl/INDAS_123.xml"))
+    assert res_xml.status_code == 200
+    assert res_xml.content == xml_content
+
 
 if __name__ == "__main__":
     test_corporate_action_regex_parser()

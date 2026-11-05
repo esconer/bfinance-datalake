@@ -266,7 +266,29 @@ class ResilientHTTPClient:
         target_url: str,
         timeout: float = 35.0,
     ) -> SimpleHTTPResponse:
-        """Fetch a file hosted on nsearchives.nseindia.com via www.nseindia.com/api/zipem proxy."""
+        """Fetch a file hosted on nsearchives.nseindia.com via www.nseindia.com proxy."""
+        target_path = urllib.parse.urlsplit(target_url).path
+        is_xml = target_path.lower().endswith(".xml")
+
+        # Fast path for XML files (Financial & Shareholding XBRLs) via /api/download_xbrl (0.16s vs 4.6s on zipem)
+        if is_xml:
+            encoded_link = urllib.parse.quote(_json.dumps(target_url))
+            xbrl_url = f"https://www.nseindia.com/api/download_xbrl?fileUrl={encoded_link}"
+            resp = await self.get(
+                xbrl_url,
+                headers=NSE_API_HEADERS,
+                prime_nse=True,
+                timeout=max(timeout, 20.0),
+                fallback_proxy=False,
+            )
+            if resp.status_code == 200 and b"<" in resp.content[:200]:
+                self._nsearchives_fail_streak = 0
+                return resp
+            if resp.status_code == 404:
+                self._nsearchives_fail_streak = 0
+                return resp
+
+        # Fall back to /api/zipem for non-xml (zip, csv, dat) or if download_xbrl returned non-200
         encoded_links = urllib.parse.quote(_json.dumps([target_url]))
         proxy_url = f"https://www.nseindia.com/api/zipem?fileURLs={encoded_links}&type=daily"
         resp = await self.get(
@@ -282,7 +304,7 @@ class ResilientHTTPClient:
                     namelist = zf.namelist()
                     if not namelist:
                         return SimpleHTTPResponse(404, b"Empty zip archive returned by proxy", {})
-                    target_filename = posixpath.basename(urllib.parse.urlsplit(target_url).path)
+                    target_filename = posixpath.basename(target_path)
                     matched_name = next((n for n in namelist if n == target_filename), namelist[0])
                     inner_bytes = zf.read(matched_name)
                     self._nsearchives_fail_streak = 0
