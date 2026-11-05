@@ -136,6 +136,7 @@ async def run_daily_update(cfg: LakeConfig, lookback_days: int = 7, include_fo: 
         await dd.sync_short_selling()
         await dd.sync_insider_trading_pit(default_start, today)
         await dd.sync_concalls_and_presentations(default_start, today)
+        await indices.sync_all_indices_snapshot()
         await indices.sync_live_index_constituents()
         await XBRLScraper(http, state, cfg).sync_recent_market_financials_nse()
         await ff.sync_amfi_daily()

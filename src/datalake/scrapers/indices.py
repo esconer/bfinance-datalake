@@ -399,39 +399,141 @@ class IndicesScraper:
             sort_cols=["IndexName", "Date"],
         )
 
-    async def sync_live_index_constituents(
-        self, indices: tuple[str, ...] = ("NIFTY 50", "NIFTY NEXT 50", "NIFTY BANK", "NIFTY IT")
-    ) -> None:
-        """Fetches live constituent weights, valuation ratios, and pricing for key Nifty indices."""
-        frames = []
+    async def sync_all_indices_snapshot(self) -> pd.DataFrame:
+        """
+        Fetches master snapshot of all 139 NSE indices from /api/allIndices,
+        including live valuation ratios (P/E, P/B, Dividend Yield), market breadth
+        (advances, declines, unchanged), and 30d/365d performance metrics.
+        """
         today = today_ist()
-        for idx in indices:
-            url = f"https://www.nseindia.com/api/equity-stock-indices?index={quote(idx)}"
-            try:
-                resp = await self.http.get(url, headers=NSE_API_HEADERS, prime_nse=True)
-                if resp.status_code != 200 or not resp.text.lstrip().startswith("{"):
-                    continue
-                data = resp.json().get("data", [])
-                if isinstance(data, list) and len(data) > 1:
-                    for it in data[1:]:
-                        sym = str(it.get("symbol") or "").strip().upper()
-                        if sym:
-                            frames.append({
-                                "IndexName": idx,
-                                "Symbol": sym,
-                                "Series": str(it.get("series") or "EQ").strip().upper(),
-                                "Open": pd.to_numeric(it.get("open"), errors="coerce"),
-                                "High": pd.to_numeric(it.get("dayHigh"), errors="coerce"),
-                                "Low": pd.to_numeric(it.get("dayLow"), errors="coerce"),
-                                "LastPrice": pd.to_numeric(it.get("lastPrice"), errors="coerce"),
-                                "TotalTradedVolume": pd.to_numeric(it.get("totalTradedVolume"), errors="coerce"),
-                                "TotalTradedValue": pd.to_numeric(it.get("totalTradedValue"), errors="coerce"),
-                                "NearWKH": pd.to_numeric(it.get("nearWKH"), errors="coerce"),
-                                "NearWKL": pd.to_numeric(it.get("nearWKL"), errors="coerce"),
-                                "Date": pd.Timestamp(today),
-                            })
-            except Exception as exc:
-                logger.debug("[Live Index Constituents %s] Skipped: %s", idx, exc)
+        url = "https://www.nseindia.com/api/allIndices"
+        try:
+            resp = await self.http.get(url, headers=NSE_API_HEADERS, prime_nse=True)
+            if resp.status_code != 200 or not resp.text.lstrip().startswith("{"):
+                logger.warning("[All Indices Snapshot] Failed with HTTP %s", resp.status_code)
+                return pd.DataFrame()
+            raw_data = resp.json().get("data", [])
+        except Exception as exc:
+            logger.warning("[All Indices Snapshot] Failed: %s", exc)
+            return pd.DataFrame()
+
+        if not raw_data:
+            return pd.DataFrame()
+
+        rows = []
+        for item in raw_data:
+            idx_name = str(item.get("index") or "").strip()
+            if not idx_name:
+                continue
+            rows.append({
+                "Date": pd.Timestamp(today),
+                "Category": str(item.get("key") or "").strip().upper(),
+                "IndexName": idx_name,
+                "IndexSymbol": str(item.get("indexSymbol") or idx_name).strip().upper(),
+                "LastPrice": pd.to_numeric(item.get("last"), errors="coerce"),
+                "Variation": pd.to_numeric(item.get("variation"), errors="coerce"),
+                "PercentChange": pd.to_numeric(item.get("percentChange"), errors="coerce"),
+                "Open": pd.to_numeric(item.get("open"), errors="coerce"),
+                "High": pd.to_numeric(item.get("high"), errors="coerce"),
+                "Low": pd.to_numeric(item.get("low"), errors="coerce"),
+                "PreviousClose": pd.to_numeric(item.get("previousClose"), errors="coerce"),
+                "YearHigh": pd.to_numeric(item.get("yearHigh"), errors="coerce"),
+                "YearLow": pd.to_numeric(item.get("yearLow"), errors="coerce"),
+                "PE": pd.to_numeric(item.get("pe"), errors="coerce"),
+                "PB": pd.to_numeric(item.get("pb"), errors="coerce"),
+                "DivYield": pd.to_numeric(item.get("dy"), errors="coerce"),
+                "Advances": pd.to_numeric(item.get("advances"), errors="coerce"),
+                "Declines": pd.to_numeric(item.get("declines"), errors="coerce"),
+                "Unchanged": pd.to_numeric(item.get("unchanged"), errors="coerce"),
+                "PerChange30d": pd.to_numeric(item.get("perChange30d"), errors="coerce"),
+                "PerChange365d": pd.to_numeric(item.get("perChange365d"), errors="coerce"),
+            })
+
+        df = pd.DataFrame(rows)
+        target = self.cfg.root_dir / "indices" / "all_indices_snapshot.parquet"
+        upsert_parquet_partition(
+            df,
+            target,
+            dedup_cols=["Date", "IndexName"],
+            sort_cols=["Category", "IndexName", "Date"],
+        )
+        self.state.record("all_indices_snapshot", today.isoformat(), "OK", len(df))
+        logger.info("[All Indices Snapshot] Ingested %d indices into %s", len(df), target.name)
+        return df
+
+    async def sync_live_index_constituents(
+        self,
+        indices: tuple[str, ...] | list[str] | None = None,
+        max_workers: int = 5,
+    ) -> None:
+        """
+        Fetches live constituent weights, valuation ratios, free-float market cap, and pricing
+        across all indices available to NSE (120+ equity indices covering ~9,500+ constituent mappings),
+        or a specified subset of indices.
+        """
+        today = today_ist()
+        target_indices: list[tuple[str, str, str]] = []
+
+        if indices is not None:
+            for idx in indices:
+                target_indices.append((idx, idx, "USER_SPECIFIED"))
+        else:
+            snap_df = await self.sync_all_indices_snapshot()
+            if not snap_df.empty:
+                for _, r in snap_df.iterrows():
+                    target_indices.append((str(r["IndexName"]), str(r["IndexSymbol"]), str(r["Category"])))
+            else:
+                for idx in CORE_NIFTY_INDICES:
+                    target_indices.append((idx, idx, "CORE"))
+
+        sem = asyncio.Semaphore(max_workers)
+        frames: list[dict] = []
+
+        async def fetch_constituents(idx_name: str, idx_sym: str, cat: str) -> None:
+            async with sem:
+                queries = [idx_sym] if idx_sym == idx_name else [idx_sym, idx_name]
+                for target_q in queries:
+                    if not target_q:
+                        continue
+                    url = f"https://www.nseindia.com/api/equity-stock-indices?index={quote(target_q)}"
+                    try:
+                        resp = await self.http.get(url, headers=NSE_API_HEADERS, prime_nse=True)
+                        if resp.status_code != 200 or not resp.text.lstrip().startswith("{"):
+                            continue
+                        data = resp.json().get("data", [])
+                        if isinstance(data, list) and len(data) > 1:
+                            for it in data[1:]:
+                                sym = str(it.get("symbol") or "").strip().upper()
+                                if sym:
+                                    frames.append({
+                                        "IndexName": idx_name,
+                                        "IndexSymbol": idx_sym,
+                                        "Category": cat,
+                                        "Symbol": sym,
+                                        "Series": str(it.get("series") or "EQ").strip().upper(),
+                                        "LastPrice": pd.to_numeric(it.get("lastPrice"), errors="coerce"),
+                                        "Change": pd.to_numeric(it.get("change"), errors="coerce"),
+                                        "PercentChange": pd.to_numeric(it.get("pChange"), errors="coerce"),
+                                        "Open": pd.to_numeric(it.get("open"), errors="coerce"),
+                                        "High": pd.to_numeric(it.get("dayHigh"), errors="coerce"),
+                                        "Low": pd.to_numeric(it.get("dayLow"), errors="coerce"),
+                                        "PreviousClose": pd.to_numeric(it.get("previousClose"), errors="coerce"),
+                                        "TotalTradedVolume": pd.to_numeric(it.get("totalTradedVolume"), errors="coerce"),
+                                        "TotalTradedValue": pd.to_numeric(it.get("totalTradedValue"), errors="coerce"),
+                                        "FFMC": pd.to_numeric(it.get("ffmc"), errors="coerce"),
+                                        "YearHigh": pd.to_numeric(it.get("yearHigh"), errors="coerce"),
+                                        "YearLow": pd.to_numeric(it.get("yearLow"), errors="coerce"),
+                                        "NearWKH": pd.to_numeric(it.get("nearWKH"), errors="coerce"),
+                                        "NearWKL": pd.to_numeric(it.get("nearWKL"), errors="coerce"),
+                                        "PerChange30d": pd.to_numeric(it.get("perChange30d"), errors="coerce"),
+                                        "PerChange365d": pd.to_numeric(it.get("perChange365d"), errors="coerce"),
+                                        "Date": pd.Timestamp(today),
+                                    })
+                            break
+                    except Exception as exc:
+                        logger.debug("[Live Index Constituents %s] Skipped (%s): %s", idx_name, target_q, exc)
+
+        await asyncio.gather(*(fetch_constituents(name, sym, cat) for name, sym, cat in target_indices))
 
         if frames:
             df = pd.DataFrame(frames)
@@ -440,6 +542,12 @@ class IndicesScraper:
                 df,
                 target,
                 dedup_cols=["Date", "IndexName", "Symbol"],
-                sort_cols=["IndexName", "Symbol", "Date"],
+                sort_cols=["Category", "IndexName", "Symbol", "Date"],
             )
             self.state.record("live_index_constituents", today.isoformat(), "OK", len(df))
+            logger.info(
+                "[Live Index Constituents] Ingested %d constituent records across %d indices into %s",
+                len(df),
+                df["IndexName"].nunique(),
+                target.name,
+            )

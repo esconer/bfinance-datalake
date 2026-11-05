@@ -754,10 +754,61 @@ def test_nse_specific_extensions_and_bse_separation():
             }]
         }).encode("utf-8")
 
+        all_indices_json = json.dumps({
+            "data": [
+                {
+                    "key": "BROAD MARKET INDICES",
+                    "index": "NIFTY 50",
+                    "indexSymbol": "NIFTY 50",
+                    "last": 24500.0,
+                    "variation": 100.0,
+                    "percentChange": 0.41,
+                    "open": 24450.0,
+                    "high": 24550.0,
+                    "low": 24400.0,
+                    "previousClose": 24400.0,
+                    "yearHigh": 26277.0,
+                    "yearLow": 18837.0,
+                    "pe": 20.25,
+                    "pb": 3.01,
+                    "dy": 1.42,
+                    "advances": 32,
+                    "declines": 18,
+                    "unchanged": 0,
+                    "perChange30d": 1.2,
+                    "perChange365d": 22.5,
+                },
+                {
+                    "key": "SECTORAL INDICES",
+                    "index": "NIFTY BANK",
+                    "indexSymbol": "NIFTY BANK",
+                    "last": 52000.0,
+                    "variation": -50.0,
+                    "percentChange": -0.1,
+                    "open": 52100.0,
+                    "high": 52200.0,
+                    "low": 51900.0,
+                    "previousClose": 52050.0,
+                    "yearHigh": 54467.0,
+                    "yearLow": 42105.0,
+                    "pe": 15.5,
+                    "pb": 2.1,
+                    "dy": 1.1,
+                    "advances": 8,
+                    "declines": 4,
+                    "unchanged": 0,
+                    "perChange30d": -0.5,
+                    "perChange365d": 15.2,
+                }
+            ]
+        }).encode("utf-8")
+
         mock_http = MagicMock()
         async def mock_get(url, **kwargs):
             if "market-data-pre-open" in url:
                 return SimpleHTTPResponse(200, pre_open_json)
+            if "allIndices" in url:
+                return SimpleHTTPResponse(200, all_indices_json)
             if "equity-stock-indices" in url:
                 idx_json = json.dumps({
                     "data": [
@@ -769,10 +820,17 @@ def test_nse_specific_extensions_and_bse_separation():
                             "dayHigh": 3980.0,
                             "dayLow": 3920.0,
                             "lastPrice": 3960.0,
+                            "change": 10.0,
+                            "pChange": 0.25,
                             "totalTradedVolume": 100000,
                             "totalTradedValue": 396000000.0,
+                            "ffmc": 5000000000.0,
                             "nearWKH": 2.5,
                             "nearWKL": -15.0,
+                            "yearHigh": 4500.0,
+                            "yearLow": 3300.0,
+                            "perChange30d": 3.2,
+                            "perChange365d": 18.5,
                         }
                     ]
                 }).encode("utf-8")
@@ -797,17 +855,28 @@ def test_nse_specific_extensions_and_bse_separation():
         assert po_df.iloc[0]["Symbol"] == "RELIANCE"
         assert po_df.iloc[0]["YearHigh"] == 2600.0
 
-        # 2. Test Live Index Constituents Sync
+        # 2. Test All Indices Master Snapshot Sync
         indices = IndicesScraper(mock_http, state, cfg)
-        asyncio.run(indices.sync_live_index_constituents(indices=("NIFTY 50",)))
+        snap_df = asyncio.run(indices.sync_all_indices_snapshot())
+        snap_path = cfg.root_dir / "indices" / "all_indices_snapshot.parquet"
+        assert snap_path.exists()
+        assert len(snap_df) == 2
+        assert "PE" in snap_df.columns and "Advances" in snap_df.columns
+        assert snap_df.iloc[0]["IndexName"] == "NIFTY 50"
+        assert snap_df.iloc[0]["PE"] == 20.25
+
+        # 3. Test Live Index Constituents Sync (Dynamic All-Indices Discovery)
+        asyncio.run(indices.sync_live_index_constituents())
         idx_path = cfg.root_dir / "indices" / "index_constituents_live.parquet"
         assert idx_path.exists()
         idx_df = read_table_safe(idx_path)
-        assert len(idx_df) == 1
-        assert idx_df.iloc[0]["Symbol"] == "TCS"
+        # 2 indices discovered * 1 constituent = 2 rows
+        assert len(idx_df) == 2
+        assert "TCS" in idx_df["Symbol"].values
         assert idx_df.iloc[0]["LastPrice"] == 3960.0
+        assert idx_df.iloc[0]["FFMC"] == 5000000000.0
 
-        # 3. Test Short Selling Sync
+        # 4. Test Short Selling Sync
         dd = DealsAndDocumentsScraper(mock_http, state, cfg)
         asyncio.run(dd.sync_short_selling(date(2026, 11, 5)))
         ss_path = cfg.root_dir / "deals" / "short_selling.parquet"
