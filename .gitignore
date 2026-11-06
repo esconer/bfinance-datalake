@@ -84,3 +84,9 @@ Thumbs.db
 .env.*
 *.pem
 *.key
+
+# Agent Customizations & Local Rules
+.agents/
+GEMINI.md
+AGENTS.md
+

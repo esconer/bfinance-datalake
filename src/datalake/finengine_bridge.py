@@ -83,6 +83,14 @@ def _finite_float(val: Any) -> float | None:
         return None
 
 
+def _first_finite(*vals: Any) -> float | None:
+    for v in vals:
+        f = _finite_float(v)
+        if f is not None:
+            return f
+    return None
+
+
 def compute_amihud_illiquidity(returns: pd.Series, rupee_volume: pd.Series) -> float | None:
     """
     Return measured Amihud (2002) illiquidity (`mean(|r_t| / rupee_volume_t * 1e6)`),
@@ -162,7 +170,7 @@ def compute_piotroski_score(fin_df: pd.DataFrame) -> tuple[int | None, dict[str,
     prev = work.iloc[-2] if len(work) >= 2 else None
 
     pat_c = _finite_float(curr.get("NetProfit_Cr"))
-    cfo_c = _finite_float(curr.get("CFO_Cr")) or _finite_float(curr.get("OperatingCashFlow_Cr"))
+    cfo_c = _first_finite(curr.get("CFO_Cr"), curr.get("OperatingCashFlow_Cr"))
     sales_c = _finite_float(curr.get("Sales_Cr"))
     eq_c = (_finite_float(curr.get("EquityCapital_Cr")) or 0.0) + (_finite_float(curr.get("Reserves_Cr")) or 0.0)
     debt_c = _finite_float(curr.get("TotalBorrowings_Cr"))
@@ -218,8 +226,8 @@ def compute_piotroski_score(fin_df: pd.DataFrame) -> tuple[int | None, dict[str,
             breakdown["F7_No_Dilution"] = sh_cap_c <= sh_cap_p * 1.005
 
         if sales_c and sales_c > 0 and sales_p and sales_p > 0:
-            pbt_c = _finite_float(curr.get("PBT_Cr")) or pat_c
-            pbt_p = _finite_float(prev.get("PBT_Cr")) or pat_p
+            pbt_c = _first_finite(curr.get("PBT_Cr"), pat_c)
+            pbt_p = _first_finite(prev.get("PBT_Cr"), pat_p)
             if pbt_c is not None and pbt_p is not None:
                 breakdown["F8_Increasing_OperatingMargin"] = (pbt_c / sales_c) >= (pbt_p / sales_p)
             if assets_c and assets_c > 0 and assets_p and assets_p > 0:
@@ -326,7 +334,7 @@ def compute_forensic_ratios(
                 borrowings_cr = _finite_float(r.get("TotalBorrowings_Cr"))
             if cash_cr is None and _finite_float(r.get("TotalCashAndBank_Cr")) is not None:
                 cash_cr = _finite_float(r.get("TotalCashAndBank_Cr"))
-            cfo_cand = _finite_float(r.get("CFO_Cr")) or _finite_float(r.get("OperatingCashFlow_Cr"))
+            cfo_cand = _first_finite(r.get("CFO_Cr"), r.get("OperatingCashFlow_Cr"))
             if cfo_cr is None and cfo_cand is not None:
                 cfo_cr = cfo_cand
 
@@ -439,6 +447,16 @@ def transpose_financials_to_statement(
 
     st = statement_type.strip().lower()
     if st in ("income_stmt", "income", "pnl"):
+        if "RawMaterials_Cr" not in df.columns and (
+            "MaterialCost_Cr" in df.columns or "StockInTradePurchases_Cr" in df.columns
+        ):
+            mat_s = pd.to_numeric(df.get("MaterialCost_Cr", pd.Series(dtype=float)), errors="coerce")
+            sit_s = pd.to_numeric(df.get("StockInTradePurchases_Cr", pd.Series(dtype=float)), errors="coerce")
+            df["RawMaterials_Cr"] = (mat_s.fillna(0.0) + sit_s.fillna(0.0)).where(mat_s.notna() | sit_s.notna())
+        if "TotalExpenses_Cr" not in df.columns and "TotalIncome_Cr" in df.columns and "PBT_Cr" in df.columns:
+            ti_s = pd.to_numeric(df["TotalIncome_Cr"], errors="coerce")
+            pbt_s_tmp = pd.to_numeric(df["PBT_Cr"], errors="coerce")
+            df["TotalExpenses_Cr"] = (ti_s - pbt_s_tmp).round(2).where(ti_s.notna() & pbt_s_tmp.notna())
         spec = [
             ("Total Revenue", "Sales_Cr"),
             ("Other Income", "OtherIncome_Cr"),
@@ -463,6 +481,15 @@ def transpose_financials_to_statement(
         df["_EBIT_Cr"] = (pbt_s + int_s).round(2)
         df["_EBITDA_Cr"] = (pbt_s + int_s + dep_s - oi_s).round(2)
     elif st in ("balance_sheet", "bs"):
+        eq_s = pd.to_numeric(df.get("EquityCapital_Cr", pd.Series(dtype=float)), errors="coerce")
+        res_s = pd.to_numeric(df.get("Reserves_Cr", pd.Series(dtype=float)), errors="coerce")
+        debt_s = pd.to_numeric(df.get("TotalBorrowings_Cr", pd.Series(dtype=float)), errors="coerce")
+        cash_s = pd.to_numeric(df.get("TotalCashAndBank_Cr", pd.Series(dtype=float)), errors="coerce")
+        df["_NetWorth_Cr"] = (eq_s.fillna(0.0) + res_s.fillna(0.0)).where(eq_s.notna() | res_s.notna())
+        df["_NetDebt_Cr"] = (debt_s - cash_s).where(debt_s.notna() & cash_s.notna())
+        if "TotalLiabilities_Cr" not in df.columns and "TotalAssets_Cr" in df.columns:
+            ta_s = pd.to_numeric(df["TotalAssets_Cr"], errors="coerce")
+            df["TotalLiabilities_Cr"] = (ta_s - df["_NetWorth_Cr"]).round(2).where(ta_s.notna() & df["_NetWorth_Cr"].notna())
         spec = [
             ("Share Capital", "EquityCapital_Cr"),
             ("Reserves And Surplus", "Reserves_Cr"),
@@ -475,12 +502,6 @@ def transpose_financials_to_statement(
             ("Total Assets", "TotalAssets_Cr"),
             ("Total Liabilities Net Minority Interest", "TotalLiabilities_Cr"),
         ]
-        eq_s = pd.to_numeric(df.get("EquityCapital_Cr", pd.Series(dtype=float)), errors="coerce")
-        res_s = pd.to_numeric(df.get("Reserves_Cr", pd.Series(dtype=float)), errors="coerce")
-        debt_s = pd.to_numeric(df.get("TotalBorrowings_Cr", pd.Series(dtype=float)), errors="coerce")
-        cash_s = pd.to_numeric(df.get("TotalCashAndBank_Cr", pd.Series(dtype=float)), errors="coerce")
-        df["_NetWorth_Cr"] = (eq_s.fillna(0.0) + res_s.fillna(0.0)).where(eq_s.notna() | res_s.notna())
-        df["_NetDebt_Cr"] = (debt_s - cash_s).where(debt_s.notna() & cash_s.notna())
     else:
         spec = [
             ("Operating Cash Flow", "CFO_Cr"),
@@ -496,6 +517,13 @@ def transpose_financials_to_statement(
             df["CFI_Cr"] = df["InvestingCashFlow_Cr"]
         if "CFF_Cr" not in df.columns and "FinancingCashFlow_Cr" in df.columns:
             df["CFF_Cr"] = df["FinancingCashFlow_Cr"]
+        if "NetCashFlow_Cr" not in df.columns and any(c in df.columns for c in ("CFO_Cr", "CFI_Cr", "CFF_Cr")):
+            cfo_n = pd.to_numeric(df.get("CFO_Cr", pd.Series(dtype=float)), errors="coerce")
+            cfi_n = pd.to_numeric(df.get("CFI_Cr", pd.Series(dtype=float)), errors="coerce")
+            cff_n = pd.to_numeric(df.get("CFF_Cr", pd.Series(dtype=float)), errors="coerce")
+            df["NetCashFlow_Cr"] = (cfo_n.fillna(0.0) + cfi_n.fillna(0.0) + cff_n.fillna(0.0)).round(2).where(
+                cfo_n.notna() | cfi_n.notna() | cff_n.notna()
+            )
         cfo_s = pd.to_numeric(df.get("CFO_Cr", pd.Series(dtype=float)), errors="coerce")
         capex_s = pd.to_numeric(df.get("Capex_Cr", pd.Series(dtype=float)), errors="coerce")
         df["_FCF_Cr"] = (cfo_s - capex_s.abs()).where(cfo_s.notna() & capex_s.notna())
@@ -859,9 +887,9 @@ def build_ai_context_india(
                 item = {
                     "date": max_dt.strftime("%Y-%m-%d"),
                     "category": str(r.get("category") or r.get("Category") or ""),
-                    "buy_cr": _finite_float(r.get("buy_cr") or r.get("buyValue")),
-                    "sell_cr": _finite_float(r.get("sell_cr") or r.get("sellValue")),
-                    "net_cr": _finite_float(r.get("net_cr") or r.get("netValue")),
+                    "buy_cr": _first_finite(r.get("buy_cr"), r.get("buyValue")),
+                    "sell_cr": _first_finite(r.get("sell_cr"), r.get("sellValue")),
+                    "net_cr": _first_finite(r.get("net_cr"), r.get("netValue")),
                 }
                 if "FII" in cat or "FPI" in cat:
                     fii_dict = item
@@ -873,9 +901,9 @@ def build_ai_context_india(
                 recent_list.append({
                     "date": pd.Timestamp(r["_dt"]).strftime("%Y-%m-%d"),
                     "category": str(r.get("category") or r.get("Category") or ""),
-                    "buy_cr": _finite_float(r.get("buy_cr") or r.get("buyValue")),
-                    "sell_cr": _finite_float(r.get("sell_cr") or r.get("sellValue")),
-                    "net_cr": _finite_float(r.get("net_cr") or r.get("netValue")),
+                    "buy_cr": _first_finite(r.get("buy_cr"), r.get("buyValue")),
+                    "sell_cr": _first_finite(r.get("sell_cr"), r.get("sellValue")),
+                    "net_cr": _first_finite(r.get("net_cr"), r.get("netValue")),
                 })
             flows_block = {
                 "scope": "market_wide",
@@ -1004,13 +1032,20 @@ def build_research_profile(
     concall_items: list[dict[str, Any]] = []
     if concalls_df is not None and not concalls_df.empty:
         for _, r in concalls_df.head(12).iterrows():
+            doc_type = str(r.get("DocumentType") or r.get("SubCategory") or "").lower()
+            pdf_url = r.get("PDFUrl") or r.get("AttachmentUrl") or r.get("TranscriptUrl") or r.get("URL")
+            ppt_url = r.get("PresentationUrl") or (pdf_url if "presentation" in doc_type else None)
+            aud_url = r.get("AudioUrl") or (pdf_url if "audio" in doc_type or "video" in doc_type else None)
+            tr_url = r.get("AttachmentUrl") or r.get("TranscriptUrl") or (
+                pdf_url if ("presentation" not in doc_type and "audio" not in doc_type) else None
+            )
             concall_items.append({
                 "date": str(r.get("FilingTimestamp") or r.get("Date") or "")[:10],
-                "quarter": str(r.get("Quarter") or r.get("Category") or "Filing"),
+                "quarter": str(r.get("Quarter") or r.get("SubCategory") or r.get("Category") or "Filing"),
                 "title": str(r.get("Headline") or r.get("Subject") or "Investor Filing"),
-                "transcript_url": r.get("AttachmentUrl") or r.get("TranscriptUrl") or r.get("URL"),
-                "audio_url": r.get("AudioUrl"),
-                "presentation_url": r.get("PresentationUrl"),
+                "transcript_url": tr_url,
+                "audio_url": aud_url,
+                "presentation_url": ppt_url,
             })
 
     return {

@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pandas as pd
 
 from datalake.adjuster import OHLCVAdjuster
-from datalake.config import LakeConfig
+from datalake.config import LakeConfig, today_ist
 from datalake.doctor import LakeDoctor
 from datalake.http_client import ResilientHTTPClient, SimpleHTTPResponse
 from datalake.scrapers.deals_docs import DealsAndDocumentsScraper, _normalize_deals_frame
@@ -951,6 +951,15 @@ def test_nse_specific_extensions_and_bse_separation():
             if "shortSelling" in url:
                 short_csv = b"Symbol,Security Name,Quantity Traded\nTCS,Tata Consultancy Services,5000\n"
                 return SimpleHTTPResponse(200, short_csv)
+            if "content/equities/bulk.csv" in url:
+                bulk_csv = b"Date,Symbol,Security Name,Client Name,Buy/Sell,Quantity Traded,Trade Price / Wght. Avg. Price,Remarks\n05-Nov-2026,INFY,Infosys Ltd,Vanguard,BUY,100000,1850.50,-\n"
+                return SimpleHTTPResponse(200, bulk_csv)
+            if "content/equities/block.csv" in url:
+                # Return empty to exercise dynamic fallback
+                return SimpleHTTPResponse(200, b"")
+            if "historicalOR/bulk-block-short-deals" in url:
+                block_csv = b"BD_DT_DATE,BD_SYMBOL,BD_SCRIP_NAME,BD_CLIENT_NAME,BD_BUY_SELL,BD_QTY_TRD,BD_TP_WATP,BD_REMARKS\n05-Nov-2026,RELIANCE,Reliance Industries Ltd,Blackrock,BUY,50000,2500.00,-\n"
+                return SimpleHTTPResponse(200, block_csv)
             if "api.bseindia.com" in url:
                 # Assert BSE requests remain pure and unproxied
                 return SimpleHTTPResponse(200, b"[]")
@@ -1046,6 +1055,249 @@ def test_nse_specific_extensions_and_bse_separation():
         assert len(ss_df) == 1
         assert ss_df.iloc[0]["Symbol"] == "TCS"
 
+        # 6. Test Bulk & Block Deals Sync (Static Archive + Dynamic Fallback + State Recording)
+        asyncio.run(dd.sync_bulk_and_block_deals())
+        bb_path = cfg.root_dir / "deals" / "bulk_block_deals.parquet"
+        assert bb_path.exists()
+        bb_df = read_table_safe(bb_path)
+        assert len(bb_df) == 2
+        assert set(bb_df["Symbol"].values) == {"INFY", "RELIANCE"}
+        today_iso = today_ist().isoformat()
+        assert state.is_completed("nse_bulk_deals", today_iso)
+        assert state.is_completed("nse_block_deals", today_iso)
+
+        # 7. Test StateStore.record accepts both source_url and url kwargs without TypeError
+        state.record("test_url_kwarg_compat", "k1", "OK", 10, url="https://example.com/url")
+        state.record("test_url_kwarg_compat", "k2", "OK", 20, source_url="https://example.com/source_url")
+        with state._session() as conn:
+            r1 = conn.execute("SELECT source_url FROM ingestion_log WHERE dataset = ? AND partition_key = ?", ("test_url_kwarg_compat", "k1")).fetchone()
+            r2 = conn.execute("SELECT source_url FROM ingestion_log WHERE dataset = ? AND partition_key = ?", ("test_url_kwarg_compat", "k2")).fetchone()
+            assert r1 and r1[0] == "https://example.com/url"
+            assert r2 and r2[0] == "https://example.com/source_url"
+
+
+def test_ten_bug_fixes_verification_suite():
+    from datalake.finengine_bridge import (
+        _first_finite,
+        compute_piotroski_score,
+        transpose_financials_to_statement,
+        build_research_profile,
+    )
+    from datalake.engine import UnifiedLakeEngine
+    from datalake.remote import RemoteLakeClient
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = LakeConfig(root_dir=Path(tmpdir))
+        cfg.ensure_dirs()
+        state = StateStore(cfg.state_db_path)
+
+        # 1. Verify Storage NUMERIC_FLOAT_COLS keeps FFMC, LastPrice, Quantity as float64 with pd.NA
+        df_num = pd.DataFrame({
+            "Symbol": ["A", "B", "C"],
+            "FFMC": [5000000.0, pd.NA, 1000000.0],
+            "LastPrice": [150.0, 200.0, pd.NA],
+            "Quantity": [100, pd.NA, 500],
+        })
+        sanitized = sanitize_for_parquet(df_num)
+        assert sanitized["FFMC"].dtype == "float64", f"FFMC should be float64, got {sanitized['FFMC'].dtype}"
+        assert sanitized["LastPrice"].dtype == "float64"
+        assert sanitized["Quantity"].dtype == "float64"
+        assert pd.isna(sanitized["FFMC"].iloc[1])
+
+        # 2. Verify http_client proxy success does NOT reset _nsearchives_fail_streak
+        client = ResilientHTTPClient()
+        client._nsearchives_fail_streak = 5
+        mock_zip = _make_zip("test.csv", b"Date,Symbol\n2026-11-05,INFY\n")
+        client.get = AsyncMock(return_value=SimpleHTTPResponse(200, mock_zip, {"content-type": "application/zip"}))
+        res = asyncio.run(client.fetch_archive_via_proxy("https://nsearchives.nseindia.com/content/test.csv"))
+        assert res.status_code == 200
+        assert client._nsearchives_fail_streak == 5, f"Streak should remain 5, got {client._nsearchives_fail_streak}"
+
+        # 3. Verify UniverseAndActionsScraper synthesizes nse_equity_master.parquet when EQUITY_L fails
+        mock_po_json = json.dumps({
+            "data": [{
+                "metadata": {"symbol": "SYNTHCO", "series": "EQ", "identifier": "INE999A01019", "lastPrice": 120.0},
+                "detail": {"preOpenMarket": {"totalTradedVolume": 1000}},
+            }]
+        }).encode("utf-8")
+        po_http = MagicMock()
+        async def po_get(url, **kwargs):
+            if "market-data-pre-open" in url:
+                return SimpleHTTPResponse(200, mock_po_json)
+            if "api.bseindia.com" in url:
+                return SimpleHTTPResponse(200, b"[]")
+            return SimpleHTTPResponse(404, b"Not Found")
+        po_http.get = AsyncMock(side_effect=po_get)
+        univ = UniverseAndActionsScraper(po_http, state, cfg)
+        asyncio.run(univ.sync_security_masters())
+        eq_master_path = cfg.root_dir / "universe" / "nse_equity_master.parquet"
+        assert eq_master_path.exists(), "nse_equity_master.parquet should have been synthesized from pre-open"
+        eq_df = read_table_safe(eq_master_path)
+        assert len(eq_df) == 1
+        assert eq_df.iloc[0]["SYMBOL"] == "SYNTHCO"
+        assert eq_df.iloc[0]["ISIN NUMBER"] == "INE999A01019"
+
+        # 4. Verify equity_eod historicalOR missing Symbol column and sec_bhavdata mirror fallback
+        eq_http = MagicMock()
+        or_csv = b"Date,Series,Open Price,High Price,Low Price,Close Price,Prev Close,Total Traded Quantity\n05-Nov-2026,EQ,100,105,95,102,100,5000\n"
+        async def eq_mock_get(url, **kwargs):
+            if "historicalOR" in url:
+                return SimpleHTTPResponse(200, or_csv)
+            if "www.nseindia.com/products/content/sec_bhavdata_full" in url:
+                full_bhav_csv = (
+                    b"SYMBOL,SERIES,DATE1,PREV_CLOSE,OPEN_PRICE,HIGH_PRICE,LOW_PRICE,LAST_PRICE,CLOSE_PRICE,AVG_PRICE,TTL_TRD_QNTY,TURNOVER_LACS,NO_OF_TRADES,DELIV_QTY,DELIV_PER\n"
+                    b"TCS,EQ,05-Nov-2026,3900,3920,3980,3910,3955,3950,3940,100000,3940.0,5000,50000,50.0\n"
+                )
+                return SimpleHTTPResponse(200, full_bhav_csv)
+            if "nsearchives.nseindia.com" in url:
+                return SimpleHTTPResponse(404, b"Not Found")
+            return SimpleHTTPResponse(404, b"Not Found")
+        eq_http.get = AsyncMock(side_effect=eq_mock_get)
+        eq_scraper = EquityEODScraper(eq_http, state, cfg)
+        asyncio.run(eq_scraper.backfill_nse_symbol_via_historical_or("TCS", start_year=2026, end_year=2026))
+        eq_pq = cfg.root_dir / "equities" / "nse_cm_2026.parquet"
+        assert eq_pq.exists()
+        eq_loaded = read_table_safe(eq_pq)
+        assert len(eq_loaded) == 1
+        assert eq_loaded.iloc[0]["Symbol"] == "TCS"
+
+        bhav_df, _, used_url = asyncio.run(eq_scraper._fetch_nse_sec_bhavdata_full(date(2026, 11, 5)))
+        assert bhav_df is not None and len(bhav_df) == 1
+        assert "www.nseindia.com" in used_url
+
+        # 5. Verify deals_docs short selling dynamic fallback
+        dyn_short_csv = b"SD_DATE,SD_SYMBOL,SD_QTY\n05-Nov-2026,INFY,12000\n"
+        dd_http = MagicMock()
+        async def dd_mock_get(url, **kwargs):
+            if "nsearchives.nseindia.com" in url:
+                return SimpleHTTPResponse(404, b"Not Found")
+            if "historicalOR/bulk-block-short-deals" in url:
+                return SimpleHTTPResponse(200, dyn_short_csv)
+            return SimpleHTTPResponse(404, b"Not Found")
+        dd_http.get = AsyncMock(side_effect=dd_mock_get)
+        dd_scraper = DealsAndDocumentsScraper(dd_http, state, cfg)
+        asyncio.run(dd_scraper.sync_short_selling(date(2026, 11, 5)))
+        ss_pq = cfg.root_dir / "deals" / "short_selling.parquet"
+        assert ss_pq.exists()
+        ss_df = read_table_safe(ss_pq)
+        assert len(ss_df) == 1
+        assert ss_df.iloc[0]["Symbol"] == "INFY"
+        assert ss_df.iloc[0]["Quantity"] == 12000
+
+        # 6. Verify indices session date parsed from timestamp
+        snap_http = MagicMock()
+        snap_json = json.dumps({
+            "timestamp": "05-Nov-2026 16:00:00",
+            "data": [{
+                "index": "NIFTY 50", "key": "BROAD", "last": 24000.0,
+                "variation": 10.0, "percentChange": 0.05, "open": 23900.0,
+                "high": 24100.0, "low": 23800.0, "previousClose": 23990.0,
+                "yearHigh": 25000.0, "yearLow": 19000.0, "pe": 20.0, "pb": 3.0, "dy": 1.2
+            }]
+        }).encode("utf-8")
+        snap_http.get = AsyncMock(return_value=SimpleHTTPResponse(200, snap_json))
+        idx_scraper = IndicesScraper(snap_http, state, cfg)
+        snap_res = asyncio.run(idx_scraper.sync_all_indices_snapshot())
+        assert len(snap_res) == 1
+        assert pd.Timestamp(snap_res.iloc[0]["Date"]).date() == date(2026, 11, 5)
+
+        # 7. Verify finengine_bridge _first_finite and 0.0 handling
+        assert _first_finite(None, 0.0, 10.0) == 0.0, "0.0 must not be treated as falsy"
+        assert _first_finite(None, "nan", 5.5) == 5.5
+
+        # Piotroski F-score with 0.0 CFO
+        df_fin = pd.DataFrame([{
+            "PeriodEnd": "2026-03-31",
+            "PeriodType": "Annual",
+            "NetProfit_Cr": -50.0,
+            "CFO_Cr": 0.0,
+            "Sales_Cr": 100.0,
+            "EquityCapital_Cr": 10.0,
+            "Reserves_Cr": 40.0,
+            "TotalBorrowings_Cr": 0.0,
+            "TotalAssets_Cr": 50.0,
+        }])
+        score, bdown = compute_piotroski_score(df_fin)
+        assert bdown["F2_Positive_CFO"] is False  # 0.0 > 0 is False
+        assert bdown["F4_Accrual_CFO_gt_PAT"] is True  # 0.0 > -50.0 is True
+
+        # Transpose financials MaterialCost synthesis
+        df_xbrl = pd.DataFrame([{
+            "PeriodEnd": "2026-03-31",
+            "Sales_Cr": 500.0,
+            "MaterialCost_Cr": 150.0,
+            "StockInTradePurchases_Cr": 50.0,
+            "TotalIncome_Cr": 520.0,
+            "PBT_Cr": 80.0,
+            "TotalAssets_Cr": 1000.0,
+            "EquityCapital_Cr": 100.0,
+            "Reserves_Cr": 400.0,
+        }])
+        inc_stmt = transpose_financials_to_statement(df_xbrl, "income_stmt")
+        assert "Cost Of Revenue" in inc_stmt.index
+        assert inc_stmt.loc["Cost Of Revenue"].iloc[0] == 200.0
+        assert "Operating Expense" in inc_stmt.index
+        assert inc_stmt.loc["Operating Expense"].iloc[0] == 440.0
+
+        bs_stmt = transpose_financials_to_statement(df_xbrl, "balance_sheet")
+        assert "Total Liabilities Net Minority Interest" in bs_stmt.index
+        assert bs_stmt.loc["Total Liabilities Net Minority Interest"].iloc[0] == 500.0
+
+        # Concalls PDFUrl mapping in build_research_profile
+        df_concalls = pd.DataFrame([{
+            "FilingTimestamp": "2026-11-05 10:30:00",
+            "Headline": "Earnings Call Q2",
+            "DocumentType": "Earnings Call Transcript",
+            "PDFUrl": "https://www.bseindia.com/xml-data/corpfiling/AttachLive/123.pdf",
+        }])
+        prof = build_research_profile(
+            symbol="TCS",
+            company_name="Tata Consultancy Services",
+            bse_code="532540",
+            isin="INE467B01029",
+            industry="IT Services",
+            face_value=1.0,
+            screener_row=None,
+            fin_df=None,
+            shp_df=None,
+            concalls_df=df_concalls,
+        )
+        assert len(prof["concalls"]) == 1
+        assert prof["concalls"][0]["transcript_url"] == "https://www.bseindia.com/xml-data/corpfiling/AttachLive/123.pdf"
+
+        # 8. Verify remote.shareholding deduping overlapping quarters
+        rl = RemoteLakeClient("http://localhost:9999", cache_dir=None)
+        # Mock dossier returning both nse and bse shareholding
+        dos_nse = pd.DataFrame([
+            {"QuarterEnd": "2026-03-31", "PromoterPct": 50.0, "MutualFundsPct": 10.0},
+            {"QuarterEnd": "2026-06-30", "PromoterPct": 50.0, "MutualFundsPct": 11.0},
+        ])
+        dos_bse = pd.DataFrame([
+            {"QuarterEnd": "2026-03-31", "PromoterPct": 50.0, "TotalShares": 1000000},
+            {"QuarterEnd": "2025-12-31", "PromoterPct": 49.0, "TotalShares": 1000000},
+        ])
+        rl.dossier = MagicMock(return_value={"shareholding": dos_nse, "shareholding_bse": dos_bse})
+        sh_res = rl.shareholding("TCS")
+        assert len(sh_res) == 3, f"Expected 3 deduplicated quarters, got {len(sh_res)}"
+        q_ends = [str(d) for d in sh_res["QuarterEnd"]]
+        assert q_ends == ["2025-12-31", "2026-03-31", "2026-06-30"]
+
+        # 9. Verify engine.sql DuckDB views for new tables
+        write_parquet_atomic(pd.DataFrame([{"Symbol": "TCS", "Quantity": 1000}]), cfg.root_dir / "deals" / "short_selling.parquet")
+        write_parquet_atomic(pd.DataFrame([{"IndexName": "NIFTY 50", "PE": 20.0}]), cfg.root_dir / "indices" / "all_indices_snapshot.parquet")
+        write_parquet_atomic(pd.DataFrame([{"IndexName": "NIFTY 50", "Symbol": "TCS"}]), cfg.root_dir / "indices" / "index_constituents_live.parquet")
+        write_parquet_atomic(pd.DataFrame([{"Symbol": "TCS", "Series": "EQ"}]), cfg.root_dir / "universe" / "nse_market_universe.parquet")
+
+        eng = UnifiedLakeEngine(cfg.root_dir)
+        v_ss = eng.sql("SELECT * FROM short_selling")
+        assert len(v_ss) == 1 and v_ss.iloc[0]["Symbol"] == "TCS"
+        v_ai = eng.sql("SELECT * FROM all_indices")
+        assert len(v_ai) == 1 and v_ai.iloc[0]["IndexName"] == "NIFTY 50"
+        v_cl = eng.sql("SELECT * FROM index_constituents_live")
+        assert len(v_cl) == 1 and v_cl.iloc[0]["Symbol"] == "TCS"
+        v_mu = eng.sql("SELECT * FROM market_universe")
+        assert len(v_mu) == 1 and v_mu.iloc[0]["Symbol"] == "TCS"
+
 
 if __name__ == "__main__":
     test_corporate_action_regex_parser()
@@ -1064,4 +1316,5 @@ if __name__ == "__main__":
     test_nsearchives_resilience_and_uncaught_guards()
     test_nsearchives_proxy_fallback_and_extraction()
     test_nse_specific_extensions_and_bse_separation()
+    test_ten_bug_fixes_verification_suite()
     print("ALL OFFLINE UNIT & INTEGRATION TESTS PASSED!")

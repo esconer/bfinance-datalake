@@ -441,7 +441,13 @@ class IndicesScraper:
             if resp.status_code != 200 or not resp.text.lstrip().startswith("{"):
                 logger.warning("[All Indices Snapshot] Failed with HTTP %s", resp.status_code)
                 return pd.DataFrame()
-            raw_data = resp.json().get("data", [])
+            payload = resp.json()
+            raw_data = payload.get("data", [])
+            ts_str = payload.get("timestamp")
+            if ts_str:
+                parsed_ts = pd.to_datetime(str(ts_str)[:11], format="mixed", dayfirst=True, errors="coerce")
+                if pd.notna(parsed_ts):
+                    today = parsed_ts.date()
         except Exception as exc:
             logger.warning("[All Indices Snapshot] Failed: %s", exc)
             return pd.DataFrame()

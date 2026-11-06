@@ -866,6 +866,7 @@ class UnifiedLakeEngine:
             return pd.DataFrame()
         has_fin = (self.root / "fundamentals" / "xbrl_financials.parquet").exists()
         has_shp = (self.root / "shareholding" / "nse_shareholding_summary.parquet").exists()
+        has_shp_bse = (self.root / "shareholding" / "bse_shareholding_history.parquet").exists()
 
         fin_cols_available = set()
         if has_fin:
@@ -926,14 +927,33 @@ class UnifiedLakeEngine:
         def _shp_col(name: str) -> str:
             return name if name in shp_cols_available else f"CAST(NULL AS DOUBLE) AS {name}"
 
+        bse_shares_cte = """
+            , latest_bse_shares AS (
+                SELECT Symbol, TotalShares AS BSE_TotalShares
+                FROM (
+                    SELECT Symbol, TotalShares,
+                           ROW_NUMBER() OVER (PARTITION BY Symbol ORDER BY QuarterId DESC) AS rn
+                    FROM shareholding_bse
+                    WHERE TotalShares IS NOT NULL AND TotalShares > 0
+                ) WHERE rn = 1
+            )
+        """ if has_shp_bse else ""
+
+        bse_sh_join = "LEFT JOIN latest_bse_shares bs USING (Symbol)" if has_shp_bse else ""
+        if "TotalShares" in shp_cols_available:
+            tot_sh_expr = "COALESCE(s.TotalShares, bs.BSE_TotalShares) AS TotalShares" if has_shp_bse else "s.TotalShares"
+        else:
+            tot_sh_expr = "bs.BSE_TotalShares AS TotalShares" if has_shp_bse else "CAST(NULL AS DOUBLE) AS TotalShares"
+
         shp_cte = f"""
+            {bse_shares_cte}
             , latest_shp AS (
-                SELECT Symbol, QuarterEnd AS ShpQuarter, PromoterPct, PromoterPledgedPct, MutualFundsPct, FPI_Pct, RetailPct,
-                    {_shp_col("TotalShares")}
+                SELECT s.Symbol, s.QuarterEnd AS ShpQuarter, s.PromoterPct, s.PromoterPledgedPct, s.MutualFundsPct, s.FPI_Pct, s.RetailPct,
+                    {tot_sh_expr}
                 FROM (
                     SELECT *, ROW_NUMBER() OVER (PARTITION BY Symbol ORDER BY QuarterEnd DESC) AS rn
                     FROM shareholding
-                ) WHERE rn = 1
+                ) s {bse_sh_join} WHERE s.rn = 1
             )
         """ if has_shp else ""
 
@@ -1517,6 +1537,9 @@ class UnifiedLakeEngine:
                     "fo_nse": "derivatives/nse_fo_*.parquet",
                     "indices": "indices/nifty_30y_ohlc_tri_pe.parquet",
                     "indices_daily": "indices/ind_close_all_*.parquet",
+                    "all_indices": "indices/all_indices_snapshot.parquet",
+                    "index_constituents_live": "indices/index_constituents_live.parquet",
+                    "market_universe": "universe/nse_market_universe.parquet",
                     "financials": "fundamentals/xbrl_financials.parquet",
                     "shareholding": "shareholding/nse_shareholding_summary.parquet",
                     "shareholding_bse": "shareholding/bse_shareholding_history.parquet",
@@ -1525,6 +1548,7 @@ class UnifiedLakeEngine:
                     "actions_bse": "actions/bse_corporate_actions.parquet",
                     "mutual_funds": "mutual_funds/amfi_nav_*.parquet",
                     "deals": "deals/bulk_block_deals.parquet",
+                    "short_selling": "deals/short_selling.parquet",
                     "insider_pit": "deals/insider_trading_pit.parquet",
                     "participant_oi": "flows/fao_participant_oi_*.parquet",
                     "fii_dii": "flows/cash_fii_dii_flows.parquet",

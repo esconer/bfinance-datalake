@@ -124,6 +124,7 @@ class ResilientHTTPClient:
         self._nifty_primed = False
         self._nsearchives_fail_streak = 0
         self._prime_lock = asyncio.Lock()
+        self._proxy_sem = asyncio.Semaphore(2)
 
     def _active_ua(self) -> str:
         prof = _IMPERSONATE_PROFILES[self._profile_idx % len(_IMPERSONATE_PROFILES)]
@@ -161,12 +162,12 @@ class ResilientHTTPClient:
         parsed_url = urllib.parse.urlsplit(url)
         is_nsearchives = parsed_url.netloc == "nsearchives.nseindia.com"
         if is_nsearchives:
-            if self._nsearchives_fail_streak >= 8:
+            if self._nsearchives_fail_streak >= (3 if fallback_proxy else 8):
                 if fallback_proxy:
                     return await self.fetch_archive_via_proxy(url, timeout=timeout)
                 raise RuntimeError("nsearchives.nseindia.com is unreachable from this runner IP")
-            retries = min(retries, 2)
-            timeout = min(timeout, 15.0)
+            retries = 1 if fallback_proxy else min(retries, 2)
+            timeout = min(timeout, 6.0 if fallback_proxy else 15.0)
 
         base_headers = headers or ARCHIVE_HEADERS
         is_exchange = any(k in url for k in ("nseindia.com", "bseindia.com", "niftyindices.com"))
@@ -270,60 +271,60 @@ class ResilientHTTPClient:
         target_path = urllib.parse.urlsplit(target_url).path
         is_xml = target_path.lower().endswith(".xml")
 
-        # Fast path for XML files (Financial & Shareholding XBRLs) via /api/download_xbrl (0.16s vs 4.6s on zipem)
-        if is_xml:
-            encoded_link = urllib.parse.quote(_json.dumps(target_url))
-            xbrl_url = f"https://www.nseindia.com/api/download_xbrl?fileUrl={encoded_link}"
+        async with self._proxy_sem:
+            # Fast path for XML files (Financial & Shareholding XBRLs) via /api/download_xbrl (0.16s vs 4.6s on zipem)
+            if is_xml:
+                encoded_link = urllib.parse.quote(_json.dumps(target_url))
+                xbrl_url = f"https://www.nseindia.com/api/download_xbrl?fileUrl={encoded_link}"
+                resp = await self.get(
+                    xbrl_url,
+                    headers=NSE_API_HEADERS,
+                    prime_nse=True,
+                    timeout=max(timeout, 20.0),
+                    fallback_proxy=False,
+                )
+                if resp.status_code == 200 and b"<" in resp.content[:200]:
+                    return resp
+                if resp.status_code == 404:
+                    return resp
+
+            # Fall back to /api/zipem for non-xml (zip, csv, dat) or if download_xbrl returned non-200
+            encoded_links = urllib.parse.quote(_json.dumps([target_url]))
+            proxy_url = f"https://www.nseindia.com/api/zipem?fileURLs={encoded_links}&type=daily"
             resp = await self.get(
-                xbrl_url,
+                proxy_url,
                 headers=NSE_API_HEADERS,
                 prime_nse=True,
-                timeout=max(timeout, 20.0),
+                timeout=max(timeout, 25.0),
                 fallback_proxy=False,
             )
-            if resp.status_code == 200 and b"<" in resp.content[:200]:
-                self._nsearchives_fail_streak = 0
-                return resp
-            if resp.status_code == 404:
-                self._nsearchives_fail_streak = 0
-                return resp
-
-        # Fall back to /api/zipem for non-xml (zip, csv, dat) or if download_xbrl returned non-200
-        encoded_links = urllib.parse.quote(_json.dumps([target_url]))
-        proxy_url = f"https://www.nseindia.com/api/zipem?fileURLs={encoded_links}&type=daily"
-        resp = await self.get(
-            proxy_url,
-            headers=NSE_API_HEADERS,
-            prime_nse=True,
-            timeout=max(timeout, 25.0),
-            fallback_proxy=False,
-        )
-        if resp.status_code == 200:
-            try:
-                with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-                    namelist = zf.namelist()
-                    if not namelist:
-                        return SimpleHTTPResponse(404, b"Empty zip archive returned by proxy", {})
-                    target_filename = posixpath.basename(target_path)
-                    matched_name = next((n for n in namelist if n == target_filename), namelist[0])
-                    inner_bytes = zf.read(matched_name)
-                    self._nsearchives_fail_streak = 0
-                    return SimpleHTTPResponse(
-                        status_code=200,
-                        content=inner_bytes,
-                        headers={"content-type": "application/octet-stream"},
-                    )
-            except zipfile.BadZipFile:
-                return resp
-        elif resp.status_code == 500:
-            try:
-                payload = _json.loads(resp.text)
-                if "Files not available" in payload.get("error", ""):
-                    self._nsearchives_fail_streak = 0
-                    return SimpleHTTPResponse(404, resp.content, resp.headers)
-            except Exception:
-                pass
-        return resp
+            if resp.status_code == 200:
+                try:
+                    with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                        namelist = zf.namelist()
+                        if not namelist:
+                            return SimpleHTTPResponse(404, b"Empty zip archive returned by proxy", {})
+                        target_filename = posixpath.basename(target_path).lower()
+                        matched_name = next(
+                            (n for n in namelist if posixpath.basename(n).lower() == target_filename),
+                            namelist[0],
+                        )
+                        inner_bytes = zf.read(matched_name)
+                        return SimpleHTTPResponse(
+                            status_code=200,
+                            content=inner_bytes,
+                            headers={"content-type": "application/octet-stream"},
+                        )
+                except zipfile.BadZipFile:
+                    return resp
+            elif resp.status_code == 500:
+                try:
+                    payload = _json.loads(resp.text)
+                    if "Files not available" in payload.get("error", ""):
+                        return SimpleHTTPResponse(404, resp.content, resp.headers)
+                except Exception:
+                    pass
+            return resp
 
     async def post(
         self,

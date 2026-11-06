@@ -95,7 +95,10 @@ class StateStore:
         row_count: int = 0,
         raw_bytes: bytes | None = None,
         source_url: str | None = None,
+        *,
+        url: str | None = None,
     ) -> None:
+        source_url = source_url or url
         digest = hashlib.sha256(raw_bytes).hexdigest() if raw_bytes else None
         now_str = datetime.now(IST).isoformat()
         with self._session() as conn:

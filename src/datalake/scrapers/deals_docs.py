@@ -95,6 +95,7 @@ class DealsAndDocumentsScraper:
             ("BLOCK", "https://nsearchives.nseindia.com/content/equities/block.csv"),
         ):
             raw_df = pd.DataFrame()
+            used_url = url
             try:
                 resp = await self.http.get(url, headers=ARCHIVE_HEADERS)
                 if resp.status_code == 200 and not resp.text.lstrip().startswith("<"):
@@ -114,6 +115,7 @@ class DealsAndDocumentsScraper:
                     d_resp = await self.http.get(dyn_url, headers=NSE_API_HEADERS, prime_nse=True)
                     if d_resp.status_code == 200 and not d_resp.text.lstrip().startswith("<"):
                         raw_df = pd.read_csv(io.StringIO(d_resp.text), on_bad_lines="skip")
+                        used_url = dyn_url
                 except Exception as dyn_exc:
                     logger.debug("[NSE %s Dynamic Deals Fallback] %s", deal_type, dyn_exc)
 
@@ -129,32 +131,61 @@ class DealsAndDocumentsScraper:
                 dedup_cols=["Date", "Exchange", "DealType", "Symbol", "Client Name", "Buy/Sell", "Quantity Traded"],
                 sort_cols=["Symbol", "Date"],
             )
-            self.state.record(f"nse_{deal_type.lower()}_deals", today_ist().isoformat(), "OK", len(df), url=url)
+            self.state.record(f"nse_{deal_type.lower()}_deals", today_ist().isoformat(), "OK", len(df), source_url=used_url)
 
     async def sync_short_selling(self, target_date: date | None = None) -> None:
         """Syncs daily NSE institutional and retail short selling disclosures."""
         d = target_date or today_ist()
         d_str = d.strftime("%d%m%Y")
         url = f"https://nsearchives.nseindia.com/archives/equities/shortSelling/shortselling_{d_str}.csv"
+        df = pd.DataFrame()
+        raw_bytes: bytes | None = None
         try:
             resp = await self.http.get(url, headers=ARCHIVE_HEADERS)
-            if resp.status_code != 200 or not resp.text.strip() or resp.text.lstrip().startswith("<"):
-                return
-            df = pd.read_csv(io.StringIO(resp.text), on_bad_lines="skip")
-            df.columns = [c.strip() for c in df.columns]
-            if df.empty:
-                return
-            df["Date"] = pd.Timestamp(d)
-            target = self.cfg.root_dir / "deals" / "short_selling.parquet"
-            upsert_parquet_partition(
-                df,
-                target,
-                dedup_cols=["Date", "Symbol", "Client Name"] if "Client Name" in df.columns else ["Date", "Symbol"],
-                sort_cols=["Symbol", "Date"],
-            )
-            self.state.record("nse_short_selling", d.isoformat(), "OK", len(df), resp.content, url)
+            if resp.status_code == 200 and resp.text.strip() and not resp.text.lstrip().startswith("<"):
+                df = pd.read_csv(io.StringIO(resp.text), on_bad_lines="skip")
+                raw_bytes = resp.content
         except Exception as exc:
             logger.debug("[NSE Short Selling %s] Skipped: %s", d, exc)
+
+        if df.empty:
+            from_d = (d - timedelta(days=7)).strftime("%d-%m-%Y")
+            to_d = d.strftime("%d-%m-%Y")
+            dyn_url = (
+                f"https://www.nseindia.com/api/historicalOR/bulk-block-short-deals"
+                f"?optionType=short_deals&from={from_d}&to={to_d}&csv=true"
+            )
+            try:
+                d_resp = await self.http.get(dyn_url, headers=NSE_API_HEADERS, prime_nse=True)
+                if d_resp.status_code == 200 and d_resp.text.strip() and not d_resp.text.lstrip().startswith("<"):
+                    df = pd.read_csv(io.StringIO(d_resp.text), on_bad_lines="skip")
+                    raw_bytes = d_resp.content
+                    url = dyn_url
+            except Exception as dyn_exc:
+                logger.debug("[NSE Dynamic Short Selling Fallback] %s", dyn_exc)
+
+        if df.empty:
+            return
+        df.columns = [str(c).lstrip("\ufeff").strip() for c in df.columns]
+        col_map = {"SD_DATE": "Date", "SD_SYMBOL": "Symbol", "Symbol Name": "Symbol", "SD_QTY": "Quantity", "Quantity Traded": "Quantity"}
+        df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+        if "Symbol" not in df.columns:
+            return
+        df = df[~df["Symbol"].astype(str).str.upper().str.contains("NO RECORDS")].copy()
+        if df.empty:
+            return
+        if "Date" in df.columns:
+            df["Date"] = pd.to_datetime(df["Date"].astype(str).str.strip(), format="mixed", dayfirst=True, errors="coerce").fillna(pd.Timestamp(d))
+        else:
+            df["Date"] = pd.Timestamp(d)
+        target = self.cfg.root_dir / "deals" / "short_selling.parquet"
+        upsert_parquet_partition(
+            df,
+            target,
+            dedup_cols=["Date", "Symbol", "Client Name"] if "Client Name" in df.columns else ["Date", "Symbol"],
+            sort_cols=["Symbol", "Date"],
+        )
+        self.state.record("nse_short_selling", d.isoformat(), "OK", len(df), raw_bytes, url)
 
     async def backfill_historical_bulk_block_deals(
         self, start_year: int = 2005, end_year: int | None = None, force: bool = False

@@ -224,6 +224,16 @@ class UniverseAndActionsScraper:
                         po_df = pd.DataFrame(po_rows)
                         write_parquet_atomic(po_df, self.cfg.root_dir / "universe" / "nse_market_universe.parquet")
                         self.state.record("security_master", "nse_market_universe", "OK", len(po_df))
+                        eq_master_path = self.cfg.root_dir / "universe" / "nse_equity_master.parquet"
+                        if not eq_master_path.exists():
+                            synth_eq = pd.DataFrame({
+                                "SYMBOL": po_df["Symbol"],
+                                "NAME OF COMPANY": po_df["Symbol"],
+                                "SERIES": po_df["Series"],
+                                "ISIN NUMBER": po_df["ISIN"],
+                            })
+                            write_parquet_atomic(synth_eq, eq_master_path)
+                            self.state.record("security_master", "nse_equity_master.parquet", "OK", len(synth_eq))
         except Exception as exc:
             logger.warning("[NSE Market Universe] Skipped: %s", exc)
 

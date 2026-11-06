@@ -366,28 +366,35 @@ class EquityEODScraper:
                     f"?from=01-01-{year}&to=31-12-{year}&symbol={sym}"
                     "&type=priceVolumeDeliverable&series=ALL&csv=true"
                 )
-                resp = await self.http.get(url, headers=NSE_API_HEADERS, prime_nse=True)
+                try:
+                    resp = await self.http.get(url, headers=NSE_API_HEADERS, prime_nse=True)
+                except Exception as exc:
+                    logger.warning("[NSE HistoricalOR %s] Failed: %s", key, exc)
+                    continue
                 if resp.status_code != 200 or not resp.text.strip() or resp.text.lstrip().startswith("<"):
                     continue
                 df = pd.read_csv(io.StringIO(resp.text), on_bad_lines="skip")
-                df.columns = [c.strip() for c in df.columns]
+                df.columns = [str(c).lstrip("\ufeff").strip() for c in df.columns]
                 if df.empty or "Date" not in df.columns:
                     self.state.record("nse_historical_or_symbol", key, "HOLIDAY", source_url=url)
                     continue
+                sym_col = next((c for c in df.columns if c.upper() == "SYMBOL"), None)
+                sym_series = df[sym_col].astype(str).str.strip() if sym_col else sym
+                ser_col = next((c for c in df.columns if c.upper() == "SERIES"), None)
                 out = pd.DataFrame({
                     "Date": pd.to_datetime(df["Date"].astype(str).str.strip(), format="mixed", dayfirst=True, errors="coerce"),
                     "Exchange": "NSE",
-                    "InstrumentId": df["Symbol"].astype(str).str.strip(),
-                    "Symbol": df["Symbol"].astype(str).str.strip(),
-                    "Series": df["Series"].astype(str).str.strip(),
+                    "InstrumentId": sym_series,
+                    "Symbol": sym_series,
+                    "Series": df[ser_col].astype(str).str.strip() if ser_col else "EQ",
                     "ISIN": pd.NA,
-                    "Open": pd.to_numeric(df["Open Price"].astype(str).str.replace(",", ""), errors="coerce"),
-                    "High": pd.to_numeric(df["High Price"].astype(str).str.replace(",", ""), errors="coerce"),
-                    "Low": pd.to_numeric(df["Low Price"].astype(str).str.replace(",", ""), errors="coerce"),
-                    "Close": pd.to_numeric(df["Close Price"].astype(str).str.replace(",", ""), errors="coerce"),
-                    "Last": pd.to_numeric(df["Last Price"].astype(str).str.replace(",", ""), errors="coerce"),
-                    "PrevClose": pd.to_numeric(df["Prev Close"].astype(str).str.replace(",", ""), errors="coerce"),
-                    "Volume": pd.to_numeric(df["Total Traded Quantity"].astype(str).str.replace(",", ""), errors="coerce"),
+                    "Open": pd.to_numeric(df.get("Open Price", df.get("Open", pd.Series(dtype=str))).astype(str).str.replace(",", ""), errors="coerce"),
+                    "High": pd.to_numeric(df.get("High Price", df.get("High", pd.Series(dtype=str))).astype(str).str.replace(",", ""), errors="coerce"),
+                    "Low": pd.to_numeric(df.get("Low Price", df.get("Low", pd.Series(dtype=str))).astype(str).str.replace(",", ""), errors="coerce"),
+                    "Close": pd.to_numeric(df.get("Close Price", df.get("Close", pd.Series(dtype=str))).astype(str).str.replace(",", ""), errors="coerce"),
+                    "Last": pd.to_numeric(df.get("Last Price", df.get("Last", df.get("Close Price", pd.Series(dtype=str)))).astype(str).str.replace(",", ""), errors="coerce"),
+                    "PrevClose": pd.to_numeric(df.get("Prev Close", df.get("PrevClose", pd.Series(dtype=str))).astype(str).str.replace(",", ""), errors="coerce"),
+                    "Volume": pd.to_numeric(df.get("Total Traded Quantity", df.get("Volume", pd.Series(dtype=str))).astype(str).str.replace(",", ""), errors="coerce"),
                     "TurnoverValue": pd.to_numeric(
                         df.get("Turnover ₹", df.get("Turnover", pd.Series(dtype=str))).astype(str).str.replace(",", ""),
                         errors="coerce",
@@ -416,6 +423,14 @@ class EquityEODScraper:
     async def _fetch_nse_sec_bhavdata_full(self, day: date) -> tuple[pd.DataFrame | None, bytes | None, str]:
         url = f"https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{day:%d%m%Y}.csv"
         resp = await self.http.get(url, headers=ARCHIVE_HEADERS)
+        if resp.status_code in (404, 403) or resp.text[:250].lstrip().startswith("<"):
+            mirror_url = f"https://www.nseindia.com/products/content/sec_bhavdata_full_{day:%d%m%Y}.csv"
+            try:
+                m_resp = await self.http.get(mirror_url, headers=ARCHIVE_HEADERS, prime_nse=True, fallback_proxy=False)
+                if m_resp.status_code == 200 and "SYMBOL" in m_resp.text[:250].upper():
+                    resp, url = m_resp, mirror_url
+            except Exception:
+                pass
         if resp.status_code in (404, 403):
             return None, None, url
         # Guard against HTML error pages served with HTTP 200 (e.g. 2022-08-08)

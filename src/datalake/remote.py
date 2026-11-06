@@ -594,6 +594,18 @@ class RemoteLakeClient:
             for c in ("Open", "High", "Low", "Close", "Last", "PrevClose"):
                 if c in df.columns:
                     df[c] = (df[c] * ratio).round(4)
+            if "Stock Splits" in df.columns:
+                import numpy as np
+                sp_arr = pd.to_numeric(df["Stock Splits"], errors="coerce").fillna(0.0).replace(0.0, 1.0).to_numpy(dtype=float)
+                rev_cum = np.cumprod(sp_arr[::-1])[::-1]
+                cum_sp = np.ones(len(df), dtype=float)
+                if len(df) > 1:
+                    cum_sp[:-1] = 1.0 / rev_cum[1:]
+                for vcol in ("Volume", "DeliverableQty"):
+                    if vcol in df.columns:
+                        df[vcol] = (pd.to_numeric(df[vcol], errors="coerce") / cum_sp).round()
+                if "Dividends" in df.columns:
+                    df["Dividends"] = (pd.to_numeric(df["Dividends"], errors="coerce") * cum_sp).round(4)
         years = pd.to_datetime(df["Date"]).dt.year
         out = (
             df[(years >= start_year) & (years <= end_year)]
@@ -913,7 +925,21 @@ class RemoteLakeClient:
             if exch == "NSE" and exchange is not None and not nse_s.empty:
                 return nse_s.copy()
             if not nse_s.empty and not bse_s.empty:
-                return pd.concat([bse_s, nse_s], ignore_index=True)
+                ndf = nse_s.copy()
+                ndf["_source_prio"] = 0
+                bdf = bse_s.copy()
+                bdf["_source_prio"] = 1
+                comb = pd.concat([ndf, bdf], ignore_index=True)
+                if "QuarterEnd" in comb.columns:
+                    comb["QuarterEnd"] = (
+                        pd.to_datetime(comb["QuarterEnd"], format="mixed", errors="coerce")
+                        .dt.to_period("Q").dt.end_time.dt.date
+                    )
+                    comb["_has_xbrl"] = comb["MutualFundsPct"].notna() if "MutualFundsPct" in comb.columns else False
+                    comb = comb.sort_values(["QuarterEnd", "_has_xbrl", "_source_prio"], ascending=[True, False, True])
+                    comb = comb.drop_duplicates(subset=["QuarterEnd"], keep="first")
+                    return comb.drop(columns=["_source_prio", "_has_xbrl"], errors="ignore").sort_values("QuarterEnd").reset_index(drop=True)
+                return comb
             if not nse_s.empty:
                 return nse_s.copy()
             if not bse_s.empty:
