@@ -460,17 +460,21 @@ class IndicesScraper:
             idx_name = str(item.get("index") or "").strip()
             if not idx_name:
                 continue
+            last_p = pd.to_numeric(item.get("last"), errors="coerce")
+            open_p = pd.to_numeric(item.get("open"), errors="coerce")
+            high_p = pd.to_numeric(item.get("high"), errors="coerce")
+            low_p = pd.to_numeric(item.get("low"), errors="coerce")
             rows.append({
                 "Date": pd.Timestamp(today),
                 "Category": str(item.get("key") or "").strip().upper(),
                 "IndexName": idx_name,
                 "IndexSymbol": str(item.get("indexSymbol") or idx_name).strip().upper(),
-                "LastPrice": pd.to_numeric(item.get("last"), errors="coerce"),
+                "LastPrice": last_p,
                 "Variation": pd.to_numeric(item.get("variation"), errors="coerce"),
                 "PercentChange": pd.to_numeric(item.get("percentChange"), errors="coerce"),
-                "Open": pd.to_numeric(item.get("open"), errors="coerce"),
-                "High": pd.to_numeric(item.get("high"), errors="coerce"),
-                "Low": pd.to_numeric(item.get("low"), errors="coerce"),
+                "Open": open_p if (pd.notna(open_p) and open_p > 0) else last_p,
+                "High": high_p if (pd.notna(high_p) and high_p > 0) else last_p,
+                "Low": low_p if (pd.notna(low_p) and low_p > 0) else last_p,
                 "PreviousClose": pd.to_numeric(item.get("previousClose"), errors="coerce"),
                 "YearHigh": pd.to_numeric(item.get("yearHigh"), errors="coerce"),
                 "YearLow": pd.to_numeric(item.get("yearLow"), errors="coerce"),
@@ -676,19 +680,23 @@ class IndicesScraper:
                         sym_label = idx_sym
                         series_label = "SYNTHETIC_INDEX"
 
+                    lp = pd.to_numeric(item.get("LastPrice"), errors="coerce")
+                    op = pd.to_numeric(item.get("Open"), errors="coerce")
+                    hp = pd.to_numeric(item.get("High"), errors="coerce")
+                    lop = pd.to_numeric(item.get("Low"), errors="coerce")
                     frames.append({
                         "IndexName": idx_name,
                         "IndexSymbol": idx_sym,
                         "Category": cat,
                         "Symbol": sym_label,
                         "Series": series_label,
-                        "LastPrice": pd.to_numeric(item["LastPrice"], errors="coerce"),
-                        "Change": pd.to_numeric(item["Variation"], errors="coerce"),
-                        "PercentChange": pd.to_numeric(item["PercentChange"], errors="coerce"),
-                        "Open": pd.to_numeric(item["Open"], errors="coerce"),
-                        "High": pd.to_numeric(item["High"], errors="coerce"),
-                        "Low": pd.to_numeric(item["Low"], errors="coerce"),
-                        "PreviousClose": pd.to_numeric(item["PreviousClose"], errors="coerce"),
+                        "LastPrice": lp,
+                        "Change": pd.to_numeric(item.get("Variation"), errors="coerce"),
+                        "PercentChange": pd.to_numeric(item.get("PercentChange"), errors="coerce"),
+                        "Open": op if (pd.notna(op) and op > 0) else lp,
+                        "High": hp if (pd.notna(hp) and hp > 0) else lp,
+                        "Low": lop if (pd.notna(lop) and lop > 0) else lp,
+                        "PreviousClose": pd.to_numeric(item.get("PreviousClose"), errors="coerce"),
                         "TotalTradedVolume": pd.NA,
                         "TotalTradedValue": pd.NA,
                         "FFMC": pd.NA,

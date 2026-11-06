@@ -350,33 +350,37 @@ class EquityEODScraper:
         resolver = SymbolRenameResolver.from_lake(self.cfg.root_dir)
         canon_sym = symbol.strip().upper()
 
-        for year in range(start_year, end_year + 1):
-            # Check both Jan 1 and Dec 31 in case a rename occurred mid-year
+        cur_year = start_year
+        while cur_year <= end_year:
+            win_end = min(end_year, cur_year + 4)
+            # Check renames across the window
             active_syms = list(dict.fromkeys([
-                resolver.traded_as_on(canon_sym, date(year, 1, 1)),
-                resolver.traded_as_on(canon_sym, date(year, 12, 31)),
+                resolver.traded_as_on(canon_sym, date(cur_year, 1, 1)),
+                resolver.traded_as_on(canon_sym, date(win_end, 12, 31)),
                 canon_sym,
             ]))
             for sym in active_syms:
-                key = f"{sym}:{year}"
-                if self.state.is_completed("nse_historical_or_symbol", key):
+                needed_years = [y for y in range(cur_year, win_end + 1) if not self.state.is_completed("nse_historical_or_symbol", f"{sym}:{y}")]
+                if not needed_years:
                     continue
+
                 url = (
                     "https://www.nseindia.com/api/historicalOR/generateSecurityWiseHistoricalData"
-                    f"?from=01-01-{year}&to=31-12-{year}&symbol={sym}"
+                    f"?from=01-01-{cur_year}&to=31-12-{win_end}&symbol={sym}"
                     "&type=priceVolumeDeliverable&series=ALL&csv=true"
                 )
                 try:
                     resp = await self.http.get(url, headers=NSE_API_HEADERS, prime_nse=True)
                 except Exception as exc:
-                    logger.warning("[NSE HistoricalOR %s] Failed: %s", key, exc)
+                    logger.warning("[NSE HistoricalOR %s %d..%d] Failed: %s", sym, cur_year, win_end, exc)
                     continue
                 if resp.status_code != 200 or not resp.text.strip() or resp.text.lstrip().startswith("<"):
                     continue
                 df = pd.read_csv(io.StringIO(resp.text), on_bad_lines="skip")
                 df.columns = [str(c).lstrip("\ufeff").strip() for c in df.columns]
                 if df.empty or "Date" not in df.columns:
-                    self.state.record("nse_historical_or_symbol", key, "HOLIDAY", source_url=url)
+                    for y in needed_years:
+                        self.state.record("nse_historical_or_symbol", f"{sym}:{y}", "HOLIDAY", source_url=url)
                     continue
                 sym_col = next((c for c in df.columns if c.upper() == "SYMBOL"), None)
                 sym_series = df[sym_col].astype(str).str.strip() if sym_col else sym
@@ -413,12 +417,21 @@ class EquityEODScraper:
                     ),
                 }).dropna(subset=["Date"])
                 out = repair_ohlc(out)
-                target = self.cfg.root_dir / "equities" / f"nse_cm_{year}.parquet"
-                upsert_parquet_partition(
-                    out, target, dedup_cols=["Date", "Exchange", "InstrumentId", "Series"], sort_cols=["Symbol", "Date"]
-                )
-                self.state.record("nse_historical_or_symbol", key, "OK", len(out), resp.content, url)
+
+                for yr, grp in out.groupby(out["Date"].dt.year):
+                    target = self.cfg.root_dir / "equities" / f"nse_cm_{int(yr)}.parquet"
+                    upsert_parquet_partition(
+                        grp, target, dedup_cols=["Date", "Exchange", "InstrumentId", "Series"], sort_cols=["Symbol", "Date"]
+                    )
+                    self.state.record("nse_historical_or_symbol", f"{sym}:{int(yr)}", "OK", len(grp), source_url=url)
+
+                covered_years = set(out["Date"].dt.year.unique())
+                for y in needed_years:
+                    if y not in covered_years:
+                        self.state.record("nse_historical_or_symbol", f"{sym}:{y}", "HOLIDAY", source_url=url)
+
                 await asyncio.sleep(0.35)
+            cur_year = win_end + 1
 
     async def _fetch_nse_sec_bhavdata_full(self, day: date) -> tuple[pd.DataFrame | None, bytes | None, str]:
         url = f"https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{day:%d%m%Y}.csv"

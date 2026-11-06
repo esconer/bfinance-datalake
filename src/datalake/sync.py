@@ -251,6 +251,7 @@ def build_company_dossier_pack(
         "actions": ("actions/nse_corporate_actions.parquet", "symbol", None),
         "actions_bse": ("actions/bse_corporate_actions.parquet", "short_name", "scrip_code"),
         "deals": ("deals/bulk_block_deals.parquet", "Symbol", None),
+        "short_selling": ("deals/short_selling.parquet", "Symbol", None),
         "insider_trades": ("deals/insider_trading_pit.parquet", "symbol", None),
         "annual_reports": ("documents/annual_reports.parquet", "Symbol", "ScripCode"),
         "concalls": ("documents/concalls_and_filings.parquet", "Symbol", "ScripCode"),

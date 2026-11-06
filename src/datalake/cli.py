@@ -6,7 +6,7 @@ import logging
 from datetime import date, timedelta
 from pathlib import Path
 
-from datalake.config import LakeConfig, today_ist
+from datalake.config import LakeConfig, now_ist, today_ist
 from datalake.doctor import LakeDoctor
 from datalake.http_client import ResilientHTTPClient
 from datalake.scrapers.deals_docs import DealsAndDocumentsScraper
@@ -32,6 +32,29 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("datalake.cli")
 
 
+async def _resolve_published_eod_end(http: ResilientHTTPClient, requested_end: date) -> date:
+    """
+    If `requested_end >= today_ist()`, check `/api/merged-daily-reports?key=CM` (or IST hour < 18)
+    so we don't poll EOD archives and 17 Nifty indices for today's unclosed/unpublished session.
+    """
+    today = today_ist()
+    if requested_end < today:
+        return requested_end
+    try:
+        m_resp = await http.get("https://www.nseindia.com/api/merged-daily-reports?key=CM", prime_nse=True, timeout=10.0)
+        if m_resp.status_code == 200 and m_resp.text.lstrip().startswith("{"):
+            actl_name = m_resp.json().get("CM-UDIFF-BHAVCOPY-CSV", {}).get("fileActlName", "")
+            if today.strftime("%Y%m%d") in actl_name or today.strftime("%d%m%Y") in actl_name:
+                return today
+            logger.info("NSE EOD Bhavcopy for %s is not published yet (~18:30 IST); clamping EOD target to %s.", today, today - timedelta(days=1))
+            return today - timedelta(days=1)
+    except Exception as exc:
+        logger.debug("Publication check skipped: %s", exc)
+    if now_ist().hour < 18:
+        return today - timedelta(days=1)
+    return requested_end
+
+
 async def run_backfill(
     cfg: LakeConfig,
     start: date,
@@ -51,24 +74,25 @@ async def run_backfill(
         fo = DerivativesEODScraper(http, state, cfg)
         ff = FundsAndFlowsScraper(http, state, cfg)
         dd = DealsAndDocumentsScraper(http, state, cfg)
+        eod_end = await _resolve_published_eod_end(http, end)
 
         logger.info("=== Step 1/6: Security Masters, Symbol Renames, PIT Nifty Constituents & 30Y Corporate Actions ===")
         await univ.sync_security_masters()
         await univ.sync_corporate_actions(start_year=max(1995, start.year), end_year=end.year, force=force)
 
         logger.info("=== Step 2/6: 30-Year Nifty Indices OHLC + TRI + P/E Bulk Backfill ===")
-        await indices.backfill_30y_bulk(start_date=start, end_date=end, force=force)
-        await indices.sync_daily_snapshots(start_date=max(date(2012, 1, 2), start), end_date=end)
+        await indices.backfill_30y_bulk(start_date=start, end_date=eod_end, force=force)
+        await indices.sync_daily_snapshots(start_date=max(date(2012, 1, 2), start), end_date=eod_end)
 
-        logger.info("=== Step 3/6: NSE & BSE Daily Equity OHLCV + Delivery (%s -> %s) ===", start, end)
-        await eq.sync_range(start_date=start, end_date=end, exchanges=("NSE", "BSE"), force=force)
+        logger.info("=== Step 3/6: NSE & BSE Daily Equity OHLCV + Delivery (%s -> %s) ===", start, eod_end)
+        await eq.sync_range(start_date=start, end_date=eod_end, exchanges=("NSE", "BSE"), force=force)
 
         if include_fo:
-            logger.info("=== Step 4/6: NSE & BSE F&O Futures + Option Chains (%s -> %s) ===", start, end)
-            await fo.sync_range(start_date=start, end_date=end, exchanges=("NSE", "BSE"), force=force)
+            logger.info("=== Step 4/6: NSE & BSE F&O Futures + Option Chains (%s -> %s) ===", start, eod_end)
+            await fo.sync_range(start_date=start, end_date=eod_end, exchanges=("NSE", "BSE"), force=force)
 
         logger.info("=== Step 5/6: F&O Participant OI, Cash FII/DII, Bulk/Block Deals, Insider PIT & Concalls ===")
-        await ff.sync_participant_oi(start_date=max(date(2012, 1, 2), start), end_date=end, force=force)
+        await ff.sync_participant_oi(start_date=max(date(2012, 1, 2), start), end_date=eod_end, force=force)
         await dd.sync_cash_fii_dii_daily()
         await dd.sync_bulk_and_block_deals()
         await dd.backfill_historical_bulk_block_deals(start_year=max(2005, start.year), end_year=end.year, force=force)
@@ -109,28 +133,21 @@ async def run_daily_update(cfg: LakeConfig, lookback_days: int = 7, include_fo: 
         idx_start = state.max_ok_date("indices_daily_all") or default_start
         oi_start = state.max_ok_date("nse_participant_oi") or default_start
 
-        try:
-            m_resp = await http.get("https://www.nseindia.com/api/merged-daily-reports?key=CM", prime_nse=True, timeout=10.0)
-            if m_resp.status_code == 200:
-                actl_name = m_resp.json().get("CM-UDIFF-BHAVCOPY-CSV", {}).get("fileActlName", "")
-                if today.strftime("%Y%m%d") not in actl_name and today.strftime("%d%m%Y") not in actl_name:
-                    logger.info("NSE EOD Bhavcopy for %s is not published yet on exchange (typical release is ~18:30 IST).", today)
-        except Exception as exc:
-            logger.debug("Publication check skipped: %s", exc)
+        eod_end = await _resolve_published_eod_end(http, today)
 
-        await eq.sync_range(nse_start, today, exchanges=("NSE",))
-        await eq.sync_range(bse_start, today, exchanges=("BSE",))
+        await eq.sync_range(nse_start, eod_end, exchanges=("NSE",))
+        await eq.sync_range(bse_start, eod_end, exchanges=("BSE",))
 
         if include_fo:
             fo_nse_start = state.max_ok_date("fo_eod_nse") or default_start
             fo_bse_start = state.max_ok_date("fo_eod_bse") or default_start
-            await fo.sync_range(fo_nse_start, today, exchanges=("NSE",))
-            await fo.sync_range(fo_bse_start, today, exchanges=("BSE",))
+            await fo.sync_range(fo_nse_start, eod_end, exchanges=("NSE",))
+            await fo.sync_range(fo_bse_start, eod_end, exchanges=("BSE",))
 
-        await indices.sync_daily_snapshots(idx_start, today)
-        await indices.backfill_30y_bulk(start_date=default_start, end_date=today)
+        await indices.sync_daily_snapshots(idx_start, eod_end)
+        await indices.backfill_30y_bulk(start_date=default_start, end_date=eod_end)
         indices.sync_vix_and_1d_rate_from_snapshots()
-        await ff.sync_participant_oi(oi_start, today)
+        await ff.sync_participant_oi(oi_start, eod_end)
         await dd.sync_cash_fii_dii_daily()
         await dd.sync_bulk_and_block_deals()
         await dd.sync_short_selling()

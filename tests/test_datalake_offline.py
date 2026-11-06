@@ -5,7 +5,7 @@ import io
 import json
 import tempfile
 import zipfile
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 import pandas as pd
@@ -1299,6 +1299,134 @@ def test_ten_bug_fixes_verification_suite():
         assert len(v_mu) == 1 and v_mu.iloc[0]["Symbol"] == "TCS"
 
 
+def test_bugs_11_to_15_verification_suite():
+    from datalake.cli import _resolve_published_eod_end
+    from datalake.engine import UnifiedLakeEngine
+    from datalake.sync import build_company_dossier_pack
+    from datalake.doctor import LakeDoctor
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = LakeConfig(root_dir=Path(tmpdir))
+        cfg.ensure_dirs()
+        state = StateStore(cfg.state_db_path)
+
+        # 1. Verify Bug 11: _resolve_published_eod_end
+        http_cli = MagicMock()
+        today = today_ist()
+        yesterday = today - timedelta(days=1)
+
+        # 1a. Requested end in past returns unchanged
+        res_past = asyncio.run(_resolve_published_eod_end(http_cli, date(2025, 1, 1)))
+        assert res_past == date(2025, 1, 1)
+
+        # 1b. Requested end today, but merged report has yesterday's date -> clamps to yesterday
+        old_resp = SimpleHTTPResponse(200, json.dumps({
+            "CM-UDIFF-BHAVCOPY-CSV": {"fileActlName": f"BhavCopy_NSE_CM_0_0_0_{yesterday:%Y%m%d}_F_0000.csv.zip"}
+        }).encode())
+        http_cli.get = AsyncMock(return_value=old_resp)
+        res_unpub = asyncio.run(_resolve_published_eod_end(http_cli, today))
+        assert res_unpub == yesterday
+
+        # 1c. Requested end today, merged report has today's date -> returns today
+        today_resp = SimpleHTTPResponse(200, json.dumps({
+            "CM-UDIFF-BHAVCOPY-CSV": {"fileActlName": f"BhavCopy_NSE_CM_0_0_0_{today:%Y%m%d}_F_0000.csv.zip"}
+        }).encode())
+        http_cli.get = AsyncMock(return_value=today_resp)
+        res_pub = asyncio.run(_resolve_published_eod_end(http_cli, today))
+        assert res_pub == today
+
+        # 2. Verify Bug 12: backfill_nse_symbol_via_historical_or 5-year rolling chunks
+        calls = []
+        async def mock_or_get(url, **kwargs):
+            calls.append(url)
+            return SimpleHTTPResponse(200, (
+                b"Date,Symbol,Series,Open Price,High Price,Low Price,Close Price,Total Traded Quantity\n"
+                b"15-Jan-2016,WIPRO,EQ,500.0,510.0,495.0,505.0,1000\n"
+                b"15-Jan-2018,WIPRO,EQ,600.0,610.0,595.0,605.0,2000\n"
+            ))
+        eq_http = MagicMock()
+        eq_http.get = AsyncMock(side_effect=mock_or_get)
+        eq_scraper = EquityEODScraper(eq_http, state, cfg)
+
+        # 10 years: 2015 to 2024 -> makes 2 calls (2015-2019, 2020-2024) instead of 10
+        asyncio.run(eq_scraper.backfill_nse_symbol_via_historical_or("WIPRO", start_year=2015, end_year=2024))
+        assert len(calls) == 2, f"Expected 2 5-year rolling calls, got {len(calls)}"
+        assert "from=01-01-2015&to=31-12-2019" in calls[0]
+        assert "from=01-01-2020&to=31-12-2024" in calls[1]
+        assert (cfg.root_dir / "equities" / "nse_cm_2016.parquet").exists()
+        assert (cfg.root_dir / "equities" / "nse_cm_2018.parquet").exists()
+
+        # 3. Verify Bug 13: IndicesScraper Open/High/Low fallback to LastPrice
+        snap_http = MagicMock()
+        snap_payload = json.dumps({
+            "timestamp": "05-Nov-2026 16:00:00",
+            "data": [
+                {
+                    "index": "FIXED_INCOME_TEST",
+                    "key": "FIXED_INCOME",
+                    "last": 1250.5,
+                    "open": 0.0,
+                    "high": None,
+                    "low": "0.0",
+                    "previousClose": 1248.0,
+                    "variation": 2.5,
+                    "percentChange": 0.2,
+                }
+            ]
+        }).encode("utf-8")
+        snap_http.get = AsyncMock(return_value=SimpleHTTPResponse(200, snap_payload))
+        idx_scraper = IndicesScraper(snap_http, state, cfg)
+        snap_df = asyncio.run(idx_scraper.sync_all_indices_snapshot())
+        row = snap_df.iloc[0]
+        assert row["LastPrice"] == 1250.5
+        assert row["Open"] == 1250.5, f"Expected Open fallback to 1250.5, got {row['Open']}"
+        assert row["High"] == 1250.5, f"Expected High fallback to 1250.5, got {row['High']}"
+        assert row["Low"] == 1250.5, f"Expected Low fallback to 1250.5, got {row['Low']}"
+
+        # 4. Verify Bug 14: LakeDoctor watermark rebuilding for new parquet tables
+        write_parquet_atomic(pd.DataFrame([{"Date": pd.Timestamp("2026-11-04"), "IndexName": "NIFTY 50"}]),
+                             cfg.root_dir / "indices" / "all_indices_snapshot.parquet")
+        write_parquet_atomic(pd.DataFrame([{"Date": pd.Timestamp("2026-11-04"), "Symbol": "TCS"}]),
+                             cfg.root_dir / "indices" / "index_constituents_live.parquet")
+        write_parquet_atomic(pd.DataFrame([{"Date": pd.Timestamp("2026-11-04"), "Symbol": "TCS", "Quantity": 100}]),
+                             cfg.root_dir / "deals" / "short_selling.parquet")
+
+        doc = LakeDoctor(cfg)
+        rep = doc.rebuild_watermarks_from_disk()
+        assert rep["watermarks_rebuilt_from_disk"] >= 3
+        assert state.max_ok_date("all_indices_snapshot") == date(2026, 11, 4)
+        assert state.max_ok_date("live_index_constituents") == date(2026, 11, 4)
+        assert state.max_ok_date("nse_short_selling") == date(2026, 11, 4)
+
+        # 5. Verify Bug 15: Dossier pack and Engine short_selling
+        offsets = build_company_dossier_pack(
+            data_dir=cfg.root_dir,
+            staging_dir=cfg.root_dir,
+            alias_to_canon={"TCS": "TCS"},
+            scrip_to_canon={"532540": "TCS"},
+        )
+        assert "TCS" in offsets
+        pack_file = cfg.root_dir / "by_ticker__nse_dossier.pack"
+        assert pack_file.exists()
+        import zlib
+        with pack_file.open("rb") as f:
+            off, length = offsets["TCS"]
+            f.seek(off)
+            tcs_blob = json.loads(zlib.decompress(f.read(length)).decode("utf-8"))
+            assert "short_selling" in tcs_blob
+            assert len(tcs_blob["short_selling"]) == 1
+            assert tcs_blob["short_selling"][0]["Quantity"] == 100
+
+        eng = UnifiedLakeEngine(cfg.root_dir)
+        ss_res = eng.short_selling("TCS")
+        assert len(ss_res) == 1
+        assert ss_res.iloc[0]["Quantity"] == 100
+        ticker = eng.ticker("TCS")
+        t_ss = ticker.short_selling
+        assert len(t_ss) == 1
+        assert t_ss.iloc[0]["Quantity"] == 100
+
+
 if __name__ == "__main__":
     test_corporate_action_regex_parser()
     test_repair_ohlc_and_bse_debt_filter()
@@ -1317,4 +1445,5 @@ if __name__ == "__main__":
     test_nsearchives_proxy_fallback_and_extraction()
     test_nse_specific_extensions_and_bse_separation()
     test_ten_bug_fixes_verification_suite()
+    test_bugs_11_to_15_verification_suite()
     print("ALL OFFLINE UNIT & INTEGRATION TESTS PASSED!")

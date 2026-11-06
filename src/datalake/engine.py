@@ -1414,6 +1414,16 @@ class UnifiedLakeEngine:
         ident = self.resolve(query)
         return self._read_filtered_parquet(p, filters=[("Symbol", "in", list(ident.aliases))])
 
+    def short_selling(self, query: str | int | None = None) -> pd.DataFrame:
+        """Return NSE Short Selling disclosures (filtered to `query` symbol if provided, or market-wide)."""
+        p = self.root / "deals" / "short_selling.parquet"
+        if not p.exists():
+            return pd.DataFrame()
+        if query is None:
+            return read_table_safe(p)
+        ident = self.resolve(query)
+        return self._read_filtered_parquet(p, filters=[("Symbol", "in", list(ident.aliases))])
+
     def annual_reports(self, query: str | int) -> pd.DataFrame:
         """Return 20-year Annual Report PDF/ZIP download links from NSE & BSE."""
         ident = self.resolve(query)
@@ -1695,6 +1705,10 @@ class LakeTicker:
     @property
     def deals(self) -> pd.DataFrame:
         return self.engine.deals(self.identity.symbol)
+
+    @property
+    def short_selling(self) -> pd.DataFrame:
+        return self.engine.short_selling(self.identity.symbol)
 
     @property
     def annual_reports(self) -> pd.DataFrame:

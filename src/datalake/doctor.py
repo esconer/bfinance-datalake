@@ -272,5 +272,52 @@ class LakeDoctor:
                     )
                     stats["watermarks_rebuilt_from_disk"] += len(missing_syms)
 
+            for pq_rel, ds_date in (
+                ("indices/all_indices_snapshot.parquet", "all_indices_snapshot"),
+                ("indices/index_constituents_live.parquet", "live_index_constituents"),
+                ("deals/short_selling.parquet", "nse_short_selling"),
+            ):
+                p_dt = self.cfg.root_dir / pq_rel
+                if p_dt.exists():
+                    try:
+                        ddf = read_table_safe(p_dt)
+                        if not ddf.empty and "Date" in ddf.columns:
+                            disk_dates = set(pd.to_datetime(ddf["Date"], errors="coerce").dt.strftime("%Y-%m-%d").dropna().unique())
+                            dt_counts = pd.to_datetime(ddf["Date"], errors="coerce").dt.strftime("%Y-%m-%d").value_counts().to_dict()
+
+                            rows = conn.execute(
+                                "SELECT partition_key FROM ingestion_log WHERE dataset = ? AND status = 'OK'",
+                                (ds_date,),
+                            ).fetchall()
+                            db_ok_dates = {r[0] for r in rows}
+
+                            missing_on_disk = db_ok_dates - disk_dates
+                            if missing_on_disk:
+                                conn.executemany(
+                                    "DELETE FROM ingestion_log WHERE dataset = ? AND partition_key = ?",
+                                    [(ds_date, k) for k in missing_on_disk],
+                                )
+                                stats["stale_watermarks_reset"] += len(missing_on_disk)
+
+                            unrecorded = disk_dates - db_ok_dates
+                            for k_dt in unrecorded:
+                                if k_dt:
+                                    conn.execute(
+                                        """
+                                        INSERT INTO ingestion_log (dataset, partition_key, status, row_count, updated_at)
+                                        VALUES (?, ?, 'OK', ?, ?)
+                                        ON CONFLICT(dataset, partition_key) DO UPDATE SET
+                                            status = 'OK', row_count = excluded.row_count, updated_at = excluded.updated_at
+                                        """,
+                                        (ds_date, str(k_dt), int(dt_counts[k_dt]), now_str),
+                                    )
+                                    stats["watermarks_rebuilt_from_disk"] += 1
+                    except Exception:
+                        pass
+
         logger.info("[Doctor] Self-healing check complete: %s", stats)
         return stats
+
+    def rebuild_watermarks_from_disk(self) -> dict[str, int]:
+        """Convenience alias for run_full_check_and_repair."""
+        return self.run_full_check_and_repair()
