@@ -102,7 +102,7 @@ class UnifiedLakeEngine:
                 for r in pdf.dropna(subset=["Symbol", "Industry"]).to_dict("records"):
                     sym_to_industry[str(r["Symbol"]).strip().upper()] = str(r["Industry"]).strip()
 
-        isin_to_bse: dict[str, tuple[str, str, str | None]] = {}
+        isin_to_bse: dict[str, tuple[str, str, str | None, float | None]] = {}
         bse_records: list[dict] = []
         if bse_path.exists():
             bdf = read_table_safe(bse_path)
@@ -114,8 +114,9 @@ class UnifiedLakeEngine:
                 isin = str(r.get("ISIN_NUMBER") or "").strip().upper()
                 name = str(r.get("Scrip_Name") or r.get("scrip_id") or "").strip()
                 ind = str(r.get("INDUSTRY") or "").strip() or None
+                bse_fv = pd.to_numeric(r.get("FACE_VALUE") or r.get("FaceValue"), errors="coerce")
                 if isin and isin not in ("", "NA", "NAN", "NONE") and sc:
-                    isin_to_bse[isin] = (sc, name, ind)
+                    isin_to_bse[isin] = (sc, name, ind, float(bse_fv) if pd.notna(bse_fv) else None)
 
         for nse_file in (
             "nse_equity_master.parquet",
@@ -145,7 +146,7 @@ class UnifiedLakeEngine:
                 if isin in ("", "NA", "NAN", "NONE"):
                     isin = None
                 name = str(r.get(name_col) or sym).strip() if name_col else sym
-                bse_info = isin_to_bse.get(isin, (None, None, None)) if isin else (None, None, None)
+                bse_info = isin_to_bse.get(isin, (None, None, None, None)) if isin else (None, None, None, None)
                 fv_raw = pd.to_numeric(r.get(fv_col), errors="coerce") if fv_col else None
                 aliases = tuple(self.resolver.all_aliases(sym))
                 canon = aliases[0]
@@ -155,7 +156,7 @@ class UnifiedLakeEngine:
                     isin=isin,
                     company_name=name,
                     aliases=aliases,
-                    face_value=float(fv_raw) if pd.notna(fv_raw) else None,
+                    face_value=float(fv_raw) if pd.notna(fv_raw) else bse_info[3],
                     industry=sym_to_industry.get(canon) or bse_info[2],
                     listing_date=str(r.get(list_col) or "").strip() or None if list_col else None,
                 )
@@ -179,13 +180,14 @@ class UnifiedLakeEngine:
             sym = str(r.get("scrip_id") or r.get("Scrip_Name") or sc).strip().upper()
             name = str(r.get("Scrip_Name") or sym).strip()
             ind = str(r.get("INDUSTRY") or "").strip() or None
+            bse_fv = pd.to_numeric(r.get("FACE_VALUE") or r.get("FaceValue"), errors="coerce")
             ident = SecurityIdentity(
                 symbol=sym,
                 bse_code=sc,
                 isin=isin,
                 company_name=name,
                 aliases=(sym,),
-                face_value=None,
+                face_value=float(bse_fv) if pd.notna(bse_fv) else None,
                 industry=ind,
                 listing_date=None,
                 primary_exchange="BSE",
@@ -487,8 +489,9 @@ class UnifiedLakeEngine:
         query: str | int,
         period_type: str | None = None,
         consolidated: bool = True,
+        as_of: str | date | None = None,
     ) -> pd.DataFrame:
-        """Return Ind-AS XBRL Financial Statements (P&L, Balance Sheet with Cash & Debt, Cash Flow in Rs Cr)."""
+        """Return Ind-AS XBRL Financial Statements (with optional Point-in-Time `as_of` filter to prevent look-ahead bias)."""
         ident = self.resolve(query)
         p = self.root / "fundamentals" / "xbrl_financials.parquet"
         df = self._read_filtered_parquet(p, filters=[("Symbol", "in", list(ident.aliases))])
@@ -497,10 +500,22 @@ class UnifiedLakeEngine:
         if period_type:
             df = df[df["PeriodType"].astype(str).str.lower() == period_type.lower()].copy()
         f_dt = (
-            pd.to_datetime(df["FilingDate"], format="mixed", dayfirst=True, errors="coerce")
+            pd.to_datetime(df["FilingDate"], format="ISO8601", errors="coerce").fillna(
+                pd.to_datetime(df["FilingDate"], format="mixed", dayfirst=True, errors="coerce")
+            )
             if "FilingDate" in df.columns
             else pd.Series(pd.NaT, index=df.index)
         )
+        if as_of is not None:
+            as_of_dt = pd.Timestamp(as_of).normalize()
+            pe_dt = pd.to_datetime(df["PeriodEnd"], format="ISO8601", errors="coerce").fillna(
+                pd.to_datetime(df["PeriodEnd"], format="mixed", dayfirst=True, errors="coerce")
+            )
+            eff_filing_dt = f_dt.where(f_dt.notna(), pe_dt + pd.Timedelta(days=45))
+            df = df[eff_filing_dt <= as_of_dt].copy()
+            if df.empty:
+                return df
+            f_dt = f_dt.loc[df.index]
         df["_f_dt"] = f_dt.fillna(pd.Timestamp("1900-01-01"))
         if "NatureOfReport" in df.columns and not df.empty:
             is_cons = df["NatureOfReport"].astype(str).str.lower().str.contains("consolidated")
@@ -633,12 +648,13 @@ class UnifiedLakeEngine:
         df = pd.concat(frames, ignore_index=True)
         if df.empty:
             return df
-        dt_norm = pd.to_datetime(df["Date"]).dt.normalize()
-        if trade_date:
-            df = df[dt_norm == pd.Timestamp(trade_date).normalize()]
-        else:
-            df = df[dt_norm == dt_norm.max()]
-        if expiry:
+        if "Date" in df.columns:
+            dt_norm = pd.to_datetime(df["Date"]).dt.normalize()
+            if trade_date:
+                df = df[dt_norm == pd.Timestamp(trade_date).normalize()]
+            else:
+                df = df[dt_norm == dt_norm.max()]
+        if expiry and "ExpiryDate" in df.columns:
             df = df[pd.to_datetime(df["ExpiryDate"]).dt.normalize() == pd.Timestamp(expiry).normalize()]
 
         if "UnderlyingPrice" in df.columns and df["UnderlyingPrice"].isna().any() and not df.empty:
@@ -701,6 +717,57 @@ class UnifiedLakeEngine:
         if end:
             df = df[df["Date"] <= pd.Timestamp(end)]
         return df.sort_values("Date").drop_duplicates(subset=["Date"], keep="first").reset_index(drop=True)
+
+    def all_indices(self) -> pd.DataFrame:
+        """
+        Return the latest snapshot of all 139 NSE indices (`indices/all_indices_snapshot.parquet`)
+        including Category, LastPrice, PE, PB, DivYield, Advances, Declines, and 30d/365d returns.
+        """
+        p = self.root / "indices" / "all_indices_snapshot.parquet"
+        if not p.exists():
+            return pd.DataFrame()
+        df = read_table_safe(p)
+        if df.empty or "Date" not in df.columns:
+            return df
+        max_dt = pd.to_datetime(df["Date"]).max()
+        return df[pd.to_datetime(df["Date"]) == max_dt].reset_index(drop=True)
+
+    def index_constituents(self, index_name: str = "NIFTY 50") -> pd.DataFrame:
+        """
+        Return live constituents and computed Free-Float Market Cap weights (`WeightPct`)
+        for any of the 139 NSE indices from `indices/index_constituents_live.parquet`
+        (falling back to `universe/nifty_constituents_pit.parquet`).
+        """
+        clean_idx = index_name.strip().upper()
+        p_live = self.root / "indices" / "index_constituents_live.parquet"
+        if p_live.exists():
+            df = read_table_safe(p_live)
+            if not df.empty and "IndexName" in df.columns:
+                mask = (
+                    (df["IndexName"].astype(str).str.strip().str.upper() == clean_idx)
+                    | (df.get("IndexSymbol", pd.Series(dtype=str)).astype(str).str.strip().str.upper() == clean_idx)
+                )
+                sub = df[mask].copy()
+                if not sub.empty:
+                    if "Date" in sub.columns:
+                        max_dt = pd.to_datetime(sub["Date"]).max()
+                        sub = sub[pd.to_datetime(sub["Date"]) == max_dt].copy()
+                    if "FFMC" in sub.columns:
+                        ffmc = pd.to_numeric(sub["FFMC"], errors="coerce")
+                        total_ffmc = ffmc.sum()
+                        if total_ffmc and total_ffmc > 0:
+                            sub["WeightPct"] = ((ffmc / total_ffmc) * 100.0).round(4)
+                            sub = sub.sort_values("WeightPct", ascending=False)
+                    return sub.reset_index(drop=True)
+        p_pit = self.root / "universe" / "nifty_constituents_pit.parquet"
+        if p_pit.exists():
+            pdf = read_table_safe(p_pit)
+            sub = pdf[pdf["IndexName"].astype(str).str.strip().str.upper() == clean_idx].copy()
+            if not sub.empty and "SnapshotDate" in sub.columns:
+                max_s = pd.to_datetime(sub["SnapshotDate"]).max()
+                sub = sub[pd.to_datetime(sub["SnapshotDate"]) == max_s]
+            return sub.reset_index(drop=True)
+        return pd.DataFrame()
 
     def trading_days(
         self,
@@ -848,6 +915,7 @@ class UnifiedLakeEngine:
             ("named_holders", self.named_holders, sym),
             ("actions", self.corporate_actions, sym),
             ("deals", self.deals, sym),
+            ("short_selling", self.short_selling, sym),
             ("insider_trades", self.insider_trades, sym),
             ("annual_reports", self.annual_reports, sym),
             ("concalls", self.concalls, bse or sym),
@@ -1042,7 +1110,7 @@ class UnifiedLakeEngine:
             return con.execute(f"SELECT * FROM _scr_sub ORDER BY {order_by}").df()
         return base
 
-    def custom_ratios(self, query: str | int) -> dict[str, Any]:
+    def custom_ratios(self, query: str | int, as_of: str | date | None = None) -> dict[str, Any]:
         """
         Return `bfinance` & `finengine` forensic ratios (Piotroski F-Score, Graham Number,
         EV/EBITDA, Interest Coverage, CFO/PAT) adhering to the strict honesty contract.
@@ -1050,7 +1118,7 @@ class UnifiedLakeEngine:
         from datalake.finengine_bridge import compute_forensic_ratios
 
         ident = self.resolve(query)
-        fin_df = self.fundamentals(ident.symbol, consolidated=True)
+        fin_df = self.fundamentals(ident.symbol, consolidated=True, as_of=as_of)
         scr_row = None
         try:
             scr = self.screener(f"Symbol = '{ident.symbol}'")
@@ -1097,6 +1165,8 @@ class UnifiedLakeEngine:
         fin_df = self.fundamentals(ident.symbol, consolidated=True)
         shp_df = self.shareholding(ident.symbol)
         concalls_df = self.concalls(ident.bse_code or ident.symbol)
+        nh_df = self.named_holders(ident.symbol)
+        ar_df = self.annual_reports(ident.symbol)
         scr_row = None
         try:
             scr = self.screener(f"Symbol = '{ident.symbol}'")
@@ -1122,6 +1192,8 @@ class UnifiedLakeEngine:
             fin_df=fin_df,
             shp_df=shp_df,
             concalls_df=concalls_df,
+            named_holders_df=nh_df,
+            annual_reports_df=ar_df,
         )
 
     def bhavcopy_records(self, trade_date: str | date | None = None, exchange: str = "NSE") -> list[dict[str, Any]]:
@@ -1226,11 +1298,40 @@ class UnifiedLakeEngine:
         flows_df = self.fii_dii_flows()
         deliv = self.delivery_anomalies(symbols=target_syms, lookback_sessions=lookback_sessions)
         liq = self.liquidity_limits(positions=pos_list, lookback_sessions=lookback_sessions)
-        return build_ai_context_india(flows_df=flows_df, delivery_payload=deliv, liquidity_payload=liq)
+        poi_df = self.participant_oi()
+        bans_df = self.fo_ban_list()
+        ban_syms = bans_df["Symbol"].dropna().astype(str).tolist() if not bans_df.empty and "Symbol" in bans_df.columns else []
+        return build_ai_context_india(
+            flows_df=flows_df,
+            delivery_payload=deliv,
+            liquidity_payload=liq,
+            participant_oi_df=poi_df,
+            fo_ban_symbols=ban_syms,
+        )
 
     def etfs(self) -> pd.DataFrame:
         """Return the NSE ETF Master catalog (Symbol, Underlying, SecurityName, ISIN, ListingDate)."""
         p = self.root / "universe" / "nse_etf_master.parquet"
+        return read_table_safe(p) if p.exists() else pd.DataFrame()
+
+    def market_universe(self) -> pd.DataFrame:
+        """Return the NSE Pre-Open Market Universe (`universe/nse_market_universe.parquet`) with 52W High/Low."""
+        p = self.root / "universe" / "nse_market_universe.parquet"
+        return read_table_safe(p) if p.exists() else pd.DataFrame()
+
+    def sme_stocks(self) -> pd.DataFrame:
+        """Return the NSE SME Emerge Master catalog (`universe/nse_sme_master.parquet`)."""
+        p = self.root / "universe" / "nse_sme_master.parquet"
+        return read_table_safe(p) if p.exists() else pd.DataFrame()
+
+    def delisted_stocks(self) -> pd.DataFrame:
+        """Return the NSE Delisted Securities archive (`universe/nse_delisted_master.parquet`)."""
+        p = self.root / "universe" / "nse_delisted_master.parquet"
+        return read_table_safe(p) if p.exists() else pd.DataFrame()
+
+    def symbol_changes(self) -> pd.DataFrame:
+        """Return the historical NSE Symbol Rename table (`universe/nse_symbol_changes.parquet`)."""
+        p = self.root / "universe" / "nse_symbol_changes.parquet"
         return read_table_safe(p) if p.exists() else pd.DataFrame()
 
     def fii_dii_flows(self, start: str | date | None = None, end: str | date | None = None) -> pd.DataFrame:
@@ -1294,14 +1395,12 @@ class UnifiedLakeEngine:
         or a named index ('NIFTY 50', 'NIFTY 100', 'NIFTY 500') in a single vectorized pass.
         """
         if isinstance(queries_or_index, str):
-            pit_path = self.root / "universe" / "nifty_constituents_pit.parquet"
-            if pit_path.exists():
-                pdf = read_table_safe(pit_path)
-                sub = pdf[pdf["IndexName"].astype(str).str.upper() == queries_or_index.strip().upper()]
-                if not sub.empty and "SnapshotDate" in sub.columns:
-                    max_snap = pd.to_datetime(sub["SnapshotDate"]).max()
-                    sub = sub[pd.to_datetime(sub["SnapshotDate"]) == max_snap]
-                symbols = sub["Symbol"].dropna().unique().tolist() if not sub.empty else [queries_or_index]
+            const_df = self.index_constituents(queries_or_index)
+            if not const_df.empty and "Symbol" in const_df.columns:
+                symbols = [
+                    s for s in const_df["Symbol"].dropna().astype(str).unique().tolist()
+                    if not s.startswith(("DEBT_BASKET:", "UNDERLYING:")) and s != "INDIA VIX"
+                ]
             else:
                 symbols = [queries_or_index]
         else:
@@ -1403,6 +1502,37 @@ class UnifiedLakeEngine:
         if end:
             df = df[df["Date"] <= pd.Timestamp(end)]
         return df.sort_values("Date").drop_duplicates(subset=["Date"]).reset_index(drop=True)
+
+    def mutual_funds(
+        self,
+        search: str | None = None,
+        category: str | None = None,
+        amc: str | None = None,
+    ) -> pd.DataFrame:
+        """
+        Search or list active AMFI Mutual Fund schemes (latest NAV, SchemeCode, SchemeName, AMC, Category, ISIN).
+        """
+        mf_dir = self.root / "mutual_funds"
+        if not mf_dir.exists():
+            return pd.DataFrame()
+        files = sorted(mf_dir.glob("amfi_nav_*.parquet"))
+        if not files:
+            return pd.DataFrame()
+        df = read_table_safe(files[-1])
+        if df.empty:
+            return df
+        df = df.sort_values("Date").drop_duplicates(subset=["SchemeCode"], keep="last").reset_index(drop=True)
+        if search:
+            q = search.strip()
+            mask = df["SchemeName"].astype(str).str.contains(q, case=False, na=False)
+            if "ISINGrowth" in df.columns:
+                mask = mask | (df["ISINGrowth"].astype(str).str.upper() == q.upper())
+            df = df[mask]
+        if category and "Category" in df.columns:
+            df = df[df["Category"].astype(str).str.contains(category.strip(), case=False, na=False)]
+        if amc and "AMC" in df.columns:
+            df = df[df["AMC"].astype(str).str.contains(amc.strip(), case=False, na=False)]
+        return df.reset_index(drop=True)
 
     def deals(self, query: str | int | None = None) -> pd.DataFrame:
         """Return Bulk & Block deals (filtered to `query` symbol if provided, or market-wide)."""
@@ -1545,17 +1675,25 @@ class UnifiedLakeEngine:
                     "equities_nse": "equities/nse_cm_*.parquet",
                     "equities_bse": "equities/bse_cm_*.parquet",
                     "fo_nse": "derivatives/nse_fo_*.parquet",
+                    "fo_bse": "derivatives/bse_fo_*.parquet",
+                    "fo_ban_list": "derivatives/fo_ban_list.parquet",
                     "indices": "indices/nifty_30y_ohlc_tri_pe.parquet",
                     "indices_daily": "indices/ind_close_all_*.parquet",
                     "all_indices": "indices/all_indices_snapshot.parquet",
                     "index_constituents_live": "indices/index_constituents_live.parquet",
+                    "nifty_constituents_pit": "universe/nifty_constituents_pit.parquet",
                     "market_universe": "universe/nse_market_universe.parquet",
+                    "etfs": "universe/nse_etf_master.parquet",
+                    "sme_master": "universe/nse_sme_master.parquet",
+                    "delisted_master": "universe/nse_delisted_master.parquet",
+                    "symbol_changes": "universe/nse_symbol_changes.parquet",
                     "financials": "fundamentals/xbrl_financials.parquet",
                     "shareholding": "shareholding/nse_shareholding_summary.parquet",
                     "shareholding_bse": "shareholding/bse_shareholding_history.parquet",
                     "named_holders": "shareholding/named_shareholders.parquet",
                     "actions_nse": "actions/nse_corporate_actions.parquet",
                     "actions_bse": "actions/bse_corporate_actions.parquet",
+                    "board_meetings": "actions/upcoming_board_meetings.parquet",
                     "mutual_funds": "mutual_funds/amfi_nav_*.parquet",
                     "deals": "deals/bulk_block_deals.parquet",
                     "short_selling": "deals/short_selling.parquet",
@@ -1709,6 +1847,20 @@ class LakeTicker:
     @property
     def short_selling(self) -> pd.DataFrame:
         return self.engine.short_selling(self.identity.symbol)
+
+    @property
+    def options(self) -> tuple[str, ...]:
+        """Return sorted tuple of available F&O expiry dates (`YYYY-MM-DD`) for this ticker."""
+        chain = self.engine.option_chain(self.identity.symbol, exchange=self.default_exchange)
+        if chain.empty or "ExpiryDate" not in chain.columns:
+            return ()
+        exps = pd.to_datetime(chain["ExpiryDate"], errors="coerce").dropna().dt.strftime("%Y-%m-%d").unique()
+        return tuple(sorted(exps.tolist()))
+
+    def option_chain(self, trade_date: str | date | None = None, expiry: str | date | None = None) -> pd.DataFrame:
+        return self.engine.option_chain(
+            self.identity.symbol, trade_date=trade_date, expiry=expiry, exchange=self.default_exchange
+        )
 
     @property
     def annual_reports(self) -> pd.DataFrame:

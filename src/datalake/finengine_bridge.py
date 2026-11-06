@@ -277,6 +277,16 @@ def compute_forensic_ratios(
     borrowings_cr: float | None = None
     cash_cr: float | None = None
     cfo_cr: float | None = None
+    cur_assets_cr: float | None = None
+    cur_liab_cr: float | None = None
+    inventories_cr: float | None = None
+    receivables_cr: float | None = None
+    payables_cr: float | None = None
+    gross_npa_pct: float | None = None
+    net_npa_pct: float | None = None
+    car_pct: float | None = None
+    deposits_cr: float | None = None
+    advances_cr: float | None = None
 
     if fin_df is not None and not fin_df.empty:
         df = fin_df.copy()
@@ -337,6 +347,26 @@ def compute_forensic_ratios(
             cfo_cand = _first_finite(r.get("CFO_Cr"), r.get("OperatingCashFlow_Cr"))
             if cfo_cr is None and cfo_cand is not None:
                 cfo_cr = cfo_cand
+            if cur_assets_cr is None and _finite_float(r.get("CurrentAssets_Cr")) is not None:
+                cur_assets_cr = _finite_float(r.get("CurrentAssets_Cr"))
+            if cur_liab_cr is None and _finite_float(r.get("CurrentLiabilities_Cr")) is not None:
+                cur_liab_cr = _finite_float(r.get("CurrentLiabilities_Cr"))
+            if inventories_cr is None and _finite_float(r.get("Inventories_Cr")) is not None:
+                inventories_cr = _finite_float(r.get("Inventories_Cr"))
+            if receivables_cr is None and _finite_float(r.get("TradeReceivables_Cr")) is not None:
+                receivables_cr = _finite_float(r.get("TradeReceivables_Cr"))
+            if payables_cr is None and _finite_float(r.get("TradePayables_Cr")) is not None:
+                payables_cr = _finite_float(r.get("TradePayables_Cr"))
+            if gross_npa_pct is None and _finite_float(r.get("GrossNPA_Pct")) is not None:
+                gross_npa_pct = _finite_float(r.get("GrossNPA_Pct"))
+            if net_npa_pct is None and _finite_float(r.get("NetNPA_Pct")) is not None:
+                net_npa_pct = _finite_float(r.get("NetNPA_Pct"))
+            if car_pct is None and _finite_float(r.get("CapitalAdequacyRatio_Pct")) is not None:
+                car_pct = _finite_float(r.get("CapitalAdequacyRatio_Pct"))
+            if deposits_cr is None and _finite_float(r.get("Deposits_Cr")) is not None:
+                deposits_cr = _finite_float(r.get("Deposits_Cr"))
+            if advances_cr is None and _finite_float(r.get("Advances_Cr")) is not None:
+                advances_cr = _finite_float(r.get("Advances_Cr"))
 
     if mcap is None and price is not None and shares is not None and shares > 0:
         mcap = round((price * shares) / 10000000.0, 2)
@@ -398,6 +428,13 @@ def compute_forensic_ratios(
         if ebit_ttm is not None and cap_employed > 0:
             roce_pct = round((ebit_ttm / cap_employed) * 100.0, 2)
 
+    current_ratio = round(cur_assets_cr / cur_liab_cr, 2) if (cur_assets_cr and cur_liab_cr and cur_liab_cr > 0) else None
+    working_cap_cr = round(cur_assets_cr - cur_liab_cr, 2) if (cur_assets_cr is not None and cur_liab_cr is not None) else None
+    rec_days = round((receivables_cr / sales_ttm) * 365.0, 1) if (receivables_cr is not None and sales_ttm and sales_ttm > 0) else None
+    inv_days = round((inventories_cr / sales_ttm) * 365.0, 1) if (inventories_cr is not None and sales_ttm and sales_ttm > 0) else None
+    pay_days = round((payables_cr / sales_ttm) * 365.0, 1) if (payables_cr is not None and sales_ttm and sales_ttm > 0) else None
+    credit_deposit_pct = round((advances_cr / deposits_cr) * 100.0, 2) if (advances_cr and deposits_cr and deposits_cr > 0) else None
+
     return {
         "piotroski_score": p_score,
         "piotroski_breakdown": p_breakdown,
@@ -419,6 +456,17 @@ def compute_forensic_ratios(
         "sales_ttm_cr": round(sales_ttm, 2) if sales_ttm is not None else None,
         "net_profit_ttm_cr": round(pat_ttm, 2) if pat_ttm is not None else None,
         "ebitda_ttm_cr": round(ebitda_ttm, 2) if ebitda_ttm is not None else None,
+        "current_ratio": current_ratio,
+        "working_capital_cr": working_cap_cr,
+        "receivable_days": rec_days,
+        "inventory_days": inv_days,
+        "payable_days": pay_days,
+        "gross_npa_pct": gross_npa_pct,
+        "net_npa_pct": net_npa_pct,
+        "capital_adequacy_pct": car_pct,
+        "deposits_cr": deposits_cr,
+        "advances_cr": advances_cr,
+        "credit_deposit_ratio_pct": credit_deposit_pct,
         "peg_ratio": None,
         "bfinance_omitted_metrics": omitted,
     }
@@ -459,11 +507,19 @@ def transpose_financials_to_statement(
             df["TotalExpenses_Cr"] = (ti_s - pbt_s_tmp).round(2).where(ti_s.notna() & pbt_s_tmp.notna())
         spec = [
             ("Total Revenue", "Sales_Cr"),
+            ("Interest Earned", "InterestEarned_Cr"),
             ("Other Income", "OtherIncome_Cr"),
+            ("Other Banking Income", "OtherBankingIncome_Cr"),
             ("Total Income", "TotalIncome_Cr"),
             ("Cost Of Revenue", "RawMaterials_Cr"),
+            ("Cost Of Materials Consumed", "MaterialCost_Cr"),
+            ("Purchases Of Stock In Trade", "StockInTradePurchases_Cr"),
             ("Employee Benefit Expense", "EmployeeCost_Cr"),
+            ("Interest Expended", "InterestExpended_Cr"),
+            ("Other Expenses", "OtherExpenses_Cr"),
             ("Operating Expense", "TotalExpenses_Cr"),
+            ("Operating Profit Pre-Provision", "OperatingProfitPreProvision_Cr"),
+            ("Provisions And Contingencies", "ProvisionsAndContingencies_Cr"),
             ("EBITDA", "_EBITDA_Cr"),
             ("Depreciation And Amortization", "Depreciation_Cr"),
             ("EBIT", "_EBIT_Cr"),
@@ -473,6 +529,9 @@ def transpose_financials_to_statement(
             ("Net Income", "NetProfit_Cr"),
             ("Basic EPS", "BasicEPS_Rs"),
             ("Diluted EPS", "DilutedEPS_Rs"),
+            ("Gross NPA %", "GrossNPA_Pct"),
+            ("Net NPA %", "NetNPA_Pct"),
+            ("Capital Adequacy Ratio %", "CapitalAdequacyRatio_Pct"),
         ]
         pbt_s = pd.to_numeric(df.get("PBT_Cr", pd.Series(dtype=float)), errors="coerce")
         int_s = pd.to_numeric(df.get("Interest_Cr", pd.Series(0.0, index=df.index)), errors="coerce").fillna(0.0)
@@ -494,13 +553,32 @@ def transpose_financials_to_statement(
             ("Share Capital", "EquityCapital_Cr"),
             ("Reserves And Surplus", "Reserves_Cr"),
             ("Stockholders Equity", "_NetWorth_Cr"),
+            ("Long Term Borrowings", "LongTermBorrowings_Cr"),
+            ("Short Term Borrowings", "ShortTermBorrowings_Cr"),
             ("Total Debt", "TotalBorrowings_Cr"),
+            ("Lease Liabilities Non-Current", "LeaseLiabilitiesNonCurrent_Cr"),
+            ("Lease Liabilities Current", "LeaseLiabilitiesCurrent_Cr"),
+            ("Deposits", "Deposits_Cr"),
+            ("Advances", "Advances_Cr"),
             ("Cash And Cash Equivalents", "TotalCashAndBank_Cr"),
             ("Net Debt", "_NetDebt_Cr"),
+            ("Property Plant And Equipment", "FixedAssets_Cr"),
+            ("Capital Work In Progress", "CWIP_Cr"),
+            ("Goodwill", "Goodwill_Cr"),
+            ("Other Intangible Assets", "IntangibleAssets_Cr"),
+            ("Non-Current Investments", "NonCurrentInvestments_Cr"),
+            ("Current Investments", "CurrentInvestments_Cr"),
+            ("Inventories", "Inventories_Cr"),
+            ("Trade Receivables", "TradeReceivables_Cr"),
+            ("Trade Payables", "TradePayables_Cr"),
             ("Current Assets", "CurrentAssets_Cr"),
             ("Current Liabilities", "CurrentLiabilities_Cr"),
+            ("Non-Current Assets", "NonCurrentAssets_Cr"),
+            ("Non-Current Liabilities", "NonCurrentLiabilities_Cr"),
             ("Total Assets", "TotalAssets_Cr"),
             ("Total Liabilities Net Minority Interest", "TotalLiabilities_Cr"),
+            ("Gross NPA (Cr)", "GrossNPA_Cr"),
+            ("Net NPA (Cr)", "NetNPA_Cr"),
         ]
     else:
         spec = [
@@ -858,6 +936,9 @@ def build_ai_context_india(
     flows_df: pd.DataFrame,
     delivery_payload: dict[str, Any],
     liquidity_payload: dict[str, Any],
+    participant_oi_df: pd.DataFrame | None = None,
+    fo_ban_symbols: list[str] | None = None,
+    short_selling_df: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     """
     Assemble the 3-component `finengine` `ai_context_india` payload:
@@ -914,6 +995,30 @@ def build_ai_context_india(
                 "recent_sessions": recent_list,
             }
 
+    oi_sentiment: dict[str, Any] | None = None
+    if participant_oi_df is not None and not participant_oi_df.empty and "Date" in participant_oi_df.columns:
+        odf = participant_oi_df.copy()
+        odf["_dt"] = pd.to_datetime(odf["Date"], errors="coerce")
+        odf = odf.dropna(subset=["_dt"]).sort_values("_dt")
+        if not odf.empty:
+            max_odt = odf["_dt"].max()
+            latest_oi = odf[odf["_dt"] == max_odt]
+            by_client: dict[str, Any] = {}
+            for _, r in latest_oi.iterrows():
+                ctype = str(r.get("Client Type") or "").strip()
+                f_long = _finite_float(r.get("Future Index Long"))
+                f_short = _finite_float(r.get("Future Index Short"))
+                ls_ratio = round(f_long / f_short, 3) if (f_long is not None and f_short and f_short > 0) else None
+                by_client[ctype] = {
+                    "future_index_long": f_long,
+                    "future_index_short": f_short,
+                    "future_index_net": round((f_long or 0.0) - (f_short or 0.0), 0) if (f_long is not None or f_short is not None) else None,
+                    "future_index_ls_ratio": ls_ratio,
+                    "total_long_contracts": _finite_float(r.get("Total Long Contracts")),
+                    "total_short_contracts": _finite_float(r.get("Total Short Contracts")),
+                }
+            oi_sentiment = {"latest_date": max_odt.strftime("%Y-%m-%d"), "participants": by_client}
+
     statuses = [
         flows_block.get("coverage_status", "unavailable"),
         delivery_payload.get("coverage_status", "unavailable"),
@@ -941,6 +1046,8 @@ def build_ai_context_india(
         "institutional_flows": flows_block,
         "delivery_anomalies": delivery_payload,
         "liquidity_limits": liquidity_payload,
+        "derivatives_participant_oi": oi_sentiment,
+        "fo_ban_symbols": fo_ban_symbols or [],
     }
 
 
@@ -957,6 +1064,8 @@ def build_research_profile(
     industry: str | None = None,
     face_value: float | None = None,
     screener_row: Mapping[str, Any] | None = None,
+    named_holders_df: pd.DataFrame | None = None,
+    annual_reports_df: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     """
     Build the 360-degree `finengine` `EquityResearchService.get_full_profile` and `bfinance.CompanyProfile`
@@ -1028,6 +1137,13 @@ def build_research_profile(
         cons.append(f"High promoter share pledge ({pledge_pct:.1f}%).")
     if prom_pct is not None and prom_pct >= 50.0 and (pledge_pct or 0.0) == 0.0:
         pros.append(f"High unpledged promoter skin-in-the-game ({prom_pct:.1f}%).")
+    if ratios.get("net_npa_pct") is not None:
+        if ratios["net_npa_pct"] <= 1.0:
+            pros.append(f"Strong banking asset quality (Net NPA = {ratios['net_npa_pct']:.2f}%).")
+        elif ratios["net_npa_pct"] > 2.5:
+            cons.append(f"Elevated Net NPA ratio ({ratios['net_npa_pct']:.2f}%).")
+    if ratios.get("capital_adequacy_pct") is not None and ratios["capital_adequacy_pct"] >= 15.0:
+        pros.append(f"Well-capitalized balance sheet (CRAR = {ratios['capital_adequacy_pct']:.2f}%).")
 
     concall_items: list[dict[str, Any]] = []
     if concalls_df is not None and not concalls_df.empty:
@@ -1046,6 +1162,26 @@ def build_research_profile(
                 "transcript_url": tr_url,
                 "audio_url": aud_url,
                 "presentation_url": ppt_url,
+            })
+
+    top_holders: list[dict[str, Any]] = []
+    if named_holders_df is not None and not named_holders_df.empty:
+        for _, r in named_holders_df.head(15).iterrows():
+            top_holders.append({
+                "holder_name": str(r.get("HolderName") or ""),
+                "category": str(r.get("CategoryMember") or ""),
+                "pct_of_total": _finite_float(r.get("PctOfTotal")),
+                "shares": _finite_float(r.get("Shares")),
+                "quarter_end": str(r.get("QuarterEnd") or ""),
+            })
+
+    annual_report_items: list[dict[str, Any]] = []
+    if annual_reports_df is not None and not annual_reports_df.empty:
+        for _, r in annual_reports_df.head(10).iterrows():
+            annual_report_items.append({
+                "year": str(r.get("Year") or ""),
+                "file_name": str(r.get("FileName") or ""),
+                "pdf_url": r.get("PDFUrl"),
             })
 
     return {
@@ -1076,4 +1212,6 @@ def build_research_profile(
         "analysis": {"pros": pros, "cons": cons},
         "custom_ratios": ratios,
         "concalls": concall_items,
+        "top_holders": top_holders,
+        "annual_reports": annual_report_items,
     }

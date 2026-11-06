@@ -125,6 +125,7 @@ class ResilientHTTPClient:
         self._nsearchives_fail_streak = 0
         self._prime_lock = asyncio.Lock()
         self._proxy_sem = asyncio.Semaphore(2)
+        self._prefetched_archives: dict[str, SimpleHTTPResponse] = {}
 
     def _active_ua(self) -> str:
         prof = _IMPERSONATE_PROFILES[self._profile_idx % len(_IMPERSONATE_PROFILES)]
@@ -162,6 +163,8 @@ class ResilientHTTPClient:
         parsed_url = urllib.parse.urlsplit(url)
         is_nsearchives = parsed_url.netloc == "nsearchives.nseindia.com"
         if is_nsearchives:
+            if url in self._prefetched_archives:
+                return self._prefetched_archives.pop(url)
             if self._nsearchives_fail_streak >= (3 if fallback_proxy else 8):
                 if fallback_proxy:
                     return await self.fetch_archive_via_proxy(url, timeout=timeout)
@@ -262,12 +265,52 @@ class ResilientHTTPClient:
             raise last_exc
         raise RuntimeError(f"Exhausted retries for {url}")
 
+    async def prefetch_archives_via_proxy(self, target_urls: list[str], timeout: float = 40.0) -> int:
+        """
+        Bundle multiple `nsearchives.nseindia.com` URLs into a SINGLE `/api/zipem` request
+        (~4.0s for 5 daily files) and cache the extracted files in `self._prefetched_archives`.
+        """
+        clean_urls = [u for u in dict.fromkeys(target_urls) if u and "nsearchives.nseindia.com" in u]
+        if not clean_urls:
+            return 0
+        encoded_links = urllib.parse.quote(_json.dumps(clean_urls))
+        proxy_url = f"https://www.nseindia.com/api/zipem?fileURLs={encoded_links}&type=daily"
+        async with self._proxy_sem:
+            try:
+                resp = await self.get(
+                    proxy_url,
+                    headers=NSE_API_HEADERS,
+                    prime_nse=True,
+                    timeout=timeout,
+                    fallback_proxy=False,
+                )
+                if resp.status_code != 200:
+                    return 0
+                with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                    by_base = {posixpath.basename(n).lower(): zf.read(n) for n in zf.namelist()}
+                loaded = 0
+                for u in clean_urls:
+                    bname = posixpath.basename(urllib.parse.urlsplit(u).path).lower()
+                    if bname in by_base:
+                        self._prefetched_archives[u] = SimpleHTTPResponse(
+                            status_code=200,
+                            content=by_base[bname],
+                            headers={"content-type": "application/octet-stream"},
+                        )
+                        loaded += 1
+                return loaded
+            except Exception as exc:
+                logger.debug("Batch zipem prefetch skipped: %s", exc)
+                return 0
+
     async def fetch_archive_via_proxy(
         self,
         target_url: str,
         timeout: float = 35.0,
     ) -> SimpleHTTPResponse:
         """Fetch a file hosted on nsearchives.nseindia.com via www.nseindia.com proxy."""
+        if target_url in self._prefetched_archives:
+            return self._prefetched_archives.pop(target_url)
         target_path = urllib.parse.urlsplit(target_url).path
         is_xml = target_path.lower().endswith(".xml")
 

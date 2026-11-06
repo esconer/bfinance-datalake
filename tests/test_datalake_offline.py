@@ -1427,6 +1427,189 @@ def test_bugs_11_to_15_verification_suite():
         assert t_ss.iloc[0]["Quantity"] == 100
 
 
+def test_scratch_6_11_26_recommendations_suite():
+    from datalake.finengine_bridge import (
+        compute_forensic_ratios,
+        transpose_financials_to_statement,
+        build_ai_context_india,
+        build_research_profile,
+    )
+    from datalake.engine import UnifiedLakeEngine
+
+    # 1. Test ResilientHTTPClient prefetch_archives_via_proxy
+    client = ResilientHTTPClient()
+    mock_zip = _make_zip("cm_bhav.csv", b"Date,Symbol\n2026-11-05,INFY\n")
+    client.get = AsyncMock(return_value=SimpleHTTPResponse(200, mock_zip, {"content-type": "application/zip"}))
+    loaded = asyncio.run(client.prefetch_archives_via_proxy(["https://nsearchives.nseindia.com/content/cm/cm_bhav.csv"]))
+    assert loaded == 1
+    assert "https://nsearchives.nseindia.com/content/cm/cm_bhav.csv" in client._prefetched_archives
+    # Fetching via get should consume the prefetched archive directly without calling get again
+    client.get = MagicMock()
+    res = asyncio.run(ResilientHTTPClient.get(client, "https://nsearchives.nseindia.com/content/cm/cm_bhav.csv"))
+    assert res.status_code == 200
+    assert b"INFY" in res.content
+    assert "https://nsearchives.nseindia.com/content/cm/cm_bhav.csv" not in client._prefetched_archives
+
+    # 2. Test FinEngine forensic ratios with banking & balance sheet metrics
+    df_bank = pd.DataFrame([{
+        "PeriodEnd": "2026-03-31",
+        "PeriodType": "Annual",
+        "Sales_Cr": 1000.0,
+        "NetProfit_Cr": 150.0,
+        "PBT_Cr": 200.0,
+        "CurrentAssets_Cr": 500.0,
+        "CurrentLiabilities_Cr": 250.0,
+        "Inventories_Cr": 100.0,
+        "TradeReceivables_Cr": 120.0,
+        "TradePayables_Cr": 80.0,
+        "GrossNPA_Pct": 2.1,
+        "NetNPA_Pct": 0.65,
+        "CapitalAdequacyRatio_Pct": 16.5,
+        "Deposits_Cr": 4000.0,
+        "Advances_Cr": 3200.0,
+    }])
+    ratios = compute_forensic_ratios(df_bank, current_price=100.0, market_cap_cr=5000.0, total_shares=50.0)
+    assert ratios["current_ratio"] == 2.0
+    assert ratios["working_capital_cr"] == 250.0
+    assert ratios["receivable_days"] == 43.8
+    assert ratios["inventory_days"] == 36.5
+    assert ratios["payable_days"] == 29.2
+    assert ratios["credit_deposit_ratio_pct"] == 80.0
+    assert ratios["gross_npa_pct"] == 2.1
+    assert ratios["net_npa_pct"] == 0.65
+    assert ratios["capital_adequacy_pct"] == 16.5
+
+    # 3. Test Statement Transposition for Banking and Balance Sheet items
+    inc_stmt = transpose_financials_to_statement(df_bank, "income_stmt")
+    assert "Gross NPA %" in inc_stmt.index
+    assert inc_stmt.loc["Gross NPA %"].iloc[0] == 2.1
+    assert "Capital Adequacy Ratio %" in inc_stmt.index
+    assert inc_stmt.loc["Capital Adequacy Ratio %"].iloc[0] == 16.5
+
+    bs_stmt = transpose_financials_to_statement(df_bank, "balance_sheet")
+    assert "Deposits" in bs_stmt.index
+    assert bs_stmt.loc["Deposits"].iloc[0] == 4000.0
+    assert "Advances" in bs_stmt.index
+    assert bs_stmt.loc["Advances"].iloc[0] == 3200.0
+
+    # 4. Test AI Context India with Participant OI sentiment and F&O ban symbols
+    df_poi = pd.DataFrame([{
+        "Date": pd.Timestamp("2026-11-05"),
+        "Client Type": "FII",
+        "Future Index Long": 120000.0,
+        "Future Index Short": 40000.0,
+        "Total Long Contracts": 200000.0,
+        "Total Short Contracts": 80000.0,
+    }])
+    ai_ctx = build_ai_context_india(
+        flows_df=pd.DataFrame(),
+        delivery_payload={},
+        liquidity_payload={},
+        participant_oi_df=df_poi,
+        fo_ban_symbols=["BANDHANBNK", "SAIL"],
+    )
+    assert ai_ctx["fo_ban_symbols"] == ["BANDHANBNK", "SAIL"]
+    assert ai_ctx["derivatives_participant_oi"] is not None
+    fii_oi = ai_ctx["derivatives_participant_oi"]["participants"]["FII"]
+    assert fii_oi["future_index_ls_ratio"] == 3.0
+    assert fii_oi["future_index_net"] == 80000.0
+
+    # 5. Test Research Profile with Top Holders, Annual Reports, and CRAR/NPA pros
+    prof = build_research_profile(
+        symbol="HDFCBANK",
+        company_name="HDFC Bank Limited",
+        bse_code="500180",
+        isin="INE040A01034",
+        fin_df=df_bank,
+        named_holders_df=pd.DataFrame([{"HolderName": "LIC OF INDIA", "PctOfTotal": 5.2, "Shares": 50000000}]),
+        annual_reports_df=pd.DataFrame([{"Year": "2026", "FileName": "HDFC_AR_2026.pdf", "PDFUrl": "https://example.com/ar.pdf"}]),
+    )
+    assert any("CRAR = 16.50%" in p for p in prof["analysis"]["pros"])
+    assert any("Net NPA = 0.65%" in p for p in prof["analysis"]["pros"])
+    assert len(prof["top_holders"]) == 1
+    assert prof["top_holders"][0]["holder_name"] == "LIC OF INDIA"
+    assert len(prof["annual_reports"]) == 1
+    assert prof["annual_reports"][0]["pdf_url"] == "https://example.com/ar.pdf"
+
+    # 6. Test Engine & Remote enhancements
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = LakeConfig(root_dir=Path(tmpdir))
+        cfg.ensure_dirs()
+
+        # Write XBRL with past and future filing dates to test Point-in-Time as_of filtering
+        xbrl_data = pd.DataFrame([
+            {"Symbol": "TCS", "PeriodEnd": "2024-03-31", "PeriodType": "Annual", "FilingDate": "2024-04-12", "Sales_Cr": 240000.0},
+            {"Symbol": "TCS", "PeriodEnd": "2024-06-30", "PeriodType": "Quarterly", "FilingDate": "2024-07-11", "Sales_Cr": 62000.0},
+            {"Symbol": "TCS", "PeriodEnd": "2024-09-30", "PeriodType": "Quarterly", "FilingDate": "2024-10-10", "Sales_Cr": 64000.0},
+        ])
+        write_parquet_atomic(xbrl_data, cfg.root_dir / "fundamentals" / "xbrl_financials.parquet")
+
+        # Write index snapshot & constituents
+        snap_data = pd.DataFrame([{"Date": pd.Timestamp("2026-11-05"), "IndexName": "NIFTY 50", "LastPrice": 24000.0, "PE": 21.0}])
+        write_parquet_atomic(snap_data, cfg.root_dir / "indices" / "all_indices_snapshot.parquet")
+
+        const_data = pd.DataFrame([
+            {"Date": pd.Timestamp("2026-11-05"), "IndexName": "NIFTY 50", "Symbol": "RELIANCE", "FFMC": 1000000.0},
+            {"Date": pd.Timestamp("2026-11-05"), "IndexName": "NIFTY 50", "Symbol": "TCS", "FFMC": 500000.0},
+        ])
+        write_parquet_atomic(const_data, cfg.root_dir / "indices" / "index_constituents_live.parquet")
+
+        # Write mutual funds
+        mf_data = pd.DataFrame([
+            {"Date": pd.Timestamp("2026-11-05"), "SchemeCode": 119551, "SchemeName": "Parag Parikh Flexi Cap Fund", "AMC": "PPFAS", "Category": "Flexi Cap", "NetAssetValue": 75.5}
+        ])
+        write_parquet_atomic(mf_data, cfg.root_dir / "mutual_funds" / "amfi_nav_2026.parquet")
+
+        # Write market universe, SME, delisted, symbol changes
+        write_parquet_atomic(pd.DataFrame([{"Symbol": "TCS", "LastPrice": 3800.0}]), cfg.root_dir / "universe" / "nse_market_universe.parquet")
+        write_parquet_atomic(pd.DataFrame([{"Symbol": "SME1", "CompanyName": "SME Co"}]), cfg.root_dir / "universe" / "nse_sme_master.parquet")
+        write_parquet_atomic(pd.DataFrame([{"Symbol": "DELIST1", "DelistingDate": "2020-01-01"}]), cfg.root_dir / "universe" / "nse_delisted_master.parquet")
+        write_parquet_atomic(pd.DataFrame([{"OldSymbol": "TCSOLD", "NewSymbol": "TCS"}]), cfg.root_dir / "universe" / "nse_symbol_changes.parquet")
+        write_parquet_atomic(pd.DataFrame([{"Date": pd.Timestamp("2026-11-05"), "Symbol": "TCS", "ExpiryDate": "2026-11-26", "StrikePrice": 3800.0, "OptionType": "CE"}]), cfg.root_dir / "derivatives" / "nse_fo_2026.parquet")
+
+        eng = UnifiedLakeEngine(cfg.root_dir)
+
+        # Test Point-in-Time as_of filter on fundamentals
+        f_all = eng.fundamentals("TCS")
+        assert len(f_all) == 3
+        f_pit = eng.fundamentals("TCS", as_of="2024-08-01")
+        assert len(f_pit) == 2, f"Expected 2 rows as of 2024-08-01, got {len(f_pit)}"
+        assert "2024-09-30" not in f_pit["PeriodEnd"].values
+
+        # Test all_indices & index_constituents with computed weights
+        idx_snap = eng.all_indices()
+        assert len(idx_snap) == 1
+        assert idx_snap.iloc[0]["IndexName"] == "NIFTY 50"
+
+        consts = eng.index_constituents("NIFTY 50")
+        assert len(consts) == 2
+        assert "WeightPct" in consts.columns
+        assert consts.iloc[0]["Symbol"] == "RELIANCE"
+        assert round(consts.iloc[0]["WeightPct"] + consts.iloc[1]["WeightPct"]) == 100
+
+        # Test mutual funds discovery
+        mfs = eng.mutual_funds(search="Parag Parikh")
+        assert len(mfs) == 1
+        assert mfs.iloc[0]["SchemeCode"] == 119551
+
+        # Test universe catalogs
+        assert len(eng.market_universe()) == 1
+        assert len(eng.sme_stocks()) == 1
+        assert len(eng.delisted_stocks()) == 1
+        assert len(eng.symbol_changes()) == 1
+
+        # Test ticker options and option_chain
+        ticker = eng.ticker("TCS")
+        assert ticker.options == ("2026-11-26",)
+        assert len(ticker.option_chain()) == 1
+
+        # Test DuckDB views
+        assert len(eng.sql("SELECT * FROM sme_master")) == 1
+        assert len(eng.sql("SELECT * FROM delisted_master")) == 1
+        assert len(eng.sql("SELECT * FROM symbol_changes")) == 1
+        assert len(eng.sql("SELECT * FROM market_universe")) == 1
+
+
 if __name__ == "__main__":
     test_corporate_action_regex_parser()
     test_repair_ohlc_and_bse_debt_filter()
@@ -1446,4 +1629,5 @@ if __name__ == "__main__":
     test_nse_specific_extensions_and_bse_separation()
     test_ten_bug_fixes_verification_suite()
     test_bugs_11_to_15_verification_suite()
+    test_scratch_6_11_26_recommendations_suite()
     print("ALL OFFLINE UNIT & INTEGRATION TESTS PASSED!")

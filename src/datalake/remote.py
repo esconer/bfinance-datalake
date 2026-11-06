@@ -1035,6 +1035,41 @@ class RemoteLakeClient:
             [index_name.strip().upper()],
         )
 
+    def all_indices(self) -> pd.DataFrame:
+        """Stream the 139-index master snapshot (`indices__all_indices_snapshot.parquet`) over HTTPS."""
+        self._ensure_httpfs()
+        url = self._resolve_cdn_url(self._asset_url("indices", "all_indices_snapshot.parquet"))
+        if not url:
+            return pd.DataFrame()
+        df = self._safe_query(f"SELECT * FROM read_parquet('{url}')")
+        if not df.empty and "Date" in df.columns:
+            max_dt = pd.to_datetime(df["Date"]).max()
+            df = df[pd.to_datetime(df["Date"]) == max_dt].reset_index(drop=True)
+        return df
+
+    def index_constituents(self, index_name: str = "NIFTY 50") -> pd.DataFrame:
+        """Stream live index constituents and compute Free-Float Market Cap `WeightPct` over HTTPS."""
+        self._ensure_httpfs()
+        clean_idx = index_name.strip().upper()
+        url = self._resolve_cdn_url(self._asset_url("indices", "index_constituents_live.parquet"))
+        if url:
+            df = self._safe_query(
+                f"SELECT * FROM read_parquet('{url}') WHERE UPPER(IndexName) = ? OR UPPER(IndexSymbol) = ?",
+                [clean_idx, clean_idx],
+            )
+            if not df.empty:
+                if "Date" in df.columns:
+                    max_dt = pd.to_datetime(df["Date"]).max()
+                    df = df[pd.to_datetime(df["Date"]) == max_dt].copy()
+                if "FFMC" in df.columns:
+                    ffmc = pd.to_numeric(df["FFMC"], errors="coerce")
+                    tot = ffmc.sum()
+                    if tot and tot > 0:
+                        df["WeightPct"] = ((ffmc / tot) * 100.0).round(4)
+                        df = df.sort_values("WeightPct", ascending=False)
+                return df.reset_index(drop=True)
+        return pd.DataFrame()
+
     def deals(self, symbol: str, use_pack: bool | None = None) -> pd.DataFrame:
         """Stream Bulk & Block deals for a symbol over HTTPS."""
         should_use_pack = self.use_pack if use_pack is None else use_pack
@@ -1050,6 +1085,21 @@ class RemoteLakeClient:
             f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ? ORDER BY Date DESC",
             [self._clean_sym(symbol)],
         )
+
+    def short_selling(self, symbol: str | None = None, use_pack: bool | None = None) -> pd.DataFrame:
+        """Stream SEBI Short Selling disclosures over HTTPS (or from Dossier Pack)."""
+        should_use_pack = self.use_pack if use_pack is None else use_pack
+        if symbol and should_use_pack:
+            dos = self.dossier(symbol)
+            if "short_selling" in dos:
+                return dos["short_selling"].copy()
+        self._ensure_httpfs()
+        url = self._resolve_cdn_url(self._asset_url("deals", "short_selling.parquet"))
+        if not url:
+            return pd.DataFrame()
+        if symbol:
+            return self._safe_query(f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ? ORDER BY Date DESC", [self._clean_sym(symbol)])
+        return self._safe_query(f"SELECT * FROM read_parquet('{url}') ORDER BY Date DESC")
 
     def insider_trades(self, symbol: str, use_pack: bool | None = None) -> pd.DataFrame:
         """Stream SEBI PIT insider trading disclosures for a symbol over HTTPS."""
@@ -1156,6 +1206,33 @@ class RemoteLakeClient:
         self._ensure_httpfs()
         url = self._resolve_cdn_url(self._asset_url("universe", "nse_etf_master.parquet"))
         return self._safe_query(f"SELECT * FROM read_parquet('{url}')")
+
+    def mutual_fund(self, scheme_code: int | str, start_year: int = 2020, end_year: int | None = None) -> pd.DataFrame:
+        """Stream historical AMFI Mutual Fund NAV series by scheme code over HTTPS."""
+        self._ensure_httpfs()
+        e_yr = end_year or pd.Timestamp.now().year
+        code_val = int(scheme_code) if str(scheme_code).isdigit() else scheme_code
+        raw_urls = [self._asset_url("mutual_funds", f"amfi_nav_{yr}.parquet") for yr in range(start_year, e_yr + 1)]
+        urls = [u for u in self._resolve_cdn_urls_parallel(raw_urls) if u]
+        if not urls:
+            return pd.DataFrame()
+        url_sql = ", ".join(f"'{u}'" for u in urls)
+        return self._safe_query(
+            f"SELECT * FROM read_parquet([{url_sql}]) WHERE SchemeCode = ? ORDER BY Date ASC",
+            [code_val],
+        )
+
+    def trading_days(self, start: str | date = "1995-11-03", end: str | date | None = None) -> pd.DatetimeIndex:
+        """Return authoritative NSE trading session dates over HTTPS."""
+        idx_df = self.index_history("NIFTY 50")
+        if idx_df.empty or "Date" not in idx_df.columns:
+            return pd.DatetimeIndex([])
+        dts = pd.to_datetime(idx_df["Date"]).dt.normalize()
+        if start:
+            dts = dts[dts >= pd.Timestamp(start)]
+        if end:
+            dts = dts[dts <= pd.Timestamp(end)]
+        return pd.DatetimeIndex(dts.unique()).sort_values()
 
     def _get_latest_fo_date(self, exch: str, yr: int, fo_cdn_url: str) -> str | None:
         """Resolve the latest trading date in `{exch}_fo_{yr}.parquet` once per session."""
@@ -1408,6 +1485,8 @@ class RemoteLakeClient:
             fin_df=fin_df,
             shp_df=shp_df,
             concalls_df=concalls_df,
+            named_holders_df=dos.get("named_holders", pd.DataFrame()),
+            annual_reports_df=dos.get("annual_reports", pd.DataFrame()),
         )
 
     def run_screen(self, strategy: str = "coffee_can") -> pd.DataFrame:

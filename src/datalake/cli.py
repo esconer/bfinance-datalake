@@ -135,6 +135,17 @@ async def run_daily_update(cfg: LakeConfig, lookback_days: int = 7, include_fo: 
 
         eod_end = await _resolve_published_eod_end(http, today)
 
+        # Prefetch daily NSE archive files in 1 bundled /api/zipem call (~4s) if nsearchives is blocked
+        await http.prefetch_archives_via_proxy([
+            f"https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_{eod_end:%Y%m%d}_F_0000.csv.zip",
+            f"https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{eod_end:%d%m%Y}.csv",
+            f"https://nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_{eod_end:%Y%m%d}_F_0000.csv.zip",
+            f"https://nsearchives.nseindia.com/content/indices/ind_close_all_{eod_end:%d%m%Y}.csv",
+            f"https://nsearchives.nseindia.com/content/nsccl/fao_participant_oi_{eod_end:%d%m%Y}.csv",
+            "https://nsearchives.nseindia.com/content/equities/bulk.csv",
+            "https://nsearchives.nseindia.com/content/equities/block.csv",
+        ])
+
         await eq.sync_range(nse_start, eod_end, exchanges=("NSE",))
         await eq.sync_range(bse_start, eod_end, exchanges=("BSE",))
 
@@ -155,7 +166,9 @@ async def run_daily_update(cfg: LakeConfig, lookback_days: int = 7, include_fo: 
         await dd.sync_concalls_and_presentations(default_start, today)
         await indices.sync_all_indices_snapshot()
         await indices.sync_live_index_constituents()
-        await XBRLScraper(http, state, cfg).sync_recent_market_financials_nse()
+        xbrl_scraper = XBRLScraper(http, state, cfg)
+        await xbrl_scraper.sync_recent_market_financials_nse()
+        await xbrl_scraper.sync_all_market(max_companies=35, force=False)
         await ff.sync_amfi_daily()
 
     LakeDoctor(cfg).run_full_check_and_repair()
