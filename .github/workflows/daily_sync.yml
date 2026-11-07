@@ -43,6 +43,11 @@ on:
         required: false
         default: false
         type: boolean
+      use_warp:
+        description: "Enable Cloudflare WARP egress (leave false for direct runner egress)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -64,6 +69,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Enable Cloudflare WARP (Official Cloudflare apt Package)
+        if: ${{ github.event.inputs.use_warp == 'true' }}
         continue-on-error: true
         run: |
           curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
@@ -98,6 +104,51 @@ jobs:
 
       - name: Install Dependencies
         run: uv sync
+
+      - name: Verify NSE Transport on GitHub Runner IP
+        continue-on-error: true
+        run: |
+          uv run python -c '
+          import time
+          from curl_cffi.requests import Session
+
+          headers = {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+              "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
+              "Connection": "keep-alive",
+              "Cache-Control": "max-age=0",
+              "DNT": "1",
+              "Upgrade-Insecure-Requests": "1",
+              "Sec-Fetch-User": "?1",
+              "Sec-Fetch-Site": "none",
+              "Sec-Fetch-Mode": "navigate",
+              "Accept-Encoding": "gzip, deflate, br",
+          }
+          s = Session(impersonate="chrome124")
+          r1 = s.get("https://www.nseindia.com", headers=headers, timeout=20)
+          print("Homepage warmup:", r1.status_code, "Cookies:", list(s.cookies.keys()))
+          time.sleep(1.2)
+          r2 = s.get("https://www.nseindia.com/option-chain", headers={**headers, "Referer": "https://www.nseindia.com/", "Sec-Fetch-Site": "same-origin"}, timeout=20)
+          print("Option-chain warmup:", r2.status_code, "Cookies:", list(s.cookies.keys()))
+          time.sleep(0.8)
+
+          # 1. Test Archive CSV (Universe)
+          r_csv = s.get("https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv", headers=headers, timeout=20)
+          print("EQUITY_L.csv status:", r_csv.status_code, "Lines:", len(r_csv.text.splitlines()) if r_csv.status_code == 200 else 0)
+
+          # 2. Test Corporate Actions API
+          api_headers = {
+              **headers,
+              "Accept": "application/json, text/plain, */*",
+              "Referer": "https://www.nseindia.com/option-chain",
+              "Sec-Fetch-Dest": "empty",
+              "Sec-Fetch-Mode": "cors",
+              "Sec-Fetch-Site": "same-origin",
+          }
+          r_ca = s.get("https://www.nseindia.com/api/corporates-corporateActions?index=equities&from_date=01-01-2026&to_date=31-12-2026", headers=api_headers, timeout=30)
+          print("Corporate Actions API status:", r_ca.status_code, "Body preview:", r_ca.text[:200] if r_ca.status_code == 200 else "Non-200")
+          '
 
       - name: Restore Existing Data Lake from GitHub Release (`datalake-latest`)
         env:

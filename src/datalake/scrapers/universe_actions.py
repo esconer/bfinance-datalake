@@ -167,15 +167,27 @@ class UniverseAndActionsScraper:
             ("nse_etf_master.parquet", "https://nsearchives.nseindia.com/content/equities/eq_etfseclist.csv"),
             ("nse_delisted_master.parquet", "https://nsearchives.nseindia.com/content/equities/delisted.csv"),
         ):
-            try:
-                resp = await self.http.get(url, headers=ARCHIVE_HEADERS)
-                if resp.status_code == 200 and not resp.text.lstrip().startswith("<"):
-                    df = pd.read_csv(io.StringIO(resp.text), on_bad_lines="skip")
-                    df.columns = [c.strip() for c in df.columns]
-                    write_parquet_atomic(df, self.cfg.root_dir / "universe" / name)
-                    self.state.record("security_master", name, "OK", len(df), resp.content, url)
-            except Exception as exc:
-                logger.warning("[Security Master %s] Skipped: %s", name, exc)
+            target_path = self.cfg.root_dir / "universe" / name
+            df_loaded = False
+            for fetch_url in (url, url.replace("https://nsearchives.nseindia.com", "https://www.nseindia.com")):
+                try:
+                    use_prime = "www.nseindia.com" in fetch_url
+                    resp = await self.http.get(
+                        fetch_url,
+                        headers=NSE_API_HEADERS if use_prime else ARCHIVE_HEADERS,
+                        prime_nse=use_prime,
+                    )
+                    if resp.status_code == 200 and not resp.text.lstrip().startswith("<"):
+                        df = pd.read_csv(io.StringIO(resp.text), on_bad_lines="skip")
+                        df.columns = [c.strip() for c in df.columns]
+                        write_parquet_atomic(df, target_path)
+                        self.state.record("security_master", name, "OK", len(df), resp.content, fetch_url)
+                        df_loaded = True
+                        break
+                except Exception as exc:
+                    logger.debug("[Security Master %s via %s] %s", name, fetch_url, exc)
+            if not df_loaded and not target_path.exists():
+                logger.warning("[Security Master %s] Skipped: exhausted endpoints", name)
 
         sym_chg_url = "https://nsearchives.nseindia.com/content/equities/symbolchange.csv"
         try:
@@ -236,6 +248,30 @@ class UniverseAndActionsScraper:
                             self.state.record("security_master", "nse_equity_master.parquet", "OK", len(synth_eq))
         except Exception as exc:
             logger.warning("[NSE Market Universe] Skipped: %s", exc)
+
+        # Fallback: If pre-open market data is unavailable, ensure nse_market_universe is populated from equity master
+        market_univ_path = self.cfg.root_dir / "universe" / "nse_market_universe.parquet"
+        eq_master_path = self.cfg.root_dir / "universe" / "nse_equity_master.parquet"
+        if not market_univ_path.exists() and eq_master_path.exists():
+            try:
+                eq_df = pd.read_parquet(eq_master_path)
+                sym_col = "SYMBOL" if "SYMBOL" in eq_df.columns else "Symbol"
+                series_col = "SERIES" if "SERIES" in eq_df.columns else "Series"
+                isin_col = "ISIN NUMBER" if "ISIN NUMBER" in eq_df.columns else ("ISIN" if "ISIN" in eq_df.columns else None)
+                synth_univ = pd.DataFrame({
+                    "Symbol": eq_df[sym_col].astype(str).str.strip().str.upper(),
+                    "Series": eq_df[series_col].astype(str).str.strip().str.upper() if series_col in eq_df.columns else "EQ",
+                    "ISIN": eq_df[isin_col].astype(str).str.strip().str.upper() if isin_col else "",
+                    "LastPrice": None,
+                    "YearHigh": None,
+                    "YearLow": None,
+                    "PreOpenVolume": None,
+                })
+                write_parquet_atomic(synth_univ, market_univ_path)
+                self.state.record("security_master", "nse_market_universe", "OK", len(synth_univ))
+                logger.info("[NSE Market Universe] Synthesized %d securities from equity master", len(synth_univ))
+            except Exception as synth_exc:
+                logger.debug("[NSE Market Universe Synth] %s", synth_exc)
 
         bse_frames = []
         for status in ("Active", "Suspended"):

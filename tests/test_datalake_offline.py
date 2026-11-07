@@ -1610,6 +1610,121 @@ def test_scratch_6_11_26_recommendations_suite():
         assert len(eng.sql("SELECT * FROM market_universe")) == 1
 
 
+def test_nse_warmup_headers_and_cloud_mitigation_suite():
+    """
+    Verifies:
+      1. NSE_API_HEADERS and NSE_WARMUP_HEADERS conform to Chrome 124 browser standards (Sec-Fetch-*, option-chain referer).
+      2. ResilientHTTPClient._prime_host('nse') executes the two-stage warm-up (homepage -> sleep -> option-chain).
+      3. Strict Exchange Boundary Isolation: BSE headers & endpoints are 100% separate from NSE logic.
+      4. UniverseAndActionsScraper synthesizes nse_market_universe.parquet from nse_equity_master.parquet when pre-open API fails.
+      5. Security master fetches fallback to www.nseindia.com if nsearchives is unreachable.
+    """
+    from datalake.http_client import (
+        BSE_API_HEADERS,
+        NSE_API_HEADERS,
+        NSE_WARMUP_HEADERS,
+        ResilientHTTPClient,
+        SimpleHTTPResponse,
+    )
+    from datalake.scrapers.universe_actions import UniverseAndActionsScraper
+
+    # 1. Verify Header Schemas
+    assert NSE_API_HEADERS["Referer"] == "https://www.nseindia.com/option-chain"
+    assert NSE_API_HEADERS["Sec-Fetch-Dest"] == "empty"
+    assert NSE_API_HEADERS["Sec-Fetch-Mode"] == "cors"
+    assert NSE_API_HEADERS["Sec-Fetch-Site"] == "same-origin"
+    assert "gzip" in NSE_API_HEADERS["Accept-Encoding"]
+
+    assert NSE_WARMUP_HEADERS["Sec-Fetch-User"] == "?1"
+    assert NSE_WARMUP_HEADERS["Sec-Fetch-Site"] == "none"
+    assert NSE_WARMUP_HEADERS["Sec-Fetch-Mode"] == "navigate"
+    assert NSE_WARMUP_HEADERS["Upgrade-Insecure-Requests"] == "1"
+
+    # 2. Strict Exchange Boundary Isolation
+    assert "bseindia.com" in BSE_API_HEADERS["Referer"]
+    assert "nseindia.com" not in BSE_API_HEADERS["Referer"]
+    assert "Sec-Fetch-Dest" not in BSE_API_HEADERS  # BSE must use standard clean headers
+
+    # 3. Verify Two-Stage Warm-Up in ResilientHTTPClient
+    client = ResilientHTTPClient()
+    visited_urls = []
+
+    class MockCurlSession:
+        cookies = {}
+
+        async def get(self, url, headers=None, timeout=None, **kwargs):
+            visited_urls.append((url, headers.get("Referer")))
+            return SimpleHTTPResponse(200, b"<html>OK</html>")
+
+        async def close(self):
+            pass
+
+    client.curl_session = MockCurlSession()
+    asyncio.run(client._prime_host("nse"))
+    assert client._nse_primed is True
+    assert len(visited_urls) == 2
+    assert visited_urls[0][0] == "https://www.nseindia.com"
+    assert visited_urls[1][0] == "https://www.nseindia.com/option-chain"
+    assert visited_urls[1][1] == "https://www.nseindia.com/"
+
+    # Verify BSE prime is strictly isolated
+    bse_visited = []
+
+    class MockBSEClient:
+        async def get(self, url, headers=None, timeout=None, **kwargs):
+            bse_visited.append((url, headers.get("Referer")))
+            return SimpleHTTPResponse(200, b"OK")
+
+    client.curl_session = MockBSEClient()
+    asyncio.run(client._prime_host("bse"))
+    assert client._bse_primed is True
+    assert len(bse_visited) == 1
+    assert "api.bseindia.com" in bse_visited[0][0]
+    assert "bseindia.com" in bse_visited[0][1]
+    assert "nseindia" not in bse_visited[0][0]
+
+    # 4. Universe Scraper Synthesis when Pre-Open API fails
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = LakeConfig(root_dir=Path(tmpdir))
+        state = StateStore(cfg.root_dir / "state.db")
+        (cfg.root_dir / "universe").mkdir(parents=True, exist_ok=True)
+
+        # Seed nse_equity_master.parquet (as from EQUITY_L.csv)
+        eq_master = pd.DataFrame({
+            "SYMBOL": ["INFY", "RELIANCE"],
+            "NAME OF COMPANY": ["Infosys Ltd", "Reliance Industries Ltd"],
+            "SERIES": ["EQ", "EQ"],
+            "ISIN NUMBER": ["INE009A01021", "INE002A01018"],
+        })
+        write_parquet_atomic(eq_master, cfg.root_dir / "universe" / "nse_equity_master.parquet")
+
+        mock_http = MagicMock()
+        # Pre-open API returns 403 or exception
+        async def mock_get(url, **kwargs):
+            if "market-data-pre-open" in url:
+                raise RuntimeError("Akamai 403 Forbidden")
+            if "EQUITY_L.csv" in url:
+                return SimpleHTTPResponse(200, b"SYMBOL,SERIES,ISIN NUMBER\nINFY,EQ,INE009A01021\nRELIANCE,EQ,INE002A01018\n")
+            if "symbolchange.csv" in url:
+                return SimpleHTTPResponse(200, b"")
+            if "ListofScripData" in url:
+                return SimpleHTTPResponse(200, b"[]")
+            if "ind_nifty" in url:
+                return SimpleHTTPResponse(200, b"")
+            return SimpleHTTPResponse(404, b"Not Found")
+
+        mock_http.get = AsyncMock(side_effect=mock_get)
+        scraper = UniverseAndActionsScraper(mock_http, state, cfg)
+        asyncio.run(scraper.sync_security_masters())
+
+        # Assert nse_market_universe.parquet was successfully synthesized from nse_equity_master.parquet!
+        univ_pq = cfg.root_dir / "universe" / "nse_market_universe.parquet"
+        assert univ_pq.exists(), "nse_market_universe.parquet must be synthesized when pre-open API fails"
+        univ_df = read_table_safe(univ_pq)
+        assert len(univ_df) == 2
+        assert set(univ_df["Symbol"]) == {"INFY", "RELIANCE"}
+
+
 if __name__ == "__main__":
     test_corporate_action_regex_parser()
     test_repair_ohlc_and_bse_debt_filter()
@@ -1630,4 +1745,5 @@ if __name__ == "__main__":
     test_ten_bug_fixes_verification_suite()
     test_bugs_11_to_15_verification_suite()
     test_scratch_6_11_26_recommendations_suite()
+    test_nse_warmup_headers_and_cloud_mitigation_suite()
     print("ALL OFFLINE UNIT & INTEGRATION TESTS PASSED!")

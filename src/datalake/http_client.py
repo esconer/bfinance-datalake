@@ -53,11 +53,34 @@ NIFTY_INDICES_HEADERS = {
     "Referer": "https://www.niftyindices.com/reports/historical-data",
 }
 
+NSE_WARMUP_HEADERS = {
+    "Connection": "keep-alive",
+    "Cache-Control": "max-age=0",
+    "DNT": "1",
+    "Upgrade-Insecure-Requests": "1",
+    "User-Agent": CHROME_UA,
+    "Sec-Fetch-User": "?1",
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9"
+    ),
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-Mode": "navigate",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
+}
+
 NSE_API_HEADERS = {
+    "Connection": "keep-alive",
+    "DNT": "1",
     "User-Agent": CHROME_UA,
     "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.nseindia.com/companies-listing/corporate-filings-financial-results",
+    "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": "https://www.nseindia.com/option-chain",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
 }
 
 _IMPERSONATE_PROFILES = ("chrome124", "chrome120", "chrome116")
@@ -213,7 +236,16 @@ class ResilientHTTPClient:
                 else:
                     raise RuntimeError("curl_cffi or httpx required for live network calls")
 
-                if resp.status_code in (401, 403):
+                if resp.status_code in (401, 403, 404, 429, 503) and ("www.nseindia.com" in url or prime_nse):
+                    if is_nsearchives and fallback_proxy:
+                        proxy_resp = await self.fetch_archive_via_proxy(url, timeout=timeout)
+                        if proxy_resp.status_code in (200, 404):
+                            return proxy_resp
+                    self._nse_primed = False
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                    await self._prime_host("nse", reset_session=True)
+                    continue
+                elif resp.status_code in (401, 403):
                     if is_nsearchives and fallback_proxy:
                         proxy_resp = await self.fetch_archive_via_proxy(url, timeout=timeout)
                         if proxy_resp.status_code in (200, 404):
@@ -437,46 +469,54 @@ class ResilientHTTPClient:
                 self._bse_primed = False
                 self._nifty_primed = False
 
-            prime_headers = {
-                "User-Agent": self._active_ua(),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-            }
             try:
                 if target == "nse" and not self._nse_primed:
-                    url = "https://www.nseindia.com"
+                    warmup_hdrs = dict(NSE_WARMUP_HEADERS)
+                    warmup_hdrs["User-Agent"] = self._active_ua()
                     if self.curl_session is not None:
-                        r = await self.curl_session.get(url, headers=prime_headers, timeout=30.0)
-                        if r.status_code == 200:
-                            try:
-                                await self.curl_session.get(
-                                    "https://www.nseindia.com/market-data/live-equity-market",
-                                    headers={**prime_headers, "Referer": "https://www.nseindia.com/"},
-                                    timeout=30.0,
-                                )
-                            except Exception:
-                                pass
+                        # Two-stage warm-up: / -> sleep 1.2s -> /option-chain -> sleep 0.8s (rahu.py v2.101 pattern)
+                        r1 = await self.curl_session.get("https://www.nseindia.com", headers=warmup_hdrs, timeout=25.0)
+                        await asyncio.sleep(1.2)
+                        chain_hdrs = dict(warmup_hdrs)
+                        chain_hdrs["Referer"] = "https://www.nseindia.com/"
+                        chain_hdrs["Sec-Fetch-Site"] = "same-origin"
+                        r2 = await self.curl_session.get(
+                            "https://www.nseindia.com/option-chain", headers=chain_hdrs, timeout=25.0
+                        )
+                        await asyncio.sleep(0.8)
+                        if r1.status_code == 200 or r2.status_code == 200:
+                            self._nse_primed = True
                     elif self.client is not None:
-                        r = await self.client.get(url, headers=prime_headers)
-                    else:
-                        return
-                    if r.status_code == 200:
-                        self._nse_primed = True
+                        r1 = await self.client.get("https://www.nseindia.com", headers=warmup_hdrs)
+                        await asyncio.sleep(1.2)
+                        chain_hdrs = dict(warmup_hdrs)
+                        chain_hdrs["Referer"] = "https://www.nseindia.com/"
+                        r2 = await self.client.get("https://www.nseindia.com/option-chain", headers=chain_hdrs)
+                        await asyncio.sleep(0.8)
+                        if r1.status_code == 200 or r2.status_code == 200:
+                            self._nse_primed = True
                 elif target == "bse" and not self._bse_primed:
+                    bse_hdrs = {
+                        "User-Agent": self._active_ua(),
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Accept-Language": "en-US,en;q=0.9",
+                        "Referer": "https://www.bseindia.com/",
+                    }
                     url = "https://api.bseindia.com/BseIndiaAPI/api/DefaultData/w"
                     try:
                         if self.curl_session is not None:
-                            await self.curl_session.get(
-                                url, headers={**prime_headers, "Referer": "https://www.bseindia.com/"}, timeout=5.0
-                            )
+                            await self.curl_session.get(url, headers=bse_hdrs, timeout=5.0)
                         elif self.client is not None:
-                            await self.client.get(
-                                url, headers={**prime_headers, "Referer": "https://www.bseindia.com/"}, timeout=5.0
-                            )
+                            await self.client.get(url, headers=bse_hdrs, timeout=5.0)
                     except Exception:
                         pass
                     self._bse_primed = True
                 elif target == "nifty" and not self._nifty_primed:
+                    prime_headers = {
+                        "User-Agent": self._active_ua(),
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Accept-Language": "en-US,en;q=0.9",
+                    }
                     url = "https://www.niftyindices.com/reports/historical-data"
                     if self.curl_session is not None:
                         r = await self.curl_session.get(url, headers=prime_headers, timeout=30.0)
