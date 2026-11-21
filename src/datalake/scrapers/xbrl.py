@@ -461,12 +461,28 @@ class XBRLScraper:
 
         if rows:
             target = self.cfg.root_dir / "fundamentals" / "xbrl_financials.parquet"
-            upsert_parquet_partition(
-                pd.DataFrame(rows),
-                target,
-                dedup_cols=["Symbol", "NatureOfReport", "PeriodType", "PeriodEnd"],
-                sort_cols=["Symbol", "PeriodEnd", "PeriodType"],
-            )
+            bse_df = pd.DataFrame(rows)
+            # BSE is a sparse P&L-only fallback. Never overwrite a richer Ind-AS XBRL
+            # row (Balance Sheet + Cash Flow columns) already stored for the same key.
+            if target.exists():
+                existing = read_table_safe(target)
+                key_cols = ["Symbol", "NatureOfReport", "PeriodType", "PeriodEnd"]
+                if not existing.empty and all(c in existing.columns for c in key_cols):
+                    existing_keys = set(
+                        existing[key_cols].astype(str).itertuples(index=False, name=None)
+                    )
+                    keep_mask = [
+                        tuple(str(r[c]) for c in key_cols) not in existing_keys
+                        for _, r in bse_df.iterrows()
+                    ]
+                    bse_df = bse_df[keep_mask].reset_index(drop=True)
+            if not bse_df.empty:
+                upsert_parquet_partition(
+                    bse_df,
+                    target,
+                    dedup_cols=["Symbol", "NatureOfReport", "PeriodType", "PeriodEnd"],
+                    sort_cols=["Symbol", "PeriodEnd", "PeriodType"],
+                )
             self.state.record("xbrl_financials_symbol", sym, "OK", len(rows))
         return len(rows)
 
@@ -476,16 +492,7 @@ class XBRLScraper:
         any_200_ok = False
         already_completed_filings = 0
 
-        # 1. Seed baseline Quarterly + Annual financials from BSE (`api.bseindia.com` works 100% on US/cloud IPs)
-        sc = self._resolve_bse_scrip_for_symbol(sym)
-        bse_rows = 0
-        if sc:
-            try:
-                bse_rows = await self.sync_symbol_financials_bse(sc, sym)
-            except Exception as exc:
-                logger.debug("[BSE Baseline Financials %s] %s", sym, exc)
-
-        # 2. Enrich/upsert with NSE Ind-AS XBRL statements (full P&L + Balance Sheet + Cash Flow) when reachable
+        # 1. Fetch rich NSE Ind-AS XBRL statements FIRST (full P&L + Balance Sheet + Cash Flow).
         for period in ("Quarterly", "Annual"):
             disc_url = (
                 f"https://www.nseindia.com/api/corporates-financial-results"
@@ -543,6 +550,18 @@ class XBRLScraper:
             batches = await asyncio.gather(*[_process_fin_item(it) for it in filings])
             for b in batches:
                 rows.extend(b)
+
+        # 2. Fall back to sparse BSE financials ONLY when NSE yielded nothing and
+        #    no NSE filing was already completed. A BSE-first baseline would let
+        #    P&L-only rows overwrite rich Ind-AS Balance Sheet / Cash Flow columns.
+        bse_rows = 0
+        if not rows and already_completed_filings == 0:
+            sc = self._resolve_bse_scrip_for_symbol(sym)
+            if sc:
+                try:
+                    bse_rows = await self.sync_symbol_financials_bse(sc, sym)
+                except Exception as exc:
+                    logger.debug("[BSE Fallback Financials %s] %s", sym, exc)
 
         if rows:
             target = self.cfg.root_dir / "fundamentals" / "xbrl_financials.parquet"
