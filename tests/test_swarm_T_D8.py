@@ -102,12 +102,14 @@ def test_D8C_unknown_none_and_skipped_action_types_are_excluded():
     assert set(out["ActionType"].dropna()) == {"DIVIDEND", "SPLIT", "DEMERGER", "RIGHTS", "BUYBACK"}
 
 
-def test_D8D_engine_default_path_still_uses_price_adjusting_view():
-    """Engine.corporate_actions calls with the default, so demergers stay hidden there.
+def test_D8D_engine_query_view_includes_non_adjusting_actions():
+    """Engine.corporate_actions now opts in to the full query view via D8B.
 
-    NOTE: engine.py is out of scope for T-D8; it does not forward
-    include_non_adjusting=True. This test locks in that the engine's default
-    price-adjustment view is unchanged by the D8 patch (no regression).
+    D8's adjuster default (used by the price-adjustment path) is unchanged:
+    get_symbol_actions() still filters out non-adjusting actions unless asked.
+    The engine's QUERY VIEW, however, forwards include_non_adjusting=True, so
+    DEMERGER / RIGHTS / BUYBACK events are surfaced alongside DIVIDEND / SPLIT.
+    This assertion fails if the engine ever stops forwarding that flag.
     """
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -121,5 +123,6 @@ def test_D8D_engine_default_path_still_uses_price_adjusting_view():
         eng.resolve = lambda q: ident  # type: ignore[method-assign]
         out = eng.corporate_actions("RELIANCE")
 
-    assert set(out["ActionType"]) == {"DIVIDEND", "SPLIT"}
-    assert not (out["ActionType"].astype(str) == "DEMERGER").any()
+    assert set(out["ActionType"]) == {"DIVIDEND", "SPLIT", "DEMERGER", "RIGHTS", "BUYBACK"}
+    non_adj = out[out["ActionType"].isin({"DEMERGER", "RIGHTS", "BUYBACK"})]
+    assert len(non_adj) == 3

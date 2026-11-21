@@ -620,17 +620,23 @@ class UnifiedLakeEngine:
         return self._read_filtered_parquet(p, filters=[("Symbol", "in", list(ident.aliases))])
 
     def corporate_actions(self, query: str | int, exchange: str | None = None) -> pd.DataFrame:
-        """Return parsed Dividends, Splits, and Bonuses for the security across NSE or BSE."""
+        """Return all parsed corporate actions for the security across NSE or BSE.
+
+        This query view includes price-adjusting actions (Dividends, Splits, Bonuses,
+        Consolidations) *and* non-adjusting events (Demergers, Rights, Buybacks), which
+        are retrieved by forwarding ``include_non_adjusting=True`` to the adjuster.
+        Price-adjustment behavior (``apply_adjustments``) is unaffected by this flag.
+        """
         ident, exch = self._infer_exchange(query, exchange)
         if exch == "BSE" and ident.bse_code:
-            bse_act = self.adjuster.get_symbol_actions(ident.bse_code, exchange="BSE")
+            bse_act = self.adjuster.get_symbol_actions(ident.bse_code, exchange="BSE", include_non_adjusting=True)
             if not bse_act.empty:
                 return bse_act
-        nse_act = self.adjuster.get_symbol_actions(ident.symbol, exchange="NSE")
+        nse_act = self.adjuster.get_symbol_actions(ident.symbol, exchange="NSE", include_non_adjusting=True)
         if not nse_act.empty:
             return nse_act
         if ident.bse_code:
-            return self.adjuster.get_symbol_actions(ident.bse_code, exchange="BSE")
+            return self.adjuster.get_symbol_actions(ident.bse_code, exchange="BSE", include_non_adjusting=True)
         return pd.DataFrame()
 
     def option_chain(
