@@ -39,7 +39,12 @@ class OHLCVAdjuster:
                 self._bse_actions = read_table_safe(p) if p.exists() else pd.DataFrame()
             return self._bse_actions
 
-    def get_symbol_actions(self, symbol_or_scrip: str, exchange: str = "NSE") -> pd.DataFrame:
+    def get_symbol_actions(
+        self,
+        symbol_or_scrip: str,
+        exchange: str = "NSE",
+        include_non_adjusting: bool = False,
+    ) -> pd.DataFrame:
         cols = ["ExDate", "ActionType", "DividendPerShareRs", "ShareMultiplier"]
         act_df = self._load_actions(exchange)
         if act_df.empty:
@@ -74,6 +79,13 @@ class OHLCVAdjuster:
         sub["DividendPerShareRs"] = pd.to_numeric(sub["DividendPerShareRs"], errors="coerce").fillna(0.0)
         sub["ShareMultiplier"] = pd.to_numeric(sub["ShareMultiplier"], errors="coerce").fillna(1.0)
         sub = sub.dropna(subset=["ExDate"])
+        if include_non_adjusting:
+            keep_cols = [c for c in ("ExDate", "ActionType", "DividendPerShareRs", "ShareMultiplier", "subject", "Purpose") if c in sub.columns]
+            return (
+                sub[sub["ActionType"].isin({"DIVIDEND", "SPLIT", "CONSOLIDATION", "BONUS", "DEMERGER", "RIGHTS", "BUYBACK"})][keep_cols]
+                .sort_values("ExDate")
+                .reset_index(drop=True)
+            )
         sub = sub[(sub["DividendPerShareRs"] > 0.0) | (sub["ShareMultiplier"] != 1.0)]
 
         return (
