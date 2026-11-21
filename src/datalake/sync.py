@@ -22,6 +22,25 @@ from datalake.symbols import SymbolRenameResolver
 logger = logging.getLogger("datalake.sync")
 
 
+def _matches_sync_profile(rel_path: str, profile: str | None) -> bool:
+    """Return True when `rel_path` belongs in the requested sync profile.
+
+    - `full` keeps everything.
+    - `core_longterm` keeps everything except historical F&O chains under
+      `derivatives/` carrying `_fo_`: only the current IST year's yearly file
+      (`..._{cur_yr}.parquet`) survives.
+    - Any other value is rejected so callers cannot silently get a partial lake.
+    """
+    if not profile or profile == "full":
+        return True
+    if profile == "core_longterm":
+        if rel_path.startswith("derivatives/") and "_fo_" in rel_path:
+            cur_yr = str(today_ist().year)
+            return rel_path.endswith(f"_{cur_yr}.parquet")
+        return True
+    raise ValueError(f"Unknown sync profile {profile!r}. Use 'full' or 'core_longterm'.")
+
+
 def compute_sha256(path: Path) -> str:
     """Compute SHA-256 hash of a file efficiently in 1MB chunks."""
     h = hashlib.sha256()
@@ -596,6 +615,7 @@ def build_by_ticker_packs(
                     "bse_code": ident.bse_code,
                     "isin": ident.isin,
                     "company_name": ident.company_name,
+                    "face_value": ident.face_value,
                     "industry": ident.industry,
                 }
             tickers_index[k] = entry
@@ -797,6 +817,7 @@ async def pull_from_github_release(
     token: str | None = None,
     concurrency: int = 4,
     pattern: str | None = None,
+    profile: str = "full",
 ) -> dict[str, int]:
     """
     Smart delta sync from `https://github.com/{repo}/releases/download/{tag}/manifest.json`.
@@ -829,6 +850,8 @@ async def pull_from_github_release(
         skipped = 0
 
         for rel_path, meta in files_map.items():
+            if not _matches_sync_profile(rel_path, profile):
+                continue
             if pattern:
                 import re
                 if not re.search(pattern, rel_path, re.IGNORECASE) and not re.search(pattern, meta.get("asset_name", ""), re.IGNORECASE):
@@ -839,14 +862,6 @@ async def pull_from_github_release(
                     skipped += 1
                     continue
             to_download.append((rel_path, meta))
-
-        if pattern is None and files_map:
-            valid_rel_paths = set(files_map.keys())
-            for existing_pq in list(target_root.rglob("*.parquet")):
-                rel_existing = existing_pq.relative_to(target_root).as_posix()
-                if rel_existing not in valid_rel_paths:
-                    logger.info("[Lake Pull] Removing retired local partition: %s", rel_existing)
-                    existing_pq.unlink(missing_ok=True)
 
         logger.info(
             "[Lake Pull] %d files up-to-date locally, %d changed/new files to download from %s...",
@@ -913,5 +928,19 @@ async def pull_from_github_release(
         if to_download:
             await asyncio.gather(*[_dl(rp, m) for rp, m in to_download])
 
-        (target_root / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        # Only prune retired local partitions after EVERY download has succeeded,
+        # and only for a complete `full` sync (never for a filtered/partial pull).
+        # Pruning earlier would destroy local state when a network drop aborts the pull.
+        if pattern is None and profile == "full" and files_map:
+            valid_rel_paths = set(files_map.keys())
+            for existing_pq in list(target_root.rglob("*.parquet")):
+                rel_existing = existing_pq.relative_to(target_root).as_posix()
+                if rel_existing not in valid_rel_paths:
+                    logger.info("[Lake Pull] Removing retired local partition: %s", rel_existing)
+                    existing_pq.unlink(missing_ok=True)
+
+        # Atomic manifest replace: never leave a truncated/partial manifest.json.
+        tmp_manifest = target_root / "manifest.json.tmp"
+        tmp_manifest.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        os.replace(tmp_manifest, target_root / "manifest.json")
         return {"up_to_date_skipped": skipped, "downloaded": downloaded, "total_files": len(files_map)}

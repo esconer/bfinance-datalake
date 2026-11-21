@@ -145,19 +145,25 @@ class LakeDoctor:
             purge_below = 1
             if fname.startswith("nse_cm_"):
                 ds_name = "equity_eod_nse"
-                yr = int(fname.split("_")[-1].split(".")[0])
-                min_rows_for_full_day = 200
-                purge_below = 200 if yr >= 2016 else 1
+                yr_str = fname.split("_")[-1].split(".")[0]
+                if yr_str.isdigit():
+                    yr = int(yr_str)
+                    min_rows_for_full_day = 200
+                    purge_below = 200 if yr >= 2016 else 1
             elif fname.startswith("bse_cm_"):
                 ds_name = "equity_eod_bse"
-                yr = int(fname.split("_")[-1].split(".")[0])
-                min_rows_for_full_day = 200
-                purge_below = 200 if yr >= 2016 else 1
+                yr_str = fname.split("_")[-1].split(".")[0]
+                if yr_str.isdigit():
+                    yr = int(yr_str)
+                    min_rows_for_full_day = 200
+                    purge_below = 200 if yr >= 2016 else 1
             elif fname.startswith("nse_fo_"):
                 ds_name = "fo_eod_nse"
-                yr = int(fname.split("_")[2].split(".")[0])
-                min_rows_for_full_day = 50 if yr >= 2002 else 1
-                purge_below = 50 if yr >= 2002 else 1
+                yr_str = fname.split("_")[2].split(".")[0]
+                if yr_str.isdigit():
+                    yr = int(yr_str)
+                    min_rows_for_full_day = 50 if yr >= 2002 else 1
+                    purge_below = 50 if yr >= 2002 else 1
             elif fname.startswith("bse_fo_"):
                 ds_name = "fo_eod_bse"
                 min_rows_for_full_day = 1
