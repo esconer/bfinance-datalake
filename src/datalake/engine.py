@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import date
-from functools import lru_cache
 from pathlib import Path
 import threading
 from types import SimpleNamespace
@@ -19,6 +19,11 @@ try:
 except ImportError:
     duckdb = None  # type: ignore
     HAS_DUCKDB = False
+
+
+def _escape_sql_literal(value: str | int) -> str:
+    """Escape a value for safe embedding inside a single-quoted SQL string literal."""
+    return str(value).strip().upper().replace("'", "''")
 
 
 @dataclass(frozen=True)
@@ -56,6 +61,25 @@ class UnifiedLakeEngine:
         self._crosswalk_loaded = False
         self._duck: Any = None
         self._lock = threading.Lock()
+        self._raw_eq_cache: OrderedDict[tuple[str, str, int, int], pd.DataFrame] = OrderedDict()
+
+    def reload(self) -> None:
+        """Drop all derived/cached state after the lake on disk changed (e.g. after re-clustering)."""
+        with self._lock:
+            self._raw_eq_cache.clear()
+            self._by_symbol.clear()
+            self._by_bse.clear()
+            self._by_isin.clear()
+            self._crosswalk_loaded = False
+            self.adjuster = OHLCVAdjuster(self.root)
+            self.resolver = self.adjuster.resolver
+            old_duck = self._duck
+            self._duck = None
+        if old_duck is not None:
+            try:
+                old_duck.close()
+            except Exception:
+                pass
 
     @classmethod
     def from_github(
@@ -304,8 +328,23 @@ class UnifiedLakeEngine:
             .reset_index(drop=True)
         )
 
-    @lru_cache(maxsize=256)
     def _cached_raw_equity(self, query_key: str, exchange: str, start_yr: int, end_yr: int) -> pd.DataFrame:
+        """Instance-scoped 256-entry LRU. Unlike functools.lru_cache it never pins `self`."""
+        key = (query_key, exchange, start_yr, end_yr)
+        with self._lock:
+            cached = self._raw_eq_cache.get(key)
+            if cached is not None:
+                self._raw_eq_cache.move_to_end(key)
+                return cached.copy()
+        out = self._load_raw_equity(query_key, exchange, start_yr, end_yr)
+        with self._lock:
+            self._raw_eq_cache[key] = out.copy()
+            self._raw_eq_cache.move_to_end(key)
+            while len(self._raw_eq_cache) > 256:
+                self._raw_eq_cache.popitem(last=False)
+        return out.copy()
+
+    def _load_raw_equity(self, query_key: str, exchange: str, start_yr: int, end_yr: int) -> pd.DataFrame:
         ident = self.resolve(query_key)
         exch = exchange.upper()
         prefix = "nse_cm_" if exch == "NSE" else "bse_cm_"
@@ -797,9 +836,8 @@ class UnifiedLakeEngine:
             "exchange": ident.primary_exchange,
         }
         try:
-            scr = self.screener(f"Symbol = '{ident.symbol}'")
-            if not scr.empty:
-                row = scr.iloc[0]
+            row = self._screener_row_for_symbol(ident.symbol)
+            if row is not None:
                 close_p = float(row["Close"]) if pd.notna(row.get("Close")) else None
                 out.update({
                     "regularMarketPrice": close_p,
@@ -958,6 +996,24 @@ class UnifiedLakeEngine:
                     ) AS fn_rn
                 FROM financials WHERE PeriodType = 'Quarterly'
             ),
+            latest_bs AS (
+                SELECT Symbol,
+                    (COALESCE(EquityCapital_Cr, 0) + Reserves_Cr) AS BookValue_Cr,
+                    TotalBorrowings_Cr,
+                    TotalCashAndBank_Cr
+                FROM (
+                    SELECT Symbol, PeriodEnd, NatureOfReport,
+                        {_fin_col("EquityCapital_Cr")}, {_fin_col("Reserves_Cr")},
+                        {_fin_col("TotalBorrowings_Cr")}, {_fin_col("TotalCashAndBank_Cr")},
+                        ROW_NUMBER() OVER (
+                            PARTITION BY Symbol
+                            ORDER BY PeriodEnd DESC,
+                                     CASE WHEN LOWER(CAST(NatureOfReport AS VARCHAR)) LIKE '%consolidated%' THEN 1 ELSE 0 END DESC
+                        ) AS bs_rn
+                    FROM financials
+                    WHERE Reserves_Cr IS NOT NULL
+                ) WHERE bs_rn = 1
+            ),
             ttm_fin AS (
                 SELECT Symbol, PeriodEnd AS FinQuarter,
                     COUNT(Sales_Cr) OVER (PARTITION BY Symbol ORDER BY PeriodEnd ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS q_cnt,
@@ -969,18 +1025,17 @@ class UnifiedLakeEngine:
                         OVER (PARTITION BY Symbol ORDER BY PeriodEnd ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS EBITDA_Cr,
                     SUM( COALESCE(PBT_Cr, 0) + COALESCE(Interest_Cr, 0) )
                         OVER (PARTITION BY Symbol ORDER BY PeriodEnd ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS EBIT_Cr,
-                    (COALESCE(EquityCapital_Cr, 0) + COALESCE(Reserves_Cr, 0)) AS BookValue_Cr,
-                    COALESCE(TotalBorrowings_Cr, 0) AS TotalBorrowings_Cr,
-                    COALESCE(TotalCashAndBank_Cr, 0) AS TotalCashAndBank_Cr,
                     ROW_NUMBER() OVER (PARTITION BY Symbol ORDER BY PeriodEnd DESC) AS rn
                 FROM dedup_fin WHERE fn_rn = 1
             ),
             latest_fin AS (
-                SELECT *,
-                    CASE WHEN BookValue_Cr > 0 THEN ROUND(((NetProfit_Cr * (CASE WHEN q_cnt BETWEEN 1 AND 3 THEN 4.0 / q_cnt ELSE 1.0 END)) / BookValue_Cr) * 100.0, 2) ELSE NULL END AS ROE_Pct,
-                    CASE WHEN (BookValue_Cr + TotalBorrowings_Cr) > 0 THEN ROUND(((EBIT_Cr * (CASE WHEN q_cnt BETWEEN 1 AND 3 THEN 4.0 / q_cnt ELSE 1.0 END)) / (BookValue_Cr + TotalBorrowings_Cr)) * 100.0, 2) ELSE NULL END AS ROCE_Pct,
-                    CASE WHEN BookValue_Cr > 0 THEN ROUND(TotalBorrowings_Cr / BookValue_Cr, 2) ELSE NULL END AS DebtToEquity
-                FROM ttm_fin WHERE rn = 1
+                SELECT t.*, b.BookValue_Cr, b.TotalBorrowings_Cr, b.TotalCashAndBank_Cr,
+                    CASE WHEN b.BookValue_Cr > 0 THEN ROUND(((t.NetProfit_Cr * (CASE WHEN t.q_cnt BETWEEN 1 AND 3 THEN 4.0 / t.q_cnt ELSE 1.0 END)) / b.BookValue_Cr) * 100.0, 2) ELSE NULL END AS ROE_Pct,
+                    CASE WHEN b.BookValue_Cr > 0 AND b.TotalBorrowings_Cr IS NOT NULL AND (b.BookValue_Cr + b.TotalBorrowings_Cr) > 0 THEN ROUND(((t.EBIT_Cr * (CASE WHEN t.q_cnt BETWEEN 1 AND 3 THEN 4.0 / t.q_cnt ELSE 1.0 END)) / (b.BookValue_Cr + b.TotalBorrowings_Cr)) * 100.0, 2) ELSE NULL END AS ROCE_Pct,
+                    CASE WHEN b.BookValue_Cr > 0 AND b.TotalBorrowings_Cr IS NOT NULL THEN ROUND(b.TotalBorrowings_Cr / b.BookValue_Cr, 2) ELSE NULL END AS DebtToEquity
+                FROM ttm_fin t
+                LEFT JOIN latest_bs b USING (Symbol)
+                WHERE t.rn = 1
             )
         """ if has_fin else ""
 
@@ -1000,7 +1055,7 @@ class UnifiedLakeEngine:
                 SELECT Symbol, TotalShares AS BSE_TotalShares
                 FROM (
                     SELECT Symbol, TotalShares,
-                           ROW_NUMBER() OVER (PARTITION BY Symbol ORDER BY QuarterId DESC) AS rn
+                           ROW_NUMBER() OVER (PARTITION BY Symbol ORDER BY TRY_CAST(QuarterId AS BIGINT) DESC) AS rn
                     FROM shareholding_bse
                     WHERE TotalShares IS NOT NULL AND TotalShares > 0
                 ) WHERE rn = 1
@@ -1038,7 +1093,7 @@ class UnifiedLakeEngine:
 
         val_cols = """
             , CASE WHEN f.BookValue_Cr > 0 AND s.TotalShares > 0 THEN ROUND(((e.Close * s.TotalShares) / 10000000.0) / f.BookValue_Cr, 2) ELSE NULL END AS PB
-            , CASE WHEN f.EBITDA_Cr > 0 AND s.TotalShares > 0 THEN ROUND((((e.Close * s.TotalShares) / 10000000.0) + COALESCE(f.TotalBorrowings_Cr, 0) - COALESCE(f.TotalCashAndBank_Cr, 0)) / f.EBITDA_Cr, 2) ELSE NULL END AS EV_EBITDA
+            , CASE WHEN f.EBITDA_Cr > 0 AND s.TotalShares > 0 AND f.TotalBorrowings_Cr IS NOT NULL AND f.TotalCashAndBank_Cr IS NOT NULL THEN ROUND((((e.Close * s.TotalShares) / 10000000.0) + f.TotalBorrowings_Cr - f.TotalCashAndBank_Cr) / f.EBITDA_Cr, 2) ELSE NULL END AS EV_EBITDA
         """ if (has_fin and has_shp) else ""
 
         fin_join = "LEFT JOIN latest_fin f USING (Symbol)" if has_fin else ""
@@ -1083,10 +1138,21 @@ class UnifiedLakeEngine:
         if base_df.empty or not sql_filter:
             return base_df
         if HAS_DUCKDB and duckdb is not None:
-            con = duckdb.connect(":memory:")
-            con.register("_snap", base_df)
-            return con.execute(f"SELECT * FROM _snap {where}").df()
+            with duckdb.connect(":memory:") as con:
+                con.register("_snap", base_df)
+                return con.execute(f"SELECT * FROM _snap {where}").df()
         return base_df
+
+    def _screener_row_for_symbol(self, symbol: str | int) -> "pd.Series | None":
+        """Return the first screener row for `symbol` using a safely escaped SQL literal."""
+        esc = _escape_sql_literal(symbol)
+        try:
+            scr = self.screener(f"Symbol = '{esc}'")
+            if not scr.empty:
+                return scr.iloc[0]
+        except Exception:
+            pass
+        return None
 
     def run_screen(self, strategy: str = "coffee_can") -> pd.DataFrame:
         """
@@ -1105,9 +1171,9 @@ class UnifiedLakeEngine:
             return base
         order_by = spec.get("order_by")
         if order_by and HAS_DUCKDB and duckdb is not None:
-            con = duckdb.connect(":memory:")
-            con.register("_scr_sub", base)
-            return con.execute(f"SELECT * FROM _scr_sub ORDER BY {order_by}").df()
+            with duckdb.connect(":memory:") as con:
+                con.register("_scr_sub", base)
+                return con.execute(f"SELECT * FROM _scr_sub ORDER BY {order_by}").df()
         return base
 
     def custom_ratios(self, query: str | int, as_of: str | date | None = None) -> dict[str, Any]:
@@ -1121,9 +1187,9 @@ class UnifiedLakeEngine:
         fin_df = self.fundamentals(ident.symbol, consolidated=True, as_of=as_of)
         scr_row = None
         try:
-            scr = self.screener(f"Symbol = '{ident.symbol}'")
-            if not scr.empty:
-                scr_row = scr.iloc[0].to_dict()
+            row = self._screener_row_for_symbol(ident.symbol)
+            if row is not None:
+                scr_row = row.to_dict()
         except Exception:
             pass
         current_price = scr_row.get("Close") if scr_row else None
@@ -1169,9 +1235,9 @@ class UnifiedLakeEngine:
         ar_df = self.annual_reports(ident.symbol)
         scr_row = None
         try:
-            scr = self.screener(f"Symbol = '{ident.symbol}'")
-            if not scr.empty:
-                scr_row = scr.iloc[0].to_dict()
+            row = self._screener_row_for_symbol(ident.symbol)
+            if row is not None:
+                scr_row = row.to_dict()
         except Exception:
             pass
         if (not scr_row or scr_row.get("Close") is None):
@@ -1657,7 +1723,7 @@ class UnifiedLakeEngine:
                     if not df.index.equals(sorted_df.index) or not self._has_page_index(pq):
                         write_parquet_atomic(sorted_df.reset_index(drop=True), pq, row_group_size=2_000)
                         reclustered += 1
-        self._cached_raw_equity.cache_clear()
+        self.reload()
         return {"files_clustered_by_symbol_date": reclustered}
 
     def sql(self, query: str) -> pd.DataFrame:
@@ -1918,9 +1984,8 @@ class LakeTicker:
             "low_52w": None,
         }
         try:
-            scr = self.engine.screener(f"Symbol = '{self.identity.symbol}'")
-            if not scr.empty:
-                row = scr.iloc[0].to_dict()
+            row = self.engine._screener_row_for_symbol(self.identity.symbol)
+            if row is not None:
                 res.update({
                     "last_price": row.get("Close"),
                     "market_cap": row.get("MarketCap_Cr"),

@@ -14,6 +14,8 @@ import urllib.request
 import zlib
 import pandas as pd
 
+from datalake.engine import _escape_sql_literal
+
 try:
     import duckdb
     HAS_DUCKDB = True
@@ -727,6 +729,25 @@ class RemoteLakeClient:
                 if not hist_slice.empty:
                     hist_slice.to_parquet(cache_file, compression="zstd", index=False)
 
+        if auto_adjust and not df.empty and "Close" in df.columns:
+            act_df = self.corporate_actions(sym, exchange=exch, use_pack=False)
+            actions_list: list[list] = []
+            if not act_df.empty and "ExDate" in act_df.columns:
+                for _, r in act_df.iterrows():
+                    if pd.isna(r.get("ExDate")):
+                        continue
+                    div_v = r.get("DividendPerShareRs", 0.0)
+                    sp_v = r.get("ShareMultiplier", 1.0)
+                    div_v = 0.0 if pd.isna(div_v) else float(div_v)
+                    sp_v = 1.0 if pd.isna(sp_v) else float(sp_v)
+                    if div_v > 0 or sp_v != 1:
+                        actions_list.append([
+                            pd.Timestamp(r["ExDate"]).strftime("%Y-%m-%d"),
+                            div_v,
+                            sp_v,
+                        ])
+            df = self._apply_pack_actions(df, actions_list, auto_adjust=True)
+
         if columns and not df.empty:
             valid_cols = [c for c in columns if c in df.columns]
             if valid_cols:
@@ -954,7 +975,7 @@ class RemoteLakeClient:
                 return pd.DataFrame()
             bse_key = self._resolve_for_exchange(sym, "BSE")
             return self._safe_query(
-                f"SELECT * FROM read_parquet('{url}') WHERE (ScripCode = ? OR UPPER(Symbol) = ?) ORDER BY QuarterId ASC",
+                f"SELECT * FROM read_parquet('{url}') WHERE (ScripCode = ? OR UPPER(Symbol) = ?) ORDER BY TRY_CAST(QuarterId AS BIGINT) ASC",
                 [bse_key, sym],
             )
         url = self._resolve_cdn_url(self._asset_url("shareholding", "nse_shareholding_summary.parquet"))
@@ -1358,14 +1379,24 @@ class RemoteLakeClient:
         """Execute arbitrary analytical SQL over remote Parquet datasets via DuckDB."""
         return self._safe_query(query, params)
 
+    def _screener_row_for_symbol(self, symbol: str | int):
+        """Return the first screener row for `symbol` using a safely escaped SQL literal."""
+        esc = _escape_sql_literal(symbol)
+        try:
+            scr = self.screener(f"Symbol = '{esc}'")
+            if not scr.empty:
+                return scr.iloc[0]
+        except Exception:
+            pass
+        return None
+
     def info(self, symbol: str) -> dict[str, Any]:
         """Return summary dict combining SecurityIdentity metadata, technicals, and valuation."""
         sym = symbol.strip().upper()
         out: dict[str, Any] = {"symbol": sym}
         try:
-            scr = self.screener(f"Symbol = '{sym}'")
-            if not scr.empty:
-                row = scr.iloc[0]
+            row = self._screener_row_for_symbol(sym)
+            if row is not None:
                 close_p = float(row["Close"]) if pd.notna(row.get("Close")) else None
                 out.update({
                     "regularMarketPrice": close_p,
@@ -1393,8 +1424,12 @@ class RemoteLakeClient:
         """Return upcoming Board Meetings over HTTPS."""
         self._ensure_httpfs()
         url = self._resolve_cdn_url(self._asset_url("actions", "upcoming_board_meetings.parquet"))
-        where = f"WHERE Symbol = '{symbol.strip().upper()}'" if symbol else ""
-        return self._safe_query(f"SELECT * FROM read_parquet('{url}') {where}")
+        if symbol:
+            return self._safe_query(
+                f"SELECT * FROM read_parquet('{url}') WHERE Symbol = ?",
+                [symbol.strip().upper()],
+            )
+        return self._safe_query(f"SELECT * FROM read_parquet('{url}')")
 
     def fo_ban_list(self) -> pd.DataFrame:
         """Return current F&O security ban list over HTTPS."""
@@ -1437,9 +1472,9 @@ class RemoteLakeClient:
             fin_df = self.financials(sym, period_type="Quarterly")
         scr_row = None
         try:
-            scr = self.screener(f"Symbol = '{sym}'")
-            if not scr.empty:
-                scr_row = scr.iloc[0].to_dict()
+            row = self._screener_row_for_symbol(sym)
+            if row is not None:
+                scr_row = row.to_dict()
         except Exception:
             pass
         return compute_forensic_ratios(
@@ -1469,14 +1504,14 @@ class RemoteLakeClient:
         concalls_df = dos.get("concalls", pd.DataFrame())
         scr_row = None
         try:
-            scr = self.screener(f"Symbol = '{canon}'")
-            if not scr.empty:
-                scr_row = scr.iloc[0].to_dict()
+            row = self._screener_row_for_symbol(canon)
+            if row is not None:
+                scr_row = row.to_dict()
         except Exception:
             pass
         return build_research_profile(
             symbol=canon,
-            company_name=meta.get("name") or canon,
+            company_name=meta.get("company_name") or meta.get("name") or canon,
             bse_code=meta.get("bse_code"),
             isin=meta.get("isin"),
             industry=meta.get("industry"),
