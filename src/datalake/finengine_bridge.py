@@ -299,13 +299,14 @@ def compute_forensic_ratios(
 
         if len(qdf) >= 4:
             last4 = qdf.tail(4)
-            sales_ttm = _finite_float(last4["Sales_Cr"].sum()) if "Sales_Cr" in last4.columns else None
-            pat_ttm = _finite_float(last4["NetProfit_Cr"].sum()) if "NetProfit_Cr" in last4.columns else None
-            pbt_ttm = _finite_float(last4["PBT_Cr"].sum()) if "PBT_Cr" in last4.columns else None
-            eps_ttm = _finite_float(last4["BasicEPS_Rs"].sum()) if "BasicEPS_Rs" in last4.columns else None
-            interest_ttm = _finite_float(last4["Interest_Cr"].sum()) if "Interest_Cr" in last4.columns else None
-            dep_ttm = _finite_float(last4["Depreciation_Cr"].sum()) if "Depreciation_Cr" in last4.columns else 0.0
-            oi_ttm = _finite_float(last4["OtherIncome_Cr"].sum()) if "OtherIncome_Cr" in last4.columns else 0.0
+            # Require all 4 quarters for headline TTM totals; min_count=1 prevents all-NaN summing to 0.0.
+            sales_ttm = _finite_float(last4["Sales_Cr"].sum(min_count=4)) if "Sales_Cr" in last4.columns else None
+            pat_ttm = _finite_float(last4["NetProfit_Cr"].sum(min_count=4)) if "NetProfit_Cr" in last4.columns else None
+            pbt_ttm = _finite_float(last4["PBT_Cr"].sum(min_count=4)) if "PBT_Cr" in last4.columns else None
+            eps_ttm = _finite_float(last4["BasicEPS_Rs"].sum(min_count=4)) if "BasicEPS_Rs" in last4.columns else None
+            interest_ttm = _finite_float(last4["Interest_Cr"].sum(min_count=1)) if "Interest_Cr" in last4.columns else None
+            dep_ttm = _finite_float(last4["Depreciation_Cr"].sum(min_count=1)) if "Depreciation_Cr" in last4.columns else None
+            oi_ttm = _finite_float(last4["OtherIncome_Cr"].sum(min_count=1)) if "OtherIncome_Cr" in last4.columns else None
             if pbt_ttm is not None:
                 ebit_ttm = pbt_ttm + (interest_ttm or 0.0)
                 ebitda_ttm = ebit_ttm + (dep_ttm or 0.0) - (oi_ttm or 0.0)
