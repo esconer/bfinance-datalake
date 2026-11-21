@@ -107,11 +107,11 @@ def parse_action_purpose(text: str, face_value: float | None = None) -> dict:
     m_spl = _SPLIT_RE.search(s)
     if m_spl:
         old_fv, new_fv = float(m_spl.group(1)), float(m_spl.group(2))
-        if new_fv > 0 and old_fv > new_fv:
+        if new_fv > 0 and old_fv > 0 and old_fv != new_fv:
             out["SplitFromFV"] = old_fv
             out["SplitToFV"] = new_fv
             out["ShareMultiplier"] *= old_fv / new_fv
-            out["ActionType"] = "SPLIT"
+            out["ActionType"] = "SPLIT" if old_fv > new_fv else "CONSOLIDATION"
 
     if out["ActionType"] == "OTHER":
         if _RIGHTS_RE.search(s):

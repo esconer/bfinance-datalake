@@ -90,6 +90,7 @@ class OHLCVAdjuster:
         exchange: str = "NSE",
         auto_adjust: bool = False,
         include_future_splits: bool = False,
+        adjust_dividends: bool = True,
     ) -> pd.DataFrame:
         if df.empty:
             return df.copy()
@@ -133,11 +134,16 @@ class OHLCVAdjuster:
             cum_split_factor[:-1] = 1.0 / rev_cum_splits[1:]
         cum_split_factor *= post_window_split_factor
 
+        # Keep the unmodified split basis: Upstox-seeded rows are already split-adjusted,
+        # but NSE corporate-action dividends are still quoted in unadjusted pre-split rupees.
+        raw_cum_split_factor = cum_split_factor.copy()
+        is_already_split_adj = np.zeros(len(out), dtype=bool)
+
         # Detect Upstox-seeded historical rows (PrevClose and TurnoverValue are NaN)
         # which are already split-adjusted at the exchange source
         if "PrevClose" in out.columns and "TurnoverValue" in out.columns:
-            is_already_split_adj = out["PrevClose"].isna() & out["TurnoverValue"].isna()
-            cum_split_factor = np.where(is_already_split_adj.to_numpy(), 1.0, cum_split_factor)
+            is_already_split_adj = (out["PrevClose"].isna() & out["TurnoverValue"].isna()).to_numpy()
+            cum_split_factor = np.where(is_already_split_adj, 1.0, cum_split_factor)
 
         close_arr = out["Close"].to_numpy(dtype=float)
         div_arr = out["Dividends"].to_numpy(dtype=float)
@@ -145,9 +151,14 @@ class OHLCVAdjuster:
         if len(out) > 1:
             prev_close = close_arr[:-1]
             ex_divs = div_arr[1:]
-            valid = (ex_divs > 0.0) & (prev_close > 0.0) & (ex_divs < prev_close)
+            # Match the dividend's share basis to prev_close before comparing them.
+            eff_divs = np.where(
+                is_already_split_adj[:-1], ex_divs * raw_cum_split_factor[:-1], ex_divs
+            )
             step = np.ones(len(out) - 1, dtype=float)
-            step[valid] = 1.0 - (ex_divs[valid] / prev_close[valid])
+            if adjust_dividends:
+                valid = (eff_divs > 0.0) & (prev_close > 0.0) & (eff_divs < prev_close)
+                step[valid] = 1.0 - (eff_divs[valid] / prev_close[valid])
 
             # Detect demergers / special pre-open discovery where exchange lowered PrevClose on adjacent trading days
             if "PrevClose" in out.columns:
