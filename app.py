@@ -18,9 +18,14 @@ ROOT_DIR = Path(__file__).resolve().parent
 SRC_DIR = ROOT_DIR / "src"
 TESTS_DIR = ROOT_DIR / "tests"
 
-for venv_site in sorted((ROOT_DIR / ".venv" / "lib").glob("python*/site-packages")):
-    if str(venv_site) not in sys.path:
-        sys.path.insert(0, str(venv_site))
+# Only consult a repo-local venv when we are NOT already inside a venv.
+# Injecting another interpreter's site-packages can shadow the active one with
+# ABI-incompatible C extensions (e.g. a python3.13 numpy under python3.15).
+if sys.prefix == sys.base_prefix:
+    _venv_abi = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    for venv_site in sorted((ROOT_DIR / ".venv" / "lib").glob(f"{_venv_abi}/site-packages")):
+        if str(venv_site) not in sys.path:
+            sys.path.insert(0, str(venv_site))
 
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
