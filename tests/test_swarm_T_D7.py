@@ -135,19 +135,19 @@ def test_retired_parquet_pruned_after_successful_full_sync():
 # ---------------------------------------------------------------------------
 def test_matches_sync_profile():
     cur = str(today_ist().year)
-    assert _matches_sync_profile("equities/nse_cm_2026.parquet", "full") is True
-    assert _matches_sync_profile("equities/nse_cm_2026.parquet", None) is True
-    assert _matches_sync_profile("derivatives/nse_fo_2018.parquet", "full") is True
+    assert _matches_sync_profile("equities/nse_cm_2026.parquet", {}, "full") is True
+    assert _matches_sync_profile("equities/nse_cm_2026.parquet", {}, None) is True
+    assert _matches_sync_profile("derivatives/nse_fo_2018.parquet", {}, "full") is True
     # core_longterm: non-F&O paths always kept
-    assert _matches_sync_profile("equities/nse_cm_2020.parquet", "core_longterm") is True
-    assert _matches_sync_profile("snapshots/market_screener_latest.parquet", "core_longterm") is True
+    assert _matches_sync_profile("equities/nse_cm_2020.parquet", {}, "core_longterm") is True
+    assert _matches_sync_profile("snapshots/market_screener_latest.parquet", {}, "core_longterm") is True
     # historical F&O chains dropped, current-year yearly file kept
-    assert _matches_sync_profile("derivatives/nse_fo_2018.parquet", "core_longterm") is False
-    assert _matches_sync_profile(f"derivatives/nse_fo_{cur}.parquet", "core_longterm") is True
-    assert _matches_sync_profile("derivatives/nse_fo_2020_03.parquet", "core_longterm") is False
-    assert _matches_sync_profile("derivatives/bse_fo_2019.parquet", "core_longterm") is False
+    assert _matches_sync_profile("derivatives/nse_fo_2018.parquet", {}, "core_longterm") is False
+    assert _matches_sync_profile(f"derivatives/nse_fo_{cur}.parquet", {}, "core_longterm") is True
+    assert _matches_sync_profile("derivatives/nse_fo_2020_03.parquet", {}, "core_longterm") is False
+    assert _matches_sync_profile("derivatives/bse_fo_2019.parquet", {}, "core_longterm") is False
     with pytest.raises(ValueError, match="Unknown sync profile"):
-        _matches_sync_profile("x", "unknown-profile")
+        _matches_sync_profile("x", {}, "unknown-profile")
 
 
 def test_core_longterm_filters_historical_fo_during_pull():

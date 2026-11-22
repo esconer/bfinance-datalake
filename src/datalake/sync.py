@@ -21,24 +21,46 @@ from datalake.symbols import SymbolRenameResolver
 
 logger = logging.getLogger("datalake.sync")
 
+CONTRACT_VERSION = "1.0.0"
 
-def _matches_sync_profile(rel_path: str, profile: str | None) -> bool:
+
+def _classify_sync_profile(rel_path: str) -> str:
+    """Classify a release file into a sync profile tier.
+
+    Historical F&O chains (`_fo_` under `derivatives/`) are split into the
+    current-year yearly file (`derivatives_recent`) and older archives
+    (`derivatives_archive`); everything else is durable `core_longterm` data.
+    """
+    if rel_path.startswith("derivatives/") and "_fo_" in rel_path:
+        cur_yr = str(today_ist().year)
+        if rel_path.endswith(f"_{cur_yr}.parquet"):
+            return "derivatives_recent"
+        return "derivatives_archive"
+    return "core_longterm"
+
+
+def _matches_sync_profile(rel_path: str, meta: dict, profile: str | None) -> bool:
     """Return True when `rel_path` belongs in the requested sync profile.
 
     - `full` keeps everything.
-    - `core_longterm` keeps everything except historical F&O chains under
-      `derivatives/` carrying `_fo_`: only the current IST year's yearly file
-      (`..._{cur_yr}.parquet`) survives.
+    - `core_longterm` keeps durable data plus the current IST year's F&O file
+      (`derivatives_recent`), dropping historical F&O archives.
+    - `core_no_fo` keeps only durable `core_longterm` data (no F&O at all).
     - Any other value is rejected so callers cannot silently get a partial lake.
+
+    The tier is read from the manifest entry's ``profile`` field, falling back
+    to classifying the path directly for older manifests.
     """
     if not profile or profile == "full":
         return True
+    tier = meta.get("profile") or _classify_sync_profile(rel_path)
     if profile == "core_longterm":
-        if rel_path.startswith("derivatives/") and "_fo_" in rel_path:
-            cur_yr = str(today_ist().year)
-            return rel_path.endswith(f"_{cur_yr}.parquet")
-        return True
-    raise ValueError(f"Unknown sync profile {profile!r}. Use 'full' or 'core_longterm'.")
+        return tier in ("core_longterm", "derivatives_recent")
+    if profile == "core_no_fo":
+        return tier == "core_longterm"
+    raise ValueError(
+        f"Unknown sync profile {profile!r}. Use 'full', 'core_longterm', or 'core_no_fo'."
+    )
 
 
 def compute_sha256(path: Path) -> str:
@@ -74,6 +96,7 @@ def build_manifest(data_dir: Path) -> dict:
             "asset_name": asset_name,
             "size_bytes": pq.stat().st_size,
             "sha256": compute_sha256(pq),
+            "profile": _classify_sync_profile(rel),
         }
         if max_dt_str:
             entry["latest_date"] = max_dt_str
@@ -82,13 +105,62 @@ def build_manifest(data_dir: Path) -> dict:
 
     manifest = {
         "version": 1,
+        "contract_version": CONTRACT_VERSION,
         "generated_at": now_ist().isoformat(),
         "file_count": len(files_meta),
         "latest_dates": latest_dates,
         "files": files_meta,
     }
-    (data_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    tmp_manifest = data_dir / "manifest.json.tmp"
+    tmp_manifest.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    os.replace(tmp_manifest, data_dir / "manifest.json")
     return manifest
+
+
+def build_unified_security_master(data_dir: Path) -> Path | None:
+    """Build a single deduplicated crosswalk Parquet spanning NSE + BSE identities.
+
+    Identities are deduplicated on ``(symbol, bse_code, isin)`` across both the
+    symbol and BSE-code indexes, sorted by ``(primary_exchange, symbol)`` and
+    written atomically to ``universe/security_master_unified.parquet``.
+
+    Returns the path to the written Parquet, or ``None`` when there are no rows.
+    """
+    eng = UnifiedLakeEngine(data_dir)
+    eng._ensure_crosswalk()
+
+    seen: set[tuple[str | None, str | None, str | None]] = set()
+    identities = []
+    for ident in list(eng._by_symbol.values()) + list(eng._by_bse.values()):
+        key = (ident.symbol, ident.bse_code, ident.isin)
+        if key in seen:
+            continue
+        seen.add(key)
+        identities.append(ident)
+
+    if not identities:
+        return None
+
+    rows = [
+        {
+            "symbol": ident.symbol,
+            "bse_code": ident.bse_code,
+            "isin": ident.isin,
+            "company_name": ident.company_name,
+            "industry": ident.industry,
+            "face_value": ident.face_value,
+            "listing_date": ident.listing_date,
+            "primary_exchange": ident.primary_exchange,
+            "aliases_json": json.dumps(list(ident.aliases)),
+        }
+        for ident in identities
+    ]
+    df = pd.DataFrame(rows).sort_values(["primary_exchange", "symbol"]).reset_index(drop=True)
+
+    out_path = data_dir / "universe" / "security_master_unified.parquet"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    write_parquet_atomic(df, out_path, row_group_size=5000)
+    return out_path
 
 
 def build_compacted_equity_bundles(
@@ -659,6 +731,9 @@ def prepare_release_staging(
     data_dir = data_dir.resolve()
     staging_dir = staging_dir.resolve()
 
+    # Build the unified NSE+BSE crosswalk so it is included in the release manifest.
+    build_unified_security_master(data_dir)
+
     old_m: dict = {}
     old_shas: dict[str, str] = {}
     remote_sizes: dict[str, int] | None = None
@@ -714,7 +789,9 @@ def prepare_release_staging(
         manifest["by_ticker_packs"] = packs_meta
 
     if compacted_meta or packs_meta or snapshots_meta:
-        (data_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        tmp_manifest = data_dir / "manifest.json.tmp"
+        tmp_manifest.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        os.replace(tmp_manifest, data_dir / "manifest.json")
 
     shutil.copy2(data_dir / "manifest.json", staging_dir / "manifest.json")
     if (data_dir / "state.db").exists():
@@ -850,7 +927,7 @@ async def pull_from_github_release(
         skipped = 0
 
         for rel_path, meta in files_map.items():
-            if not _matches_sync_profile(rel_path, profile):
+            if not _matches_sync_profile(rel_path, meta, profile):
                 continue
             if pattern:
                 import re
