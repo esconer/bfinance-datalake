@@ -78,6 +78,8 @@ def parse_action_purpose(text: str, face_value: float | None = None) -> dict:
     fv_match = _FV_EXTRACT_RE.search(s)
     detected_fv = float(fv_match.group(1)) if fv_match else face_value
 
+    has_div_context = bool(re.search(r"\b(?:dividend|div)\b", s, re.I)) and ("per unit" not in s.lower())
+    _bare_rs_re = re.compile(r"\b(?:rs\.?|re\.?|₹|inr)\s*[-:]?\s*(\d+(?:\.\d+)?)", re.I)
     clauses = re.split(r"[/;]|(?:\band\b)", s, flags=re.I)
     for clause in clauses:
         if re.search(r"buy\s*back|\brights?\b|split|sub[-\s]*division", clause, re.I):
@@ -89,6 +91,11 @@ def parse_action_purpose(text: str, face_value: float | None = None) -> dict:
             out["DividendPerShareRs"] = (out["DividendPerShareRs"] or 0.0) + val
             out["ActionType"] = "DIVIDEND"
             found_rs_div = True
+        if not found_rs_div and has_div_context and re.search(r"\b(?:special|final|interim)\b", clause, re.I):
+            for m_sp in _bare_rs_re.finditer(clean_clause):
+                out["DividendPerShareRs"] = round((out["DividendPerShareRs"] or 0.0) + float(m_sp.group(1)), 4)
+                out["ActionType"] = "DIVIDEND"
+                found_rs_div = True
         if not found_rs_div and detected_fv and detected_fv > 0:
             for m_pct in _PCT_DIV_RE.finditer(clean_clause):
                 pct = float(m_pct.group(1))
@@ -98,7 +105,7 @@ def parse_action_purpose(text: str, face_value: float | None = None) -> dict:
     m_bon = _BONUS_RE.search(s)
     if m_bon:
         new_sh, held_sh = float(m_bon.group(1)), float(m_bon.group(2))
-        if held_sh > 0:
+        if 0 < held_sh <= 100:
             out["BonusNew"] = new_sh
             out["BonusHeld"] = held_sh
             out["ShareMultiplier"] *= (new_sh + held_sh) / held_sh
