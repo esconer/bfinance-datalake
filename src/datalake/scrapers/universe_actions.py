@@ -52,8 +52,15 @@ _DIV_RE = re.compile(
     re.I,
 )
 _BONUS_RE = re.compile(r"\bbonus\b.*?(\d+)\s*:\s*(\d+)", re.I)
+# Reverse splits are also notified as "Face Value Consolidation From Rs 1/- To Rs 10/-".
+# Anchor that trigger to explicit face-value context: generic "Consolidated Results" /
+# "consolidated financials" are reporting boilerplate, not share actions.
+_FV_CONSOLIDATION_TRIGGER = (
+    r"(?:\b(?:face\s*value(?:\s+of\s+shares?)?|fv|f\.v\.)\s*(?:of\s+)?consolidat(?:ion|e)"
+    r"|consolidat(?:ion|e)\s+(?:of\s+)?\b(?:face\s*value(?:\s+of\s+shares?)?|fv|f\.v\.))"
+)
 _SPLIT_RE = re.compile(
-    r"(?:split|sub[-\s]*division).*?(?:from\s+)?(?:rs\.?|re\.?|₹|inr)?\s*(\d+(?:\.\d+)?)\s*(?:/-)?(?:\s*(?:per\s+(?:share|unit|security)|each))?\s*(?:to|into)\s*(?:rs\.?|re\.?|₹|inr)?\s*(\d+(?:\.\d+)?)",
+    r"(?:split|sub[-\s]*division|" + _FV_CONSOLIDATION_TRIGGER + r").*?(?:from\s+)?(?:rs\.?|re\.?|₹|inr)?\s*(\d+(?:\.\d+)?)\s*(?:/-)?(?:\s*(?:per\s+(?:share|unit|security)|each))?\s*(?:to|into)\s*(?:rs\.?|re\.?|₹|inr)?\s*(\d+(?:\.\d+)?)",
     re.I,
 )
 _RIGHTS_RE = re.compile(r"\brights?\b.*?(\d+)\s*:\s*(\d+)", re.I)
@@ -82,7 +89,11 @@ def parse_action_purpose(text: str, face_value: float | None = None) -> dict:
     _bare_rs_re = re.compile(r"\b(?:rs\.?|re\.?|₹|inr)\s*[-:]?\s*(\d+(?:\.\d+)?)", re.I)
     clauses = re.split(r"[/;]|(?:\band\b)", s, flags=re.I)
     for clause in clauses:
-        if re.search(r"buy\s*back|\brights?\b|split|sub[-\s]*division", clause, re.I):
+        if re.search(
+            r"buy\s*back|\brights?\b|split|sub[-\s]*division|" + _FV_CONSOLIDATION_TRIGGER,
+            clause,
+            re.I,
+        ):
             continue
         clean_clause = _FV_NOISE_RE.sub(" ", clause)
         found_rs_div = False
