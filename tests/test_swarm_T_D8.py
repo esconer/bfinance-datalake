@@ -102,14 +102,15 @@ def test_D8C_unknown_none_and_skipped_action_types_are_excluded():
     assert set(out["ActionType"].dropna()) == {"DIVIDEND", "SPLIT", "DEMERGER", "RIGHTS", "BUYBACK"}
 
 
-def test_D8D_engine_query_view_includes_non_adjusting_actions():
-    """Engine.corporate_actions now opts in to the full query view via D8B.
+def test_D8D_engine_query_view_opt_in_for_non_adjusting_actions():
+    """Engine.corporate_actions hides non-adjusting actions by default and opts in on request.
 
     D8's adjuster default (used by the price-adjustment path) is unchanged:
     get_symbol_actions() still filters out non-adjusting actions unless asked.
-    The engine's QUERY VIEW, however, forwards include_non_adjusting=True, so
-    DEMERGER / RIGHTS / BUYBACK events are surfaced alongside DIVIDEND / SPLIT.
-    This assertion fails if the engine ever stops forwarding that flag.
+    The engine's QUERY VIEW now mirrors that: the default view is price-adjusting
+    only, and DEMERGER / RIGHTS / BUYBACK events are surfaced only when the caller
+    passes include_non_adjusting=True. These assertions fail if the engine ever
+    stops forwarding that flag (or forwards it unconditionally).
     """
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -121,8 +122,14 @@ def test_D8D_engine_query_view_includes_non_adjusting_actions():
             aliases=("RELIANCE",), primary_exchange="NSE",
         )
         eng.resolve = lambda q: ident  # type: ignore[method-assign]
-        out = eng.corporate_actions("RELIANCE")
+        default_out = eng.corporate_actions("RELIANCE")
+        opt_in_out = eng.corporate_actions("RELIANCE", include_non_adjusting=True)
 
-    assert set(out["ActionType"]) == {"DIVIDEND", "SPLIT", "DEMERGER", "RIGHTS", "BUYBACK"}
-    non_adj = out[out["ActionType"].isin({"DEMERGER", "RIGHTS", "BUYBACK"})]
+    non_adj_types = {"DEMERGER", "RIGHTS", "BUYBACK"}
+    # Default view is price-adjusting only.
+    assert set(default_out["ActionType"]) == {"DIVIDEND", "SPLIT"}
+    assert non_adj_types.isdisjoint(set(default_out["ActionType"]))
+    # Opt-in view surfaces all classified actions, including the non-adjusting ones.
+    assert set(opt_in_out["ActionType"]) == {"DIVIDEND", "SPLIT", "DEMERGER", "RIGHTS", "BUYBACK"}
+    non_adj = opt_in_out[opt_in_out["ActionType"].isin(non_adj_types)]
     assert len(non_adj) == 3

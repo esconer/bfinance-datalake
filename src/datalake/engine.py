@@ -81,6 +81,30 @@ class UnifiedLakeEngine:
             except Exception:
                 pass
 
+    def health(self) -> dict[str, Any]:
+        """Return local lake watermarks, contract version, file counts, and disk usage."""
+        import json
+        manifest_path = self.root / "manifest.json"
+        manifest: dict[str, Any] = {}
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if not isinstance(manifest, dict):
+                    manifest = {}
+            except Exception:
+                manifest = {}
+        pq_files = list(self.root.rglob("*.parquet"))
+        size_bytes = sum(p.stat().st_size for p in pq_files if p.exists())
+        return {
+            "root": str(self.root),
+            "contract_version": manifest.get("contract_version", "1.0.0"),
+            "generated_at": manifest.get("generated_at"),
+            "parquet_files": len(pq_files),
+            "size_mb": round(size_bytes / (1024 * 1024), 2),
+            "latest_dates": manifest.get("latest_dates", {}),
+            "ready": len(pq_files) > 0,
+        }
+
     @classmethod
     def from_github(
         cls,
@@ -413,6 +437,7 @@ class UnifiedLakeEngine:
         period: str | None = None,
         exchange: str | None = None,
         auto_adjust: bool = True,
+        adjust_dividends: bool = True,
     ) -> pd.DataFrame:
         """
         Fetch daily OHLCV + Delivery + Dividends + Stock Splits + Adj Close across 1995..2026
@@ -445,7 +470,8 @@ class UnifiedLakeEngine:
 
         key_for_actions = ident.symbol if exch == "NSE" else (ident.bse_code or ident.symbol)
         adj = self.adjuster.apply_adjustments(
-            raw, key_for_actions, exchange=exch, auto_adjust=auto_adjust, include_future_splits=True
+            raw, key_for_actions, exchange=exch, auto_adjust=auto_adjust,
+            adjust_dividends=adjust_dividends, include_future_splits=True
         )
         adj = adj[(adj["Date"] >= s_dt) & (adj["Date"] <= e_dt)].reset_index(drop=True)
         return adj
@@ -619,24 +645,36 @@ class UnifiedLakeEngine:
         p = self.root / "shareholding" / "named_shareholders.parquet"
         return self._read_filtered_parquet(p, filters=[("Symbol", "in", list(ident.aliases))])
 
-    def corporate_actions(self, query: str | int, exchange: str | None = None) -> pd.DataFrame:
-        """Return all parsed corporate actions for the security across NSE or BSE.
+    def corporate_actions(
+        self,
+        query: str | int,
+        exchange: str | None = None,
+        include_non_adjusting: bool = False,
+    ) -> pd.DataFrame:
+        """Return parsed corporate actions for the security across NSE or BSE.
 
-        This query view includes price-adjusting actions (Dividends, Splits, Bonuses,
-        Consolidations) *and* non-adjusting events (Demergers, Rights, Buybacks), which
-        are retrieved by forwarding ``include_non_adjusting=True`` to the adjuster.
-        Price-adjustment behavior (``apply_adjustments``) is unaffected by this flag.
+        By default this is the price-adjusting view: only Dividends, Splits, Bonuses
+        and Consolidations are returned. Opt in with ``include_non_adjusting=True``
+        to also surface non-adjusting events (Demergers, Rights, Buybacks); the flag
+        is forwarded to all three ``get_symbol_actions()`` lookups. Price-adjustment
+        behavior (``apply_adjustments``) is unaffected by this flag.
         """
         ident, exch = self._infer_exchange(query, exchange)
         if exch == "BSE" and ident.bse_code:
-            bse_act = self.adjuster.get_symbol_actions(ident.bse_code, exchange="BSE", include_non_adjusting=True)
+            bse_act = self.adjuster.get_symbol_actions(
+                ident.bse_code, exchange="BSE", include_non_adjusting=include_non_adjusting
+            )
             if not bse_act.empty:
                 return bse_act
-        nse_act = self.adjuster.get_symbol_actions(ident.symbol, exchange="NSE", include_non_adjusting=True)
+        nse_act = self.adjuster.get_symbol_actions(
+            ident.symbol, exchange="NSE", include_non_adjusting=include_non_adjusting
+        )
         if not nse_act.empty:
             return nse_act
         if ident.bse_code:
-            return self.adjuster.get_symbol_actions(ident.bse_code, exchange="BSE", include_non_adjusting=True)
+            return self.adjuster.get_symbol_actions(
+                ident.bse_code, exchange="BSE", include_non_adjusting=include_non_adjusting
+            )
         return pd.DataFrame()
 
     def option_chain(

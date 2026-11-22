@@ -1,10 +1,11 @@
-"""Offline regression tests for swarm bug T-D8B.
+"""Offline regression tests for swarm bug T-D8B (revised Patch 4 contract).
 
-``UnifiedLakeEngine.corporate_actions()`` used to call ``get_symbol_actions()``
-with the default flag, which filters out DEMERGER / RIGHTS / BUYBACK rows. These
-tests lock in that the query view now forwards ``include_non_adjusting=True``
-at all three call sites, while the price-adjustment path (``apply_adjustments``)
-keeps using the default flag. No network / no on-disk lake required.
+``UnifiedLakeEngine.corporate_actions()`` exposes a caller-controlled
+``include_non_adjusting`` flag (default False). The query view forwards that
+flag to all three ``get_symbol_actions()`` lookups: with the default the
+price-adjusting view hides DEMERGER / RIGHTS / BUYBACK rows, while opting in
+surfaces them. The price-adjustment path (``apply_adjustments``) keeps using
+the adjuster default and is unaffected. No network / no on-disk lake required.
 """
 from __future__ import annotations
 
@@ -81,17 +82,23 @@ def _one_action(action, symbol="RELIANCE", exchange="NSE") -> pd.DataFrame:
     }])
 
 
+_NON_ADJUSTING = {"DEMERGER", "RIGHTS", "BUYBACK"}
+
+
 # (a) + (d): real adjuster, seeded data.
-def test_D8B_A_corporate_actions_surfaces_non_adjusting_events():
-    """The query view must now return seeded DEMERGER / RIGHTS / BUYBACK events."""
+def test_D8B_A_default_hides_opt_in_surfaces_non_adjusting_events():
+    """Default view is price-adjusting only; opt-in surfaces DEMERGER/RIGHTS/BUYBACK."""
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         _seed(root, _fixture_rows())
-        out = _seeded_engine(root, _ident()).corporate_actions("RELIANCE")
+        eng = _seeded_engine(root, _ident())
+        default_out = eng.corporate_actions("RELIANCE")
+        opt_in_out = eng.corporate_actions("RELIANCE", include_non_adjusting=True)
 
-    types = set(out["ActionType"])
-    assert {"DEMERGER", "RIGHTS", "BUYBACK"}.issubset(types)
-    assert len(out[out["ActionType"].isin({"DEMERGER", "RIGHTS", "BUYBACK"})]) == 3
+    assert set(default_out["ActionType"]) == {"DIVIDEND", "SPLIT"}
+    assert _NON_ADJUSTING.isdisjoint(set(default_out["ActionType"]))
+    assert _NON_ADJUSTING.issubset(set(opt_in_out["ActionType"]))
+    assert len(opt_in_out[opt_in_out["ActionType"].isin(_NON_ADJUSTING)]) == 3
 
 
 def test_D8B_D_existing_dividend_split_behavior_unchanged():
@@ -108,12 +115,14 @@ def test_D8B_D_existing_dividend_split_behavior_unchanged():
     assert list(out["ExDate"]) == sorted(list(out["ExDate"]))
 
 
-# (b): all three call sites forward include_non_adjusting=True.
+# (b): all three call sites forward the caller's flag (default False, opt-in True).
 def _mock_adjuster(nse_df: pd.DataFrame, bse_df: pd.DataFrame) -> Mock:
     adj = Mock()
 
     def _gsa(symbol_or_scrip, exchange="NSE", include_non_adjusting=False):
         frame = nse_df if exchange.upper() == "NSE" else bse_df
+        if not include_non_adjusting:
+            frame = frame[~frame["ActionType"].isin(_NON_ADJUSTING)]
         return frame.copy()
 
     adj.get_symbol_actions.side_effect = _gsa
@@ -127,39 +136,71 @@ def _engine_with_mock_adjuster(adj: Mock, ident: SecurityIdentity) -> UnifiedLak
     return eng
 
 
+def _assert_call_flags(adj: Mock, expected_flag: bool) -> None:
+    calls = adj.get_symbol_actions.call_args_list
+    assert calls, "get_symbol_actions was never called"
+    for c in calls:
+        assert c.kwargs.get("include_non_adjusting") is expected_flag, c
+
+
 def test_D8B_B1_bse_first_call_site_forwards_flag():
+    # Opt-in: DEMERGER from the BSE-first lookup is surfaced and the flag is True.
     adj = _mock_adjuster(_empty_actions(), _one_action("DEMERGER", exchange="BSE"))
     eng = _engine_with_mock_adjuster(adj, _ident(bse_code="500325"))
-    out = eng.corporate_actions("RELIANCE", exchange="BSE")
+    out = eng.corporate_actions("RELIANCE", exchange="BSE", include_non_adjusting=True)
 
     assert not out.empty
     assert call("500325", exchange="BSE", include_non_adjusting=True) in adj.get_symbol_actions.call_args_list
-    for c in adj.get_symbol_actions.call_args_list:
-        assert c.kwargs.get("include_non_adjusting") is True
+    _assert_call_flags(adj, True)
+
+    # Default: flag is False and the non-adjusting row is hidden.
+    adj_def = _mock_adjuster(_empty_actions(), _one_action("DEMERGER", exchange="BSE"))
+    eng_def = _engine_with_mock_adjuster(adj_def, _ident(bse_code="500325"))
+    out_def = eng_def.corporate_actions("RELIANCE", exchange="BSE")
+
+    assert out_def.empty
+    assert call("500325", exchange="BSE", include_non_adjusting=False) in adj_def.get_symbol_actions.call_args_list
+    _assert_call_flags(adj_def, False)
 
 
 def test_D8B_B2_nse_call_site_forwards_flag():
     adj = _mock_adjuster(_one_action("DEMERGER"), _empty_actions())
     eng = _engine_with_mock_adjuster(adj, _ident(bse_code=None))
-    out = eng.corporate_actions("RELIANCE")
+    out = eng.corporate_actions("RELIANCE", include_non_adjusting=True)
 
     assert not out.empty
     assert call("RELIANCE", exchange="NSE", include_non_adjusting=True) in adj.get_symbol_actions.call_args_list
-    for c in adj.get_symbol_actions.call_args_list:
-        assert c.kwargs.get("include_non_adjusting") is True
+    _assert_call_flags(adj, True)
+
+    adj_def = _mock_adjuster(_one_action("DEMERGER"), _empty_actions())
+    eng_def = _engine_with_mock_adjuster(adj_def, _ident(bse_code=None))
+    out_def = eng_def.corporate_actions("RELIANCE")
+
+    assert out_def.empty
+    assert call("RELIANCE", exchange="NSE", include_non_adjusting=False) in adj_def.get_symbol_actions.call_args_list
+    _assert_call_flags(adj_def, False)
 
 
 def test_D8B_B3_bse_fallback_call_site_forwards_flag():
     adj = _mock_adjuster(_empty_actions(), _one_action("RIGHTS", exchange="BSE"))
     eng = _engine_with_mock_adjuster(adj, _ident(bse_code="500325"))
-    out = eng.corporate_actions("RELIANCE")  # NSE empty -> BSE fallback
+    out = eng.corporate_actions("RELIANCE", include_non_adjusting=True)  # NSE empty -> BSE fallback
 
     assert not out.empty
     calls = adj.get_symbol_actions.call_args_list
     assert call("RELIANCE", exchange="NSE", include_non_adjusting=True) in calls
     assert call("500325", exchange="BSE", include_non_adjusting=True) in calls
-    for c in calls:
-        assert c.kwargs.get("include_non_adjusting") is True
+    _assert_call_flags(adj, True)
+
+    adj_def = _mock_adjuster(_empty_actions(), _one_action("RIGHTS", exchange="BSE"))
+    eng_def = _engine_with_mock_adjuster(adj_def, _ident(bse_code="500325"))
+    out_def = eng_def.corporate_actions("RELIANCE")
+
+    assert out_def.empty
+    calls_def = adj_def.get_symbol_actions.call_args_list
+    assert call("RELIANCE", exchange="NSE", include_non_adjusting=False) in calls_def
+    assert call("500325", exchange="BSE", include_non_adjusting=False) in calls_def
+    _assert_call_flags(adj_def, False)
 
 
 # (c): apply_adjustments (price-adjustment path) still uses the DEFAULT flag.
