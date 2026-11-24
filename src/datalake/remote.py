@@ -1243,7 +1243,12 @@ class RemoteLakeClient:
             [code_val],
         )
 
-    def trading_days(self, start: str | date = "1995-11-03", end: str | date | None = None) -> pd.DatetimeIndex:
+    def trading_days(
+        self,
+        start: str | date = "1995-11-03",
+        end: str | date | None = None,
+        include_weekends: bool = False,
+    ) -> pd.DatetimeIndex:
         """Return authoritative NSE trading session dates over HTTPS."""
         idx_df = self.index_history("NIFTY 50")
         if idx_df.empty or "Date" not in idx_df.columns:
@@ -1253,7 +1258,8 @@ class RemoteLakeClient:
             dts = dts[dts >= pd.Timestamp(start)]
         if end:
             dts = dts[dts <= pd.Timestamp(end)]
-        return pd.DatetimeIndex(dts.unique()).sort_values()
+        idx = pd.DatetimeIndex(dts.unique()).sort_values()
+        return idx if include_weekends else idx[idx.weekday < 5]
 
     def _get_latest_fo_date(self, exch: str, yr: int, fo_cdn_url: str) -> str | None:
         """Resolve the latest trading date in `{exch}_fo_{yr}.parquet` once per session."""

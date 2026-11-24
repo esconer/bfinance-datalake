@@ -62,11 +62,13 @@ class UnifiedLakeEngine:
         self._duck: Any = None
         self._lock = threading.Lock()
         self._raw_eq_cache: OrderedDict[tuple[str, str, int, int], pd.DataFrame] = OrderedDict()
+        self._mf_latest_cache: pd.DataFrame | None = None
 
     def reload(self) -> None:
         """Drop all derived/cached state after the lake on disk changed (e.g. after re-clustering)."""
         with self._lock:
             self._raw_eq_cache.clear()
+            self._mf_latest_cache = None
             self._by_symbol.clear()
             self._by_bse.clear()
             self._by_isin.clear()
@@ -134,10 +136,50 @@ class UnifiedLakeEngine:
                 asyncio.run(pull_from_github_release(repo=repo, data_dir=lake_dir, token=token))
         return cls(lake_dir=lake_dir)
 
-    def _ensure_crosswalk(self) -> None:
+    def _ensure_crosswalk(self, use_unified_cache: bool = True) -> None:
         if self._crosswalk_loaded:
             return
         self._crosswalk_loaded = True
+
+        unified_path = self.root / "universe" / "security_master_unified.parquet"
+        if use_unified_cache and unified_path.exists():
+            try:
+                import json
+                udf = read_table_safe(unified_path)
+                if not udf.empty and {"symbol", "primary_exchange"}.issubset(udf.columns):
+                    for r in udf.to_dict("records"):
+                        sym = str(r.get("symbol") or "").strip().upper()
+                        if not sym:
+                            continue
+                        raw_aliases = r.get("aliases_json")
+                        try:
+                            aliases = tuple(json.loads(raw_aliases)) if raw_aliases else (sym,)
+                        except Exception:
+                            aliases = (sym,)
+                        bse_c = str(r.get("bse_code") or "").strip() or None
+                        isin_c = str(r.get("isin") or "").strip().upper() or None
+                        fv_val = pd.to_numeric(r.get("face_value"), errors="coerce")
+                        ident = SecurityIdentity(
+                            symbol=sym,
+                            bse_code=bse_c,
+                            isin=isin_c,
+                            company_name=str(r.get("company_name") or "").strip() or None,
+                            aliases=aliases,
+                            face_value=float(fv_val) if pd.notna(fv_val) else None,
+                            industry=str(r.get("industry") or "").strip() or None,
+                            listing_date=str(r.get("listing_date") or "").strip() or None,
+                            primary_exchange=str(r.get("primary_exchange") or "NSE").strip().upper(),
+                        )
+                        for al in aliases:
+                            if al not in self._by_symbol:
+                                self._by_symbol[al] = ident
+                        if bse_c and bse_c not in self._by_bse:
+                            self._by_bse[bse_c] = ident
+                        if isin_c and isin_c not in self._by_isin:
+                            self._by_isin[isin_c] = ident
+                    return
+            except Exception:
+                pass
 
         nse_path = self.root / "universe" / "nse_equity_master.parquet"
         bse_path = self.root / "universe" / "bse_scrip_master.parquet"
@@ -856,11 +898,15 @@ class UnifiedLakeEngine:
         self,
         start: str | date = "1995-11-03",
         end: str | date | None = None,
+        include_weekends: bool = False,
     ) -> pd.DatetimeIndex:
-        """Return authoritative NSE trading session dates (derived from NIFTY 50 index history)."""
+        """Return authoritative NSE trading session dates (derived from NIFTY 50 index history).
+        Set `include_weekends=True` to retain special Saturday/Sunday Muhurat, Budget & DR sessions.
+        """
         idx_df = self.index_history("NIFTY 50", start=start, end=end)
         if not idx_df.empty and "Date" in idx_df.columns:
-            return pd.DatetimeIndex(pd.to_datetime(idx_df["Date"]).dt.normalize().unique()).sort_values()
+            dts = pd.DatetimeIndex(pd.to_datetime(idx_df["Date"]).dt.normalize().unique()).sort_values()
+            return dts if include_weekends else dts[dts.weekday < 5]
         return pd.DatetimeIndex([])
 
     def info(self, query: str | int) -> dict[str, Any]:
@@ -1492,6 +1538,39 @@ class UnifiedLakeEngine:
             df = df[df["Date"] <= pd.Timestamp(end)]
         return df.sort_values(["Date", "Client Type"]).reset_index(drop=True)
 
+    def participant_vol(
+        self,
+        start: str | date | None = None,
+        end: str | date | None = None,
+        client_type: str | None = None,
+    ) -> pd.DataFrame:
+        """Return NSE F&O Participant Volume breakdown (Client, DII, FII, Pro)."""
+        fl_dir = self.root / "flows"
+        if not fl_dir.exists():
+            return pd.DataFrame()
+        s_yr = pd.Timestamp(start).year if start else 2012
+        e_yr = pd.Timestamp(end).year if end else pd.Timestamp.now().year
+        frames = []
+        for yr in range(s_yr, e_yr + 1):
+            p = fl_dir / f"fao_participant_vol_{yr}.parquet"
+            if p.exists():
+                sub = (
+                    self._read_filtered_parquet(p, filters=[("Client Type", "==", client_type)])
+                    if client_type
+                    else read_table_safe(p)
+                )
+                if not sub.empty:
+                    frames.append(sub)
+        if not frames:
+            return pd.DataFrame()
+        df = pd.concat(frames, ignore_index=True)
+        df["Date"] = pd.to_datetime(df["Date"])
+        if start:
+            df = df[df["Date"] >= pd.Timestamp(start)]
+        if end:
+            df = df[df["Date"] <= pd.Timestamp(end)]
+        return df.sort_values(["Date", "Client Type"]).reset_index(drop=True)
+
     def panel(
         self,
         queries_or_index: list[str | int] | str = "NIFTY 50",
@@ -1564,6 +1643,30 @@ class UnifiedLakeEngine:
         s_dt = pd.Timestamp(start) if start else pd.Timestamp("2000-06-12")
         e_dt = pd.Timestamp(end) if end else pd.Timestamp.now().normalize()
 
+        if HAS_DUCKDB and duckdb is not None:
+            view = "fo_nse" if exch == "nse" else "fo_bse"
+            if list(fo_dir.glob(f"{exch}_fo_*.parquet")):
+                aliases_sql = ", ".join(f"'{_escape_sql_literal(a)}'" for a in fo_aliases)
+                q = f"""
+                    WITH active_fut AS (
+                        SELECT *,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY CAST(Date AS DATE)
+                                ORDER BY CAST(ExpiryDate AS DATE) ASC
+                            ) AS _rk
+                        FROM {view}
+                        WHERE Symbol IN ({aliases_sql})
+                          AND OptionType = 'XX'
+                          AND CAST(Date AS DATE) BETWEEN DATE '{s_dt.strftime('%Y-%m-%d')}' AND DATE '{e_dt.strftime('%Y-%m-%d')}'
+                          AND CAST(ExpiryDate AS DATE) >= CAST(Date AS DATE)
+                    )
+                    SELECT * EXCLUDE (_rk) FROM active_fut WHERE _rk = {int(contract)} ORDER BY Date ASC
+                """
+                out = self.sql(q)
+                if not out.empty:
+                    out["Symbol"] = sym
+                return out.reset_index(drop=True)
+
         frames = []
         for yr in range(s_dt.year, e_dt.year + 1):
             p = fo_dir / f"{exch}_fo_{yr}.parquet"
@@ -1622,16 +1725,23 @@ class UnifiedLakeEngine:
         """
         Search or list active AMFI Mutual Fund schemes (latest NAV, SchemeCode, SchemeName, AMC, Category, ISIN).
         """
-        mf_dir = self.root / "mutual_funds"
-        if not mf_dir.exists():
-            return pd.DataFrame()
-        files = sorted(mf_dir.glob("amfi_nav_*.parquet"))
-        if not files:
-            return pd.DataFrame()
-        df = read_table_safe(files[-1])
-        if df.empty:
-            return df
-        df = df.sort_values("Date").drop_duplicates(subset=["SchemeCode"], keep="last").reset_index(drop=True)
+        with self._lock:
+            cached_mf = self._mf_latest_cache
+        if cached_mf is None:
+            mf_dir = self.root / "mutual_funds"
+            if not mf_dir.exists():
+                return pd.DataFrame()
+            files = sorted(mf_dir.glob("amfi_nav_*.parquet"))
+            if not files:
+                return pd.DataFrame()
+            raw = read_table_safe(files[-1])
+            cached_mf = (
+                raw.sort_values("Date").drop_duplicates(subset=["SchemeCode"], keep="last").reset_index(drop=True)
+                if not raw.empty else raw
+            )
+            with self._lock:
+                self._mf_latest_cache = cached_mf
+        df = cached_mf.copy()
         if search:
             q = search.strip()
             mask = df["SchemeName"].astype(str).str.contains(q, case=False, na=False)
@@ -1809,6 +1919,7 @@ class UnifiedLakeEngine:
                     "short_selling": "deals/short_selling.parquet",
                     "insider_pit": "deals/insider_trading_pit.parquet",
                     "participant_oi": "flows/fao_participant_oi_*.parquet",
+                    "participant_vol": "flows/fao_participant_vol_*.parquet",
                     "fii_dii": "flows/cash_fii_dii_flows.parquet",
                     "annual_reports": "documents/annual_reports.parquet",
                     "concalls": "documents/concalls_and_filings.parquet",
