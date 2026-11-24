@@ -18,6 +18,97 @@ logger = logging.getLogger("datalake.equity_eod")
 
 _BSE_GLUED_LINE_RE = re.compile(r"(\d+\.\d{2}),(\d{6},[A-Z0-9])")
 
+_NSE_DEBT_SERIES_RE = re.compile(r"^(?:GS|TB|SG|GB|D[0-9A-Z]|G[0-9]|N[0-9A-Z]|Y[0-9]|P[0-9]|E[0-9]|U[0-9])$")
+_EQUITY_SERIES_SET = frozenset({"EQ", "BE", "BZ", "SM", "ST", "BL", "IL", "IQ", "RL", "RR"})
+# Indian ISIN = "IN" + 9-char NSIN + check digit: "INE" + 4 issuer chars +
+# 2-digit instrument class (01/02/20 equity, 07/08/14 debt) + suffix + check digit.
+# NB: p3.txt sketches these with {5}, which is off by one and never matches a
+# real 12-char ISIN (e.g. INE001A07RU9 / INE0Q8P01011) — verified offline.
+_DEBT_ISIN_RE = re.compile(r"^(?:IN00|IN[1-4]\d|INE[A-Z0-9]{4}(?:07|08|14))")
+_EQUITY_OR_ETF_ISIN_RE = re.compile(r"^(?:INF|INE[A-Z0-9]{4}(?:01|02|20))")
+_DEBT_SYMBOL_RE = re.compile(
+    r"^(?:\d{3,4}GS\d{4}|(?:91|182|364)D\d{6}|SGB[A-Z]{3}\d{2}[A-Z0-9]*)$"
+)
+_DEBT_NAME_RE = re.compile(
+    r"(?:^\d+(?:\.\d+)?\s*%|\b(?:NCD|DEBENTURES?|G-?SEC|TREASURY\s+BILL|T-?BILL|GOI\s+LOAN|"
+    r"SOVEREIGN\s+GOLD\s+BOND|ZERO\s+COUPON\s+BOND|TAX\s+FREE\s+BOND|STATE\s+DEV(?:ELOPMENT)?\s+LOAN)\b)",
+    re.I,
+)
+
+
+def _text_or_empty(value: object) -> str:
+    """Normalize a possibly-null scalar (None / NaN / pd.NA) to text."""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(value)
+
+
+def is_debt_instrument(
+    symbol: object = None,
+    series: object = None,
+    isin: object = None,
+    name: object = None,
+    exchange: str = "NSE",
+) -> bool:
+    """
+    Return True if a cash-segment row is a debt/fixed-income instrument (G-Sec, T-Bill,
+    SDL, SGB, NCD, corporate bond, preference/debenture series) rather than an equity/ETF.
+    """
+    sym = _text_or_empty(symbol).strip().upper()
+    ser = _text_or_empty(series).strip().upper()
+    isin_s = _text_or_empty(isin).strip().upper()
+    nm = _text_or_empty(name).strip()
+    exch = _text_or_empty(exchange).strip().upper()
+
+    # 1. Explicit debt ISINs (Central G-Sec IN00, SDL IN10..49, Corp NCD/Bond/CP INE.....07/08/14)
+    if isin_s and _DEBT_ISIN_RE.match(isin_s):
+        return True
+
+    # 2. Explicit exchange debt series / groups
+    if exch == "BSE":
+        if ser == "G" or (ser == "F" and isin_s.startswith("INE")):
+            return True
+    else:
+        if ser and _NSE_DEBT_SERIES_RE.match(ser):
+            return True
+
+    # 3. Protect verified equity & ETF ISINs / cash equity series from name false positives (e.g. BONDADA, GOLDBEES)
+    if isin_s and _EQUITY_OR_ETF_ISIN_RE.match(isin_s):
+        return False
+    if exch == "NSE" and ser in _EQUITY_SERIES_SET and not _DEBT_SYMBOL_RE.match(sym):
+        return False
+
+    # 4. Fallback ticker & instrument-name patterns when ISIN/Series are missing or generic
+    if sym and _DEBT_SYMBOL_RE.match(sym):
+        return True
+    if nm and _DEBT_NAME_RE.search(nm):
+        return True
+    return False
+
+
+def filter_equity_only(
+    df: pd.DataFrame,
+    exchange: str = "NSE",
+    name_series: pd.Series | None = None,
+) -> pd.DataFrame:
+    """Drop debt/fixed-income instruments from cash-market equity frames while preserving all equities & ETFs."""
+    if df is None or df.empty:
+        return df
+    syms = df["Symbol"].tolist() if "Symbol" in df.columns else [None] * len(df)
+    sers = df["Series"].tolist() if "Series" in df.columns else [None] * len(df)
+    isins = df["ISIN"].tolist() if "ISIN" in df.columns else [None] * len(df)
+    names = name_series.tolist() if name_series is not None else [None] * len(df)
+    keep = [
+        not is_debt_instrument(sym, ser, isin, nm, exchange=exchange)
+        for sym, ser, isin, nm in zip(syms, sers, isins, names)
+    ]
+    return df.loc[keep].reset_index(drop=True)
+
 
 def repair_ohlc(df: pd.DataFrame) -> pd.DataFrame:
     """Repair 1995-2003 NSE bhavcopy rows where Open=0, High<Low, or Open/Close fall outside [Low, High]."""
@@ -52,13 +143,7 @@ def repair_ohlc(df: pd.DataFrame) -> pd.DataFrame:
 
 def filter_bse_equity_only(df: pd.DataFrame) -> pd.DataFrame:
     """Remove Government Securities (Group 'G') and Corporate Bonds (Group 'F' with 'INE' ISIN) from BSE files."""
-    if df.empty:
-        return df
-    series = df["Series"].astype(str).str.strip().str.upper()
-    isin = df["ISIN"].fillna("").astype(str).str.strip().str.upper()
-    is_gov_debt = series == "G"
-    is_corp_bond = (series == "F") & isin.str.startswith("INE")
-    return df[~(is_gov_debt | is_corp_bond)].reset_index(drop=True)
+    return filter_equity_only(df, exchange="BSE")
 
 
 class EquityEODScraper:
@@ -495,7 +580,7 @@ class EquityEODScraper:
             "DeliverableQty": df["DELIV_QTY"],
             "DeliveryPct": df["DELIV_PER"],
         })
-        return out, resp.content, url
+        return filter_equity_only(out, exchange="NSE"), resp.content, url
 
     async def _fetch_nse_udiff(self, day: date) -> tuple[pd.DataFrame | None, bytes | None, str]:
         url = f"https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_{day:%Y%m%d}_F_0000.csv.zip"
@@ -534,7 +619,7 @@ class EquityEODScraper:
             "DeliverableQty": pd.NA,
             "DeliveryPct": pd.NA,
         })
-        return out, resp.content, url
+        return filter_equity_only(out, exchange="NSE"), resp.content, url
 
     async def _fetch_nse_mto_delivery(self, day: date) -> pd.DataFrame | None:
         url = f"https://nsearchives.nseindia.com/archives/equities/mto/MTO_{day:%d%m%Y}.DAT"
@@ -674,7 +759,7 @@ class EquityEODScraper:
             if exchange.upper() == "NSE"
             else df["FinInstrmId"].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
         )
-        return pd.DataFrame({
+        out = pd.DataFrame({
             "Date": pd.Timestamp(day),
             "Exchange": exchange,
             "InstrumentId": inst_id,
@@ -693,3 +778,5 @@ class EquityEODScraper:
             "DeliverableQty": pd.NA,
             "DeliveryPct": pd.NA,
         })
+        name_col = df["FinInstrmNm"] if "FinInstrmNm" in df.columns else None
+        return filter_equity_only(out, exchange=exchange, name_series=name_col)

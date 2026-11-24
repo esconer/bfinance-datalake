@@ -258,7 +258,26 @@ class FundsAndFlowsScraper:
         return df
 
     async def sync_participant_oi(self, start_date: date, end_date: date, force: bool = False) -> None:
-        dataset = "nse_participant_oi"
+        await self._sync_participant_csv(
+            dataset="nse_participant_oi",
+            file_prefix="fao_participant_oi",
+            start_date=start_date,
+            end_date=end_date,
+            force=force,
+        )
+
+    async def sync_participant_vol(self, start_date: date, end_date: date, force: bool = False) -> None:
+        await self._sync_participant_csv(
+            dataset="nse_participant_vol",
+            file_prefix="fao_participant_vol",
+            start_date=start_date,
+            end_date=end_date,
+            force=force,
+        )
+
+    async def _sync_participant_csv(
+        self, dataset: str, file_prefix: str, start_date: date, end_date: date, force: bool = False
+    ) -> None:
         done_keys = set() if force else self.state.completed_keys(dataset)
         freeze_cutoff = today_ist() - timedelta(days=self.cfg.holiday_freeze_days)
         sem = asyncio.Semaphore(self.cfg.archive_concurrency)
@@ -276,7 +295,7 @@ class FundsAndFlowsScraper:
                 continue
 
             async def _fetch(d: date):
-                url = f"https://nsearchives.nseindia.com/content/nsccl/fao_participant_oi_{d:%d%m%Y}.csv"
+                url = f"https://nsearchives.nseindia.com/content/nsccl/{file_prefix}_{d:%d%m%Y}.csv"
                 async with sem:
                     try:
                         resp = await self.http.get(url, headers=ARCHIVE_HEADERS)
@@ -321,7 +340,7 @@ class FundsAndFlowsScraper:
                         ok_records.append((key, len(df), raw_b, url))
 
                 if frames:
-                    target = self.cfg.root_dir / "flows" / f"fao_participant_oi_{year}.parquet"
+                    target = self.cfg.root_dir / "flows" / f"{file_prefix}_{year}.parquet"
                     upsert_parquet_partition(
                         pd.concat(frames, ignore_index=True),
                         target,
