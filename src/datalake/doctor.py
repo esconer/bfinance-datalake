@@ -3,13 +3,195 @@ from __future__ import annotations
 from datetime import datetime
 import logging
 import sqlite3
+from typing import Any
+import numpy as np
 import pandas as pd
 
 from datalake.config import IST, LakeConfig
 from datalake.state import StateStore
 from datalake.storage import NUMERIC_FLOAT_COLS, read_table_safe, upsert_parquet_partition, write_parquet_atomic
+from datalake.symbols import SymbolRenameResolver
 
 logger = logging.getLogger("datalake.doctor")
+
+
+def measure_turnover_unit(
+    df: pd.DataFrame,
+    *,
+    allow_lacs_rounding: bool = True,
+) -> dict[str, Any]:
+    """
+    Audit cash-equity VWAP (`TurnoverValue / Volume`) against `[Low, High]` and infer
+    the turnover scale (`rupees`, `thousands`, `lakhs`, `crores`, `unknown`).
+    """
+    required = ("Low", "High", "Volume", "TurnoverValue")
+    if df is None or df.empty or not all(c in df.columns for c in required):
+        return {
+            "rows_checked": 0,
+            "bad_rows": 0,
+            "violation_rate": 0.0,
+            "median_vwap_ratio": None,
+            "detected_unit": "empty",
+            "is_healthy": True,
+        }
+
+    low = pd.to_numeric(df["Low"], errors="coerce").to_numpy(dtype=float)
+    high = pd.to_numeric(df["High"], errors="coerce").to_numpy(dtype=float)
+    vol = pd.to_numeric(df["Volume"], errors="coerce").to_numpy(dtype=float)
+    tval = pd.to_numeric(df["TurnoverValue"], errors="coerce").to_numpy(dtype=float)
+
+    valid = (
+        np.isfinite(low) & np.isfinite(high) & np.isfinite(vol) & np.isfinite(tval)
+        & (low > 0.0) & (high >= low) & (vol > 0.0) & (tval > 0.0)
+    )
+    n_valid = int(valid.sum())
+    if n_valid == 0:
+        return {
+            "rows_checked": 0,
+            "bad_rows": 0,
+            "violation_rate": 0.0,
+            "median_vwap_ratio": None,
+            "detected_unit": "empty",
+            "is_healthy": True,
+        }
+
+    vwap = tval[valid] / vol[valid]
+    lo_v, hi_v, vol_v = low[valid], high[valid], vol[valid]
+    mid_v = 0.5 * (lo_v + hi_v)
+    med_ratio = float(np.median(vwap / mid_v))
+
+    if 0.5 <= med_ratio <= 2.0:
+        unit = "rupees"
+    elif 0.5e-3 <= med_ratio <= 2.0e-3:
+        unit = "thousands"
+    elif 0.5e-5 <= med_ratio <= 2.0e-5:
+        unit = "lakhs"
+    elif 0.5e-7 <= med_ratio <= 2.0e-7:
+        unit = "crores"
+    else:
+        unit = "unknown"
+
+    tol = np.maximum(1e-6, (500.0 / vol_v) + 0.01) if allow_lacs_rounding else 1e-6
+    in_bounds = (vwap >= (lo_v - tol)) & (vwap <= (hi_v + tol))
+    bad_rows = int((~in_bounds).sum())
+    viol_rate = round(bad_rows / n_valid, 6)
+
+    return {
+        "rows_checked": n_valid,
+        "bad_rows": bad_rows,
+        "violation_rate": viol_rate,
+        "median_vwap_ratio": round(med_ratio, 8),
+        "detected_unit": unit,
+        "is_healthy": (unit == "rupees") and (viol_rate <= 0.05),
+    }
+
+
+def unexplained_price_jumps(
+    eq_df: pd.DataFrame,
+    actions_df: pd.DataFrame | None = None,
+    *,
+    drop_threshold: float = 0.25,
+    min_price: float = 5.0,
+    max_gap_days: int = 10,
+    action_window_days: int = 3,
+    resolver: SymbolRenameResolver | None = None,
+    exchange: str = "NSE",
+) -> pd.DataFrame:
+    """
+    Identify single-session price drops exceeding `drop_threshold` (default >25%) on a
+    symbol with no recorded corporate action within `+-action_window_days`.
+    Tags `LikelyMissingAction=True` when the exchange also stepped down `PrevClose` overnight.
+    """
+    cols = [
+        "Exchange", "Symbol", "Date", "PrevDate",
+        "PrevCloseRaw", "Close", "PctDrop", "ExchangePrevClose", "LikelyMissingAction",
+    ]
+    if eq_df is None or eq_df.empty or not {"Symbol", "Date", "Close"}.issubset(eq_df.columns):
+        return pd.DataFrame(columns=cols)
+
+    work = eq_df.copy()
+    work["Date"] = pd.to_datetime(work["Date"], errors="coerce").dt.normalize()
+    work["Close"] = pd.to_numeric(work["Close"], errors="coerce")
+    if "PrevClose" in work.columns:
+        work["PrevClose"] = pd.to_numeric(work["PrevClose"], errors="coerce")
+    work = work.dropna(subset=["Symbol", "Date", "Close"])
+    work = work[work["Close"] > 0.0]
+    if work.empty:
+        return pd.DataFrame(columns=cols)
+
+    key_col = "InstrumentId" if (exchange.upper() == "BSE" and "InstrumentId" in work.columns) else "Symbol"
+    work["_Key"] = work[key_col].astype(str).str.replace(r"\.0$", "", regex=True).str.strip().str.upper()
+    work = work.sort_values(["_Key", "Date"]).reset_index(drop=True)
+
+    # Build lookup of recorded corporate action dates per symbol/alias
+    act_dates: dict[str, np.ndarray] = {}
+    if actions_df is not None and not actions_df.empty and "ExDate" in actions_df.columns:
+        adf = actions_df.copy()
+        if "ActionType" in adf.columns:
+            adf = adf[adf["ActionType"].astype(str).str.upper() != "SKIP_NON_EQUITY"]
+        adf["_ExDt"] = pd.to_datetime(adf["ExDate"], errors="coerce").dt.normalize()
+        adf = adf.dropna(subset=["_ExDt"])
+        sym_col = "symbol" if (exchange.upper() == "NSE" and "symbol" in adf.columns) else (
+            "scrip_code" if "scrip_code" in adf.columns else None
+        )
+        if sym_col:
+            adf["_ActKey"] = adf[sym_col].astype(str).str.replace(r"\.0$", "", regex=True).str.strip().str.upper()
+            for k, grp in adf.groupby("_ActKey"):
+                dts = np.sort(grp["_ExDt"].unique())
+                act_dates[str(k)] = dts
+                if resolver is not None and exchange.upper() == "NSE":
+                    for al in resolver.all_aliases(str(k)):
+                        act_dates[al] = np.unique(np.concatenate([act_dates.get(al, np.array([], dtype="datetime64[ns]")), dts]))
+
+    prev_key = work["_Key"].shift(1)
+    prev_dt = work["Date"].shift(1)
+    prev_close = work["Close"].shift(1)
+    days_diff = (work["Date"] - prev_dt).dt.days
+    same_series = (
+        work["Series"].astype(str).str.strip().eq(work["Series"].astype(str).str.strip().shift(1))
+        if "Series" in work.columns
+        else pd.Series(True, index=work.index)
+    )
+
+    pct_drop = (work["Close"] / prev_close) - 1.0
+    cand_mask = (
+        work["_Key"].eq(prev_key)
+        & same_series
+        & (days_diff > 0)
+        & (days_diff <= max_gap_days)
+        & (prev_close >= min_price)
+        & (pct_drop < -abs(drop_threshold))
+    )
+    if not cand_mask.any():
+        return pd.DataFrame(columns=cols)
+
+    win_ns = np.timedelta64(int(action_window_days), "D")
+    hits: list[dict[str, Any]] = []
+    for idx in work.index[cand_mask]:
+        k = str(work.at[idx, "_Key"])
+        dt = work.at[idx, "Date"].to_datetime64()
+        known = act_dates.get(k)
+        if known is not None and len(known) > 0:
+            if np.any(np.abs(known - dt) <= win_ns):
+                continue
+        exch_prev = float(work.at[idx, "PrevClose"]) if "PrevClose" in work.columns and pd.notna(work.at[idx, "PrevClose"]) else float("nan")
+        p_raw = float(prev_close.at[idx])
+        likely_missing = bool(np.isfinite(exch_prev) and exch_prev > 0 and (exch_prev / p_raw) < (1.0 - abs(drop_threshold)))
+        hits.append({
+            "Exchange": exchange.upper(),
+            "Symbol": str(work.at[idx, "Symbol"]),
+            "Date": work.at[idx, "Date"],
+            "PrevDate": prev_dt.at[idx],
+            "PrevCloseRaw": round(p_raw, 4),
+            "Close": round(float(work.at[idx, "Close"]), 4),
+            "PctDrop": round(float(pct_drop.at[idx]) * 100.0, 2),
+            "ExchangePrevClose": round(exch_prev, 4) if np.isfinite(exch_prev) else None,
+            "LikelyMissingAction": likely_missing,
+        })
+
+    if not hits:
+        return pd.DataFrame(columns=cols)
+    return pd.DataFrame(hits, columns=cols).sort_values(["LikelyMissingAction", "PctDrop"], ascending=[False, True]).reset_index(drop=True)
 
 
 class LakeDoctor:
@@ -67,6 +249,7 @@ class LakeDoctor:
             "fo_eod_bse": {},
             "indices_daily_all": {},
             "nse_participant_oi": {},
+            "nse_participant_vol": {},
         }
 
         # Auto-migrate legacy monthly F&O files (nse_fo_YYYY_MM.parquet -> nse_fo_YYYY.parquet)
@@ -174,6 +357,10 @@ class LakeDoctor:
                 purge_below = 15
             elif fname.startswith("fao_participant_oi_"):
                 ds_name = "nse_participant_oi"
+                min_rows_for_full_day = 2
+                purge_below = 2
+            elif fname.startswith("fao_participant_vol_"):
+                ds_name = "nse_participant_vol"
                 min_rows_for_full_day = 2
                 purge_below = 2
 
@@ -327,3 +514,75 @@ class LakeDoctor:
     def rebuild_watermarks_from_disk(self) -> dict[str, int]:
         """Convenience alias for run_full_check_and_repair."""
         return self.run_full_check_and_repair()
+
+    def audit_data_quality(
+        self,
+        *,
+        drop_threshold: float = 0.25,
+        max_jump_examples: int = 50,
+    ) -> dict[str, Any]:
+        """
+        Non-fatal quality audit across cash equity partitions:
+          1. VWAP turnover-unit invariant (`Low <= TurnoverValue/Volume <= High`).
+          2. Unexplained >25% single-day drops without a recorded corporate action.
+        """
+        eq_dir = self.cfg.root_dir / "equities"
+        vwap_anomalies: list[dict[str, Any]] = []
+        jump_frames: list[pd.DataFrame] = []
+        files_checked = 0
+
+        if eq_dir.exists():
+            resolver = SymbolRenameResolver.from_lake(self.cfg.root_dir)
+            actions_cache: dict[str, pd.DataFrame] = {}
+            for exch, act_name in (("NSE", "nse_corporate_actions.parquet"), ("BSE", "bse_corporate_actions.parquet")):
+                ap = self.cfg.root_dir / "actions" / act_name
+                actions_cache[exch] = read_table_safe(ap) if ap.exists() else pd.DataFrame()
+
+            for exch in ("NSE", "BSE"):
+                prefix = f"{exch.lower()}_cm_"
+                for pq_path in sorted(eq_dir.glob(f"{prefix}*.parquet")):
+                    yr_str = pq_path.stem.split("_")[-1]
+                    if not yr_str.isdigit():
+                        continue
+                    try:
+                        df = read_table_safe(pq_path)
+                    except Exception:
+                        continue
+                    if df.empty:
+                        continue
+                    files_checked += 1
+                    vwap_res = measure_turnover_unit(df)
+                    if not vwap_res["is_healthy"]:
+                        vwap_anomalies.append({"file": pq_path.name, **vwap_res})
+                        logger.warning(
+                            "[Doctor Quality] VWAP turnover anomaly in %s: unit=%s, bad=%d/%d (%.2f%%)",
+                            pq_path.name, vwap_res["detected_unit"],
+                            vwap_res["bad_rows"], vwap_res["rows_checked"],
+                            vwap_res["violation_rate"] * 100.0,
+                        )
+
+                    jumps = unexplained_price_jumps(
+                        df,
+                        actions_cache[exch],
+                        drop_threshold=drop_threshold,
+                        resolver=resolver if exch == "NSE" else None,
+                        exchange=exch,
+                    )
+                    if not jumps.empty:
+                        jump_frames.append(jumps)
+
+        all_jumps = pd.concat(jump_frames, ignore_index=True) if jump_frames else pd.DataFrame()
+        likely_missing = int(all_jumps["LikelyMissingAction"].sum()) if not all_jumps.empty else 0
+        if not all_jumps.empty:
+            logger.warning(
+                "[Doctor Quality] Detected %d unexplained >%.0f%% single-day drops (%d with exchange PrevClose step-down).",
+                len(all_jumps), drop_threshold * 100.0, likely_missing,
+            )
+        return {
+            "equity_files_checked": files_checked,
+            "vwap_unit_anomalies": len(vwap_anomalies),
+            "vwap_anomaly_details": vwap_anomalies,
+            "unexplained_price_jumps": int(len(all_jumps)),
+            "likely_missing_actions": likely_missing,
+            "jump_examples": all_jumps.head(max_jump_examples).to_dict("records") if not all_jumps.empty else [],
+        }
