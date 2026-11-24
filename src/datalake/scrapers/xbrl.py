@@ -199,8 +199,25 @@ class XBRLScraper:
         sym_to_scrip, _ = self._build_bse_nse_maps()
         return sym_to_scrip.get(sym)
 
+    def _sparse_financial_symbols(self) -> set[str]:
+        """Return symbols in xbrl_financials.parquet that only have sparse P&L rows (no Balance Sheet Reserves_Cr)."""
+        fin_p = self.cfg.root_dir / "fundamentals" / "xbrl_financials.parquet"
+        if not fin_p.exists():
+            return set()
+        try:
+            fdf = read_table_safe(fin_p)
+        except Exception:
+            return set()
+        if fdf.empty or "Symbol" not in fdf.columns:
+            return set()
+        syms = fdf["Symbol"].dropna().astype(str).str.strip().str.upper()
+        if "Reserves_Cr" not in fdf.columns:
+            return set(syms.unique())
+        has_bs = fdf["Reserves_Cr"].notna().groupby(syms).any()
+        return set(has_bs[~has_bs].index.tolist())
+
     async def sync_all_market(
-        self, max_companies: int | None = None, force: bool = False
+        self, max_companies: int | None = None, force: bool = False, upgrade_sparse: bool = False
     ) -> tuple[list[str], list[str]]:
         nse_master = self.cfg.root_dir / "universe" / "nse_equity_master.parquet"
         bse_master = self.cfg.root_dir / "universe" / "bse_scrip_master.parquet"
@@ -211,6 +228,9 @@ class XBRLScraper:
         if nse_master.exists():
             ndf = read_table_safe(nse_master)
             done_fin = self.state.completed_keys("xbrl_financials_symbol")
+            if upgrade_sparse:
+                sparse_syms = self._sparse_financial_symbols()
+                done_fin = done_fin - sparse_syms
             done_shp = self.state.completed_keys("nse_shareholding_symbol")
             raw_syms = ndf["SYMBOL"].dropna().astype(str).str.strip().unique().tolist()
             prio_syms = [s for s in _DEFAULT_BSE_SCRIP_MAP if s in raw_syms]
