@@ -87,10 +87,19 @@ def build_manifest(data_dir: Path) -> dict:
         try:
             import pyarrow.parquet as pq_mod
             pf = pq_mod.ParquetFile(pq)
-            if "Date" in pf.schema.names and pf.num_row_groups > 0:
-                d_df = pd.read_parquet(pq, columns=["Date"])
+            date_col = next(
+                (
+                    c for c in ("Date", "ExDate", "PeriodEnd", "QuarterEnd", "MeetingDate", "SnapshotDate", "FilingTimestamp", "ChangeDate", "date")
+                    if c in pf.schema.names
+                ),
+                None,
+            )
+            if date_col is not None and pf.num_row_groups > 0:
+                d_df = pd.read_parquet(pq, columns=[date_col])
                 if not d_df.empty:
-                    max_dt_str = pd.to_datetime(d_df["Date"], errors="coerce").max().strftime("%Y-%m-%d")
+                    max_ts = pd.to_datetime(d_df[date_col], format="mixed", errors="coerce").max()
+                    if pd.notna(max_ts):
+                        max_dt_str = max_ts.strftime("%Y-%m-%d")
         except Exception:
             pass
         entry = {
@@ -128,7 +137,13 @@ def build_unified_security_master(data_dir: Path) -> Path | None:
     Returns the path to the written Parquet, or ``None`` when there are no rows.
     """
     eng = UnifiedLakeEngine(data_dir)
-    eng._ensure_crosswalk()
+    try:
+        eng._ensure_crosswalk(use_unified_cache=False)
+    except TypeError as exc:
+        # Legacy/test engines expose _ensure_crosswalk() without the cache-bypass flag.
+        if "use_unified_cache" not in str(exc):
+            raise
+        eng._ensure_crosswalk()
 
     seen: set[tuple[str | None, str | None, str | None]] = set()
     identities = []
@@ -761,6 +776,19 @@ def prepare_release_staging(
                 remote_sizes = None
 
     UnifiedLakeEngine(data_dir).optimize_layout()
+
+    try:
+        from datalake.config import LakeConfig
+        from datalake.doctor import LakeDoctor
+        q_rep = LakeDoctor(LakeConfig(root_dir=data_dir)).audit_data_quality()
+        if q_rep["vwap_unit_anomalies"] > 0:
+            logger.warning(
+                "[Release Stage] %d equity partition(s) flagged by VWAP turnover-unit audit: %s",
+                q_rep["vwap_unit_anomalies"],
+                [a["file"] for a in q_rep["vwap_anomaly_details"]],
+            )
+    except Exception as exc:
+        logger.debug("[Release Stage] Quality audit skipped: %s", exc)
 
     if staging_dir.exists():
         shutil.rmtree(staging_dir)

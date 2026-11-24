@@ -93,6 +93,7 @@ async def run_backfill(
 
         logger.info("=== Step 5/6: F&O Participant OI, Cash FII/DII, Bulk/Block Deals, Insider PIT & Concalls ===")
         await ff.sync_participant_oi(start_date=max(date(2012, 1, 2), start), end_date=eod_end, force=force)
+        await ff.sync_participant_vol(start_date=max(date(2012, 1, 2), start), end_date=eod_end, force=force)
         await dd.sync_cash_fii_dii_daily()
         await dd.sync_bulk_and_block_deals()
         await dd.backfill_historical_bulk_block_deals(start_year=max(2005, start.year), end_year=end.year, force=force)
@@ -132,6 +133,7 @@ async def run_daily_update(cfg: LakeConfig, lookback_days: int = 7, include_fo: 
         bse_start = state.max_ok_date("equity_eod_bse") or default_start
         idx_start = state.max_ok_date("indices_daily_all") or default_start
         oi_start = state.max_ok_date("nse_participant_oi") or default_start
+        vol_start = state.max_ok_date("nse_participant_vol") or default_start
 
         eod_end = await _resolve_published_eod_end(http, today)
 
@@ -142,6 +144,7 @@ async def run_daily_update(cfg: LakeConfig, lookback_days: int = 7, include_fo: 
             f"https://nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_{eod_end:%Y%m%d}_F_0000.csv.zip",
             f"https://nsearchives.nseindia.com/content/indices/ind_close_all_{eod_end:%d%m%Y}.csv",
             f"https://nsearchives.nseindia.com/content/nsccl/fao_participant_oi_{eod_end:%d%m%Y}.csv",
+            f"https://nsearchives.nseindia.com/content/nsccl/fao_participant_vol_{eod_end:%d%m%Y}.csv",
             "https://nsearchives.nseindia.com/content/equities/bulk.csv",
             "https://nsearchives.nseindia.com/content/equities/block.csv",
         ])
@@ -159,6 +162,7 @@ async def run_daily_update(cfg: LakeConfig, lookback_days: int = 7, include_fo: 
         await indices.backfill_30y_bulk(start_date=default_start, end_date=eod_end)
         indices.sync_vix_and_1d_rate_from_snapshots()
         await ff.sync_participant_oi(oi_start, eod_end)
+        await ff.sync_participant_vol(vol_start, eod_end)
         await dd.sync_cash_fii_dii_daily()
         await dd.sync_bulk_and_block_deals()
         await dd.sync_short_selling()
@@ -181,6 +185,7 @@ async def run_xbrl_sync(
     all_market: bool,
     limit: int | None,
     force: bool = False,
+    upgrade_sparse: bool = False,
 ) -> None:
     cfg.ensure_dirs()
     state = StateStore(cfg.state_db_path)
@@ -188,7 +193,9 @@ async def run_xbrl_sync(
         xbrl = XBRLScraper(http, state, cfg)
         dd = DealsAndDocumentsScraper(http, state, cfg)
         if all_market:
-            synced_syms, synced_scrips = await xbrl.sync_all_market(max_companies=limit, force=force)
+            synced_syms, synced_scrips = await xbrl.sync_all_market(
+                max_companies=limit, force=force, upgrade_sparse=upgrade_sparse
+            )
             if synced_scrips or synced_syms:
                 await dd.sync_annual_reports_bse(synced_scrips[:200], symbols=synced_syms[:200])
             return
@@ -270,6 +277,7 @@ def main() -> None:
     p_xb.add_argument("--all-market", action="store_true", help="Automatically loop through all NSE & BSE companies")
     p_xb.add_argument("--limit", type=int, default=None, help="Optional cap when running --all-market")
     p_xb.add_argument("--force", action="store_true", help="Force re-sync even if symbols already completed in state.db")
+    p_xb.add_argument("--upgrade-sparse", action="store_true", help="Re-sync symbols that only have sparse BSE P&L rows (no Balance Sheet)")
 
     # 4. pre2016-nse
     p_p16 = sub.add_parser("pre2016-nse", help="Backfill 1995-2015 NSE Equity + Delivery via historicalOR endpoint")
@@ -326,7 +334,9 @@ def main() -> None:
     elif args.cmd == "xbrl":
         syms = [s.strip() for s in args.symbols.split(",") if s.strip()]
         scrips = [s.strip() for s in args.bse_scrips.split(",") if s.strip()]
-        asyncio.run(run_xbrl_sync(cfg, syms, scrips, args.all_market, args.limit, force=args.force))
+        asyncio.run(
+            run_xbrl_sync(cfg, syms, scrips, args.all_market, args.limit, force=args.force, upgrade_sparse=args.upgrade_sparse)
+        )
         print_status(cfg)
     elif args.cmd == "pre2016-nse":
         syms = [s.strip() for s in args.symbols.split(",") if s.strip()]
@@ -336,8 +346,11 @@ def main() -> None:
         asyncio.run(run_seed_cloud(cfg, args.start_year, args.end_year, args.limit))
         print_status(cfg)
     elif args.cmd == "doctor":
-        report = LakeDoctor(cfg).run_full_check_and_repair()
+        doc = LakeDoctor(cfg)
+        report = doc.run_full_check_and_repair()
+        quality = doc.audit_data_quality()
         print("Doctor Repair Summary:", report)
+        print("Doctor Quality Audit:", {k: v for k, v in quality.items() if k != "jump_examples"})
         print_status(cfg)
     elif args.cmd == "status":
         print_status(cfg)
